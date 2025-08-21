@@ -5,6 +5,7 @@ An IDA Pro 9.0+ cross-platform port of @A200K's [IDA-Pro-SigMaker](https://githu
 Signature Maker Plugin for IDA Pro 9.0+
 
 ## Requirements
+
 - IDA Python
 - Python 3
 
@@ -20,18 +21,22 @@ That's it!
 ### Need to find your plugin directory?
 
 From IDA's Python console run the following command to find its plugin directory:
+
 ```python
 import idaapi, os; print(os.path.join(idaapi.get_user_idadir(), "plugins"))
 ```
 
 ### Where and what is my default user directory?
-The user directory is a location where IDA stores some of the global settings and which can be used for some additional customization. 
+
+The user directory is a location where IDA stores some of the global settings and which can be used for some additional customization.
 Default location:
+
 - On Windows: `%APPDATA%/Hex-Rays/IDA Pro`
 - On Linux and Mac: `$HOME/.idapro`
 
 ## Usage
-In disassembly view, select a line you want to generate a signature for, and press 
+
+In disassembly view, select a line you want to generate a signature for, and press
 **CTRL+ALT+S**
 ![](https://i.imgur.com/b4MKkca.png)
 
@@ -48,12 +53,16 @@ ___
 | C Raw Bytes Signature + Bitmask | 0xE8, 0x00, 0x00, 0x00, 0x00, 0x45, 0x33, 0xF6, 0x66, 0x44, 0x89, 0x34, 0x33  0b1111111100001 |
 
 ___
+
 ### Finding XREFs
+
 Generating code Signatures by data or code xrefs and finding the shortest ones is also supported:
 ![](https://i.imgur.com/P0VRIFQ.png)
 
 ___
+
 ### Signature searching
+
 Searching for Signatures works for supported formats:
 
 ![](https://i.imgur.com/lD4Zfwb.png)

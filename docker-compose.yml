@@ -49,8 +49,6 @@ services:
         image: ghcr.io/mahmoudimus/idapro-linux:baked
         entrypoint: ["python3"]
         working_dir: /work
-        env_file:
-            - .env
         environment:
             - CONTAINER_TIMEZONE=America/Los_Angeles
             - DISPLAY=host.docker.internal:0

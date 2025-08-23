@@ -45,4 +45,4 @@ jobs:
 
             - name: Run test_sigmaker.py
               run: |
-                  docker compose run --rm idapro-tests test_sigmaker.py 2>/dev/null
+                  docker compose run --rm idapro-tests test_sigmaker.py

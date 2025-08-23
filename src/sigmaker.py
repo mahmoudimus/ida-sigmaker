@@ -785,7 +785,7 @@ class PySigMaker(ida_idaapi.plugin_t):
             data = ida_bytes.get_bytes(seg.start_ea, size)
             if data:
                 buf.extend(data)
-            seg = idaapi.get_next_seg(seg)
+            seg = idaapi.get_next_seg(seg.start_ea)
         return bytes(buf)
 
     def parse_signature(self, sig_str: str):

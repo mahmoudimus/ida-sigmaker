@@ -1,0 +1,67 @@
+services:
+    idapro:
+        image: idapro-linux:latest
+        build:
+            context: .
+            dockerfile: Dockerfile
+        container_name: idapro-linux
+        restart: always
+        env_file:
+            - .env
+        environment:
+            - CONTAINER_TIMEZONE=America/Los_Angeles
+            - DISPLAY=host.docker.internal:0
+            - QT_X11_NO_MITSHM=1
+            - LIBGL_ALWAYS_INDIRECT=1
+            - IDAUSR=/root/.idapro
+        volumes:
+            - idausr:/root/.idapro
+            - ./src/:/root/.idapro/plugins:ro # the plugin
+            - ./tests:/work:ro # the test suite to operate on
+            - ./tests/out:/out # artifacts and results
+        ports:
+            - "65433:65433"
+
+    idapro-baked:
+        image: ghcr.io/mahmoudimus/idapro-linux:baked
+        build:
+            context: .
+            dockerfile: Dockerfile
+            target: baked
+        container_name: idapro-linux-baked
+        restart: always
+        env_file:
+            - .env
+        environment:
+            - CONTAINER_TIMEZONE=America/Los_Angeles
+            - DISPLAY=host.docker.internal:0
+            - QT_X11_NO_MITSHM=1
+            - LIBGL_ALWAYS_INDIRECT=1
+            - IDAUSR=/root/.idapro
+        volumes:
+            # Note: No need to mount idausr volume since it's baked in
+            - ./src/:/root/.idapro/plugins:ro # the plugin
+            - ./tests:/work:ro # the test suite to operate on
+            - ./tests/out:/out # artifacts and results
+        ports:
+            - "65434:65433" # Different port to avoid conflicts
+    idapro-tests:
+        image: ghcr.io/mahmoudimus/idapro-linux:baked
+        entrypoint: ["python3"]
+        working_dir: /work
+        env_file:
+            - .env
+        environment:
+            - CONTAINER_TIMEZONE=America/Los_Angeles
+            - DISPLAY=host.docker.internal:0
+            - QT_X11_NO_MITSHM=1
+            - LIBGL_ALWAYS_INDIRECT=1
+            - IDAUSR=/root/.idapro
+            - PYTHONPATH=/app/ida/python:/work
+            - PYTHONWARNINGS=ignore
+        volumes:
+            - ./src/:/root/.idapro/plugins:ro # the plugin
+            - ./tests:/work:ro # the test suite to operate on
+            - ./tests/out:/out # artifacts and results
+volumes:
+    idausr:

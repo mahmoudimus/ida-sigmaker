@@ -46,7 +46,7 @@ services:
         ports:
             - "65434:65433" # Different port to avoid conflicts
     idapro-tests:
-        image: ghcr.io/mahmoudimus/idapro-linux:baked
+        image: ghcr.io/mahmoudimus/idapro-linux:baked@sha256:26481cc7cb968cfcda4e50d203ee22d77f76faff3feb99d2c4f56839da8d2cd9
         entrypoint: ["python3"]
         working_dir: /work
         environment:

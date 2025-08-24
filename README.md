@@ -1,17 +1,28 @@
-# ida-pysigmaker
+# Signature Maker Plugin for IDA Pro 9.0+
 
-An IDA Pro 9.0+ cross-platform port of @A200K's [IDA-Pro-SigMaker](https://github.com/A200K/IDA-Pro-SigMaker) to Python. Works on MacOS/Linux/Windows.
+[![ida-sigmaker tests](https://github.com/mahmoudimus/ida-sigmaker/actions/workflows/python.yml/badge.svg)](https://github.com/mahmoudimus/ida-sigmaker/actions/workflows/python.yml)
 
-Signature Maker Plugin for IDA Pro 9.0+
+An IDA Pro 9.0+ cross-platform signature maker plugin that works on MacOS/Linux/Windows. The primary goal of this plugin is to work with future versions of IDA without needing to compile against the IDA SDK as well as to allow for easier community contributions.
+
+## What is a "sigmaker"?
+
+Sigmaker stands for "signature maker." It enables users to create unique binary pattern signatures that can identify specific addresses or routines within a binary, even after the binary has been updated.
+
+In malware analysis or binary reverse engineering, a common challenge is pinpointing an important address, such as a function or global variable. However, when the binary is updated, all the effort spent identifying these locations can be lost if their addresses change.
+
+To preserve this work, reverse engineers take advantage of the fact that most programs do not change drastically between updates. While some functions or data may be modified, much of the binary remains the same. Most often, previously identified addresses are simply relocated. This is where `sigmaker` comes in.
+
+Sigmaker lets you create unique patterns to track important parts of a program, making your analysis more resilient to updates. By generating signatures for specific functions, data references, or other critical locations, you can quickly relocate these points in a new version of the binary, saving time and effort in future reverse engineering tasks.
 
 ## Requirements
 
+- IDA Pro 9.0+
 - IDA Python
-- Python 3
+- Python 3.10+
 
 ## Installation
 
-This python port of sigmaker's main value proposition is its cross-platform (Windows, macOS, Linux) Python 3 support. It takes zero third party dependencies, making the code both portable and easy to install.
+sigmaker's main value proposition is its cross-platform (Windows, macOS, Linux) Python 3 support. It uses zero third party dependencies, making the code both portable and easy to install.
 
 - Copy `sigmaker.py` into the /plugins/ folder to the plugin directory!
 - Restart your disassembler.
@@ -76,3 +87,11 @@ Currently, all output formats you can generate are supported.
 Match(es) of your signature will be printed to console:
 
 ![](https://i.imgur.com/Pe4REkX.png)
+
+## Acknowledgements
+
+Thank you to to [@A200K](https://github.com/A200K)'s [IDA-Pro-SigMaker](https://github.com/A200K/IDA-Pro-SigMaker) plugin which served as an inspiration and the initial port of this plugin.
+
+## Contact
+
+ping me on x [@mahmoudimus](https://x.com/mahmoudimus) or you may contact me from any one of the addresses on [mahmoudimus.com](https://mahmoudimus.com).

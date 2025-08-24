@@ -81,7 +81,8 @@ jobs:
               run: |
                   echo "Caching docker image for next run..."
                   mkdir -p /tmp/docker-cache
-                  docker save ghcr.io/mahmoudimus/idapro-linux:baked -o /tmp/docker-cache/idapro-baked.tar || echo "Failed to save image."
+                  docker image ls
+                  docker save $(docker images --format '{{.Repository}}:{{.Tag}}') -o /tmp/docker-cache/idapro-baked.tar || echo "Failed to save image."
                   # Only save the image if it was not restored from cache
                   # The cache will be updated for future runs
                   # Note: actions/cache@v4 will automatically upload the cache at the end of the job

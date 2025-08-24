@@ -41,8 +41,13 @@ jobs:
               with:
                   registry: ghcr.io
                   username: ${{ github.actor }}
-                  password: ${{ secrets.GITHUB_TOKEN }}
+                  password: ${{ secrets.GHCR_TOKEN }}
+
+            - name: Try logging in to GHCR
+              run: |
+                  echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
             - name: Run test_sigmaker.py
               run: |
-                  docker compose run --rm idapro-tests test_sigmaker.py
+                  docker compose run --rm idapro-tests test_sigmaker.py ||  { docker compose logs ; exit 1 ; }
+                  docker compose logs

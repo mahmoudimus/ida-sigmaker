@@ -36,6 +36,7 @@ jobs:
               with:
                   python-version: ${{ matrix.python-version }}
                   cache: "pip"
+
             - name: Login to GHCR (only if private)
               uses: docker/login-action@v3
               with:
@@ -46,6 +47,35 @@ jobs:
             - name: Try logging in to GHCR
               run: |
                   echo "${{ secrets.GHCR_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+            - name: Create a .env file if it doesn't exist
+              run: |
+                  if [ ! -f .env ]; then
+                      echo "Creating .env file..."
+                      touch .env
+                  fi
+
+            - name: Cache Docker image
+              uses: actions/cache@v4
+              with:
+                  path: /tmp/docker-cache
+                  key: docker-image-${{ runner.os }}-idapro-baked-${{ github.sha }}
+                  restore-keys: |
+                      docker-image-${{ runner.os }}-idapro-baked-
+
+            - name: Load cached Docker image or pull fresh
+              run: |
+                  # Try to load from cache first
+                  if [ -f /tmp/docker-cache/idapro-baked.tar ]; then
+                      echo "Loading Docker image from cache..."
+                      docker load < /tmp/docker-cache/idapro-baked.tar
+                  else
+                      echo "Cache miss, pulling fresh image..."
+                      docker pull ghcr.io/mahmoudimus/idapro-linux:baked
+                      # Save to cache for next run
+                      mkdir -p /tmp/docker-cache
+                      docker save ghcr.io/mahmoudimus/idapro-linux:baked > /tmp/docker-cache/idapro-baked.tar
+                  fi
 
             - name: Run test_sigmaker.py
               run: |

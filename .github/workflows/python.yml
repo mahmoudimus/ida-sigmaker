@@ -57,28 +57,31 @@ jobs:
                   fi
 
             - name: Cache Docker image
+              id: docker-cache
               uses: actions/cache@v4
               with:
                   path: /tmp/docker-cache
-                  key: docker-image-${{ runner.os }}-idapro-baked-${{ github.sha }}
+                  key: docker-image-${{ runner.os }}-idapro-baked-${{ hashFiles('docker-compose.yml') }}
                   restore-keys: |
-                      docker-image-${{ runner.os }}-idapro-baked-
+                      docker-image-${{ runner.os }}-idapro-baked-${{ hashFiles('docker-compose.yml') }}
 
             - name: Load cached Docker image or pull fresh
+              if: steps.docker-cache.outputs.cache-hit == 'true'
               run: |
-                  # Try to load from cache first
-                  if [ -f /tmp/docker-cache/idapro-baked.tar ]; then
-                      echo "Loading Docker image from cache..."
-                      docker load < /tmp/docker-cache/idapro-baked.tar
-                  else
-                      echo "Cache miss, pulling fresh image..."
-                      docker pull ghcr.io/mahmoudimus/idapro-linux:baked
-                      # Save to cache for next run
-                      mkdir -p /tmp/docker-cache
-                      docker save ghcr.io/mahmoudimus/idapro-linux:baked > /tmp/docker-cache/idapro-baked.tar
-                  fi
+                  echo "Loading Docker image from cache..."
+                  docker load -i /tmp/docker-cache/idapro-baked.tar || echo "No cached image to load."
 
             - name: Run test_sigmaker.py
               run: |
                   docker compose run --rm idapro-tests test_sigmaker.py ||  { docker compose logs ; exit 1 ; }
                   docker compose logs
+
+            - name: Save Docker image to cache
+              if: steps.docker-cache.outputs.cache-hit != 'true'
+              run: |
+                  echo "Caching docker image for next run..."
+                  mkdir -p /tmp/docker-cache
+                  docker save ghcr.io/mahmoudimus/idapro-linux:baked -o /tmp/docker-cache/idapro-baked.tar || echo "Failed to save image."
+                  # Only save the image if it was not restored from cache
+                  # The cache will be updated for future runs
+                  # Note: actions/cache@v4 will automatically upload the cache at the end of the job

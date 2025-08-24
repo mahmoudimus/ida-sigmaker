@@ -49,5 +49,5 @@ jobs:
 
             - name: Run test_sigmaker.py
               run: |
-                  docker compose run --rm idapro-tests test_sigmaker.py ||  { docker compose logs ; exit 1 ; }
-                  docker compose logs
+                  docker compose run --rm idapro-tests test_sigmaker.py ||  { docker compose logs idapro-tests ; exit 1 ; }
+                  docker compose logs idapro-tests

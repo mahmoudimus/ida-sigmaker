@@ -11,9 +11,14 @@ import contextlib
 import ctypes
 import dataclasses
 import enum
+import functools
+import operator
 import os
 import platform
 import re
+import shlex
+import subprocess
+import sys
 import traceback
 import typing
 
@@ -33,8 +38,6 @@ PLUGIN_NAME: str = "Signature Maker (py)"
 PLUGIN_VERSION: str = __version__
 PLUGIN_AUTHOR: str = __author__
 
-# Toggle to enable QIS signature scanning; left disabled by default.
-USE_QIS_SIGNATURE: bool = False  # _is_avx2_available()
 
 # Default values controlling signature generation heuristics.
 PRINT_TOP_X: int = 5
@@ -52,26 +55,158 @@ WILDCARD_OPTIMIZED_INSTRUCTION: bool = True
 WildcardableOperandTypeBitmask: int = 0
 
 
-def _is_processor_feature_present(feature: int) -> bool:
-    """Return True if the given processor feature is present.
+class OSType(enum.IntEnum):
+    WINDOWS = enum.auto()
+    LINUX = enum.auto()
+    DARWIN = enum.auto()
+    OTHER = enum.auto()
 
-    Parameters
-    ----------
-    feature : int
-        The numeric identifier of the processor feature to check.
 
-    Returns
-    -------
-    bool
-        True if the feature is present, False otherwise or on non-Windows
-        platforms.
-    """
-    if platform.system() != "Windows":
-        return False
+class AVXType(enum.IntEnum):
+    NONE = enum.auto()
+    BASIC = enum.auto()  # baseline (no AVX)
+    AVX = enum.auto()
+    AVX2 = enum.auto()
+    AVX512 = enum.auto()
+
+    @classmethod
+    def of_type(cls, s: str | None) -> "AVXType | None":
+        if not s:
+            return None
+        s = s.strip().lower()
+        if s in ("none", "0"):
+            return cls.NONE
+        if s in ("basic", "1"):
+            return cls.BASIC
+        if s in ("avx", "2"):
+            return cls.AVX
+        if s in ("avx2", "3"):
+            return cls.AVX2
+        if s in ("avx512", "avx-512", "4"):
+            return cls.AVX512
+        return None
+
+
+def _os_type() -> OSType:
+    n = platform.system()
+    if n == "Windows" or "windows" in n.lower():
+        return OSType.WINDOWS
+    if n == "Linux":
+        return OSType.LINUX
+    if n == "Darwin":
+        return OSType.DARWIN
+    return OSType.OTHER
+
+
+def _is_x86_like() -> bool:
+    m = platform.machine().lower()
+    return any(x in m for x in ("x86_64", "amd64", "i686", "x86"))
+
+
+def _is_arm_like() -> bool:
+    m = platform.machine().lower()
+    return any(x in m for x in ("aarch64", "arm64", "armv8", "armv7", "arm"))
+
+
+class WindowsProcessorFeature(enum.IntEnum):
+    PF_AVX_INSTRUCTIONS_AVAILABLE = 39  # The AVX instruction set is available.
+    PF_AVX2_INSTRUCTIONS_AVAILABLE = 40  # The AVX2 instruction set is available.
+    PF_AVX512F_INSTRUCTIONS_AVAILABLE = 41  # The AVX512F instruction set is available.
+
+    @classmethod
+    def supported_avx_type(cls) -> AVXType:
+        if sys.platform != "win32":
+            return AVXType.BASIC
+        k32 = ctypes.windll.kernel32
+        has_avx512 = bool(
+            k32.IsProcessorFeaturePresent(cls.PF_AVX512F_INSTRUCTIONS_AVAILABLE)
+        )
+        if has_avx512:
+            return AVXType.AVX512
+        has_avx2 = bool(
+            k32.IsProcessorFeaturePresent(cls.PF_AVX2_INSTRUCTIONS_AVAILABLE)
+        )
+        if has_avx2:
+            return AVXType.AVX2
+        has_avx = bool(k32.IsProcessorFeaturePresent(cls.PF_AVX_INSTRUCTIONS_AVAILABLE))
+        if has_avx:
+            return AVXType.AVX
+        # (SSE2 presence implies BASIC baseline)
+        return AVXType.BASIC
+
+
+# ---------- Text-based fallbacks for x86 on Linux/macOS ----------
+def nix_avx_type() -> AVXType:
     try:
-        return bool(ctypes.windll.kernel32.IsProcessorFeaturePresent(feature))
+        if _os_type() == OSType.DARWIN:
+            if _is_x86_like():
+                out = subprocess.check_output(
+                    shlex.split(
+                        "sysctl -n machdep.cpu.features machdep.cpu.leaf7_features"
+                    ),
+                    text=True,
+                ).lower()
+                if "avx512" in out:
+                    return AVXType.AVX512
+                if "avx2" in out:
+                    return AVXType.AVX2
+                if "avx " in out or "avx1.0" in out:
+                    return AVXType.AVX
+                return AVXType.BASIC
+            if _is_arm_like():
+                out = subprocess.check_output(
+                    shlex.split("sysctl -n hw.optional.neon"),
+                    text=True,
+                ).lower()
+                if "1" in out:
+                    return AVXType.AVX2
+                return AVXType.BASIC
+        if _os_type() == OSType.LINUX and _is_x86_like():
+            txt = ""
+            try:
+                with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
+                    txt = f.read().lower()
+            except Exception:
+                pass
+            if not txt:
+                txt = subprocess.check_output(
+                    ["lscpu"], text=True, stderr=subprocess.DEVNULL
+                ).lower()
+            if "avx512" in txt:
+                return AVXType.AVX512
+            if "avx2" in txt:
+                return AVXType.AVX2
+            if " avx " in txt:
+                return AVXType.AVX
+            return AVXType.BASIC
     except Exception:
-        return False
+        pass
+    return AVXType.BASIC
+
+
+@functools.cache
+def get_cpu_avx_support() -> tuple[OSType, AVXType]:
+    """
+    Returns (OSType, AVXType).
+    Honors env override: SIGMAKER_AVX in {'none','basic','avx','avx2','avx512','0'..'4'}
+    """
+    os_type = _os_type()
+
+    # 0) Env override
+    env = AVXType.of_type(os.getenv("SIGMAKER_AVX"))
+    if env is not None:
+        return os_type, env
+
+    # 1) ARM families have no AVX (short-circuit)
+    if _is_arm_like():
+        return os_type, AVXType.BASIC
+
+    # 2) Windows fallback API
+    if os_type == OSType.WINDOWS:
+        return os_type, WindowsProcessorFeature.supported_avx_type()
+
+    # 4) Unix text fallbacks (mac x86, linux x86)
+    return os_type, nix_avx_type()
 
 
 def _is_avx2_available() -> bool:
@@ -86,28 +221,26 @@ def _is_avx2_available() -> bool:
     bool
         True if AVX2 instructions are available, False otherwise.
     """
-    # Check for AVX2 feature to enable QIS signature scanning.
-    pf_avx2_instructions_available = 10
-    return _is_processor_feature_present(pf_avx2_instructions_available)
+
+    return get_cpu_avx_support()[1] >= AVXType.AVX2
 
 
-def bit(x: int) -> int:
-    """Return a bitmask with only bit ``x`` set.
+bit = functools.partial(operator.lshift, 1)
+"""Return a bitmask with only bit ``x`` set.
 
-    This is a convenience wrapper around the left-shift operator used
-    throughout this module for constructing operand type masks.
+This is a convenience wrapper around the left-shift operator used
+throughout this module for constructing operand type masks.
 
-    Parameters
-    ----------
-    x : int
-        The bit number to set.
+Parameters
+----------
+x : int
+    The bit number to set.
 
-    Returns
-    -------
-    int
-        ``1 << x``.
-    """
-    return 1 << x
+Returns
+-------
+int
+    ``1 << x``.
+"""
 
 
 class SignatureType(enum.Enum):
@@ -565,7 +698,7 @@ class SignatureMakerForm(ida_kernwin.Form):
             f"""STARTITEM 0
 BUTTON YES* OK
 BUTTON CANCEL Cancel
-Signature Maker v{PLUGIN_VERSION} {("(AVX2)" if USE_QIS_SIGNATURE else "")}"""
+Signature Maker v{PLUGIN_VERSION} {("(AVX2)" if _is_avx2_available() else "")}"""
             + r"""
 {FormChangeCb}
 Select action:
@@ -898,7 +1031,7 @@ class SigMaker(ida_idaapi.plugin_t):
 
     def find_signature_occurrences(self, ida_signature: str) -> typing.List[int]:
         """Search for occurrences of a binary pattern using IDA's API."""
-        if USE_QIS_SIGNATURE:
+        if _is_avx2_available():
             return self.find_signature_occurrences_qis(ida_signature)
         binary_pattern = idaapi.compiled_binpat_vec_t()
         idaapi.parse_binpat_str(
@@ -1018,7 +1151,6 @@ class SigMaker(ida_idaapi.plugin_t):
                 return signature
 
             current_address += current_instruction_length
-            
 
             if (
                 not continue_outside_of_function

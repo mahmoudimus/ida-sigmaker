@@ -63,7 +63,7 @@ def _is_processor_feature_present(feature: int) -> bool:
     Returns
     -------
     bool
-        True if the feature is present, False otherwise or on non‑Windows
+        True if the feature is present, False otherwise or on non-Windows
         platforms.
     """
     if platform.system() != "Windows":
@@ -94,7 +94,7 @@ def _is_avx2_available() -> bool:
 def bit(x: int) -> int:
     """Return a bitmask with only bit ``x`` set.
 
-    This is a convenience wrapper around the left‑shift operator used
+    This is a convenience wrapper around the left-shift operator used
     throughout this module for constructing operand type masks.
 
     Parameters
@@ -206,7 +206,7 @@ class Clipboard:
     def set_text(cls, text: str) -> bool:
         """Set the clipboard text on the current operating system.
 
-        This method first attempts to use PyQt5 for cross‑platform clipboard
+        This method first attempts to use PyQt5 for cross-platform clipboard
         support and falls back to platform specific implementations.
 
         Parameters
@@ -698,7 +698,7 @@ def is_disassembly_widget(widget, popup, ctx) -> bool:
 
 
 class _PopupHook(idaapi.UI_Hooks):
-    """Hook used to attach actions to IDA pop‑ups."""
+    """Hook used to attach actions to IDA pop-ups."""
 
     def __init__(
         self,

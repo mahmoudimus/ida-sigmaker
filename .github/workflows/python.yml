@@ -38,6 +38,10 @@ jobs:
                   python-version: ${{ matrix.python-version }}
                   # cache: "pip"
 
+            - name: Run unit tests
+              run: |
+                  python -m unittest discover tests -p "unit_*.py"
+
             - name: Login to GHCR (only if private)
               uses: docker/login-action@v3
               with:
@@ -71,9 +75,9 @@ jobs:
                   echo "Loading Docker image from cache..."
                   docker load -i /tmp/docker-cache/idapro-baked.tar || echo "No cached image to load."
 
-            - name: Run test_sigmaker.py
+            - name: Run integration tests
               run: |
-                  docker compose run --rm idapro-tests test_sigmaker.py ||  { docker compose logs ; exit 1 ; }
+                  docker compose run --rm idapro-tests -m unittest discover . -p "integration_*.py"  2>/dev/null ||  { docker compose logs ; exit 1 ; }
                   docker compose logs
 
             - name: Save Docker image to cache

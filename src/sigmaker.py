@@ -22,12 +22,6 @@ import sys
 import traceback
 import typing
 
-import ida_bytes
-import ida_ida
-import ida_idaapi
-import ida_idp
-import ida_kernwin
-import ida_xref
 import idaapi
 import idc
 
@@ -48,7 +42,7 @@ MAX_XREF_SIGNATURE_LENGTH: int = 250
 FILE_BUFFER: typing.Optional[bytes] = None
 
 # Determine the current processor architecture for operand handling.
-PROCESSOR_ARCH: int = ida_idp.ph_get_id()
+PROCESSOR_ARCH: int = idaapi.ph_get_id()
 
 # Global bitmask controlling which operand types may be wildcarded.
 WILDCARD_OPTIMIZED_INSTRUCTION: bool = True
@@ -62,15 +56,20 @@ class OSType(enum.IntEnum):
     OTHER = enum.auto()
 
 
-class AVXType(enum.IntEnum):
+class SIMDType(enum.IntEnum):
+    #: specifically for testing
     NONE = enum.auto()
-    BASIC = enum.auto()  # baseline (no AVX)
-    AVX = enum.auto()
-    AVX2 = enum.auto()
-    AVX512 = enum.auto()
+    #: baseline, no SIMD
+    BASIC = enum.auto()
+    #: AVX on x86, NEON on ARM
+    SIMD = enum.auto()
+    #: AVX2 on x86, Advanced NEON on ARM
+    SIMD2 = enum.auto()
+    #: AVX512 on x86, SVE on ARM (future)
+    SIMD512 = enum.auto()
 
     @classmethod
-    def of_type(cls, s: str | None) -> "AVXType | None":
+    def of_type(cls, s: str | None) -> "SIMDType | None":
         if not s:
             return None
         s = s.strip().lower()
@@ -78,152 +77,385 @@ class AVXType(enum.IntEnum):
             return cls.NONE
         if s in ("basic", "1"):
             return cls.BASIC
-        if s in ("avx", "2"):
-            return cls.AVX
-        if s in ("avx2", "3"):
-            return cls.AVX2
-        if s in ("avx512", "avx-512", "4"):
-            return cls.AVX512
+        if s in ("simd", "2"):
+            return cls.SIMD
+        if s in ("simd2", "3"):
+            return cls.SIMD2
+        if s in ("simd512", "4"):
+            return cls.SIMD512
         return None
 
 
-def _os_type() -> OSType:
-    n = platform.system()
-    if n == "Windows" or "windows" in n.lower():
-        return OSType.WINDOWS
-    if n == "Linux":
-        return OSType.LINUX
-    if n == "Darwin":
-        return OSType.DARWIN
-    return OSType.OTHER
+class SystemInterface:
+    """Abstract interface for system operations to enable testing."""
+
+    def get_platform_system(self) -> str:
+        return platform.system()
+
+    def get_platform_machine(self) -> str:
+        return platform.machine()
+
+    def get_sys_platform(self) -> str:
+        return sys.platform
+
+    def get_env_var(self, name: str) -> str | None:
+        return os.getenv(name)
+
+    def run_subprocess(
+        self, cmd: list[str] | str, text: bool = True, stderr=None
+    ) -> str:
+        if isinstance(cmd, str):
+            cmd = shlex.split(cmd)
+        return subprocess.check_output(cmd, text=text, stderr=stderr)
+
+    def read_file(
+        self, path: str, encoding: str = "utf-8", errors: str = "ignore"
+    ) -> str:
+        with open(path, "r", encoding=encoding, errors=errors) as f:
+            return f.read()
+
+    def is_running_in_docker(self) -> bool:
+        """Check if we're running inside a Docker container."""
+        # Check environment variable first
+        if self.get_env_var("SIGMAKER_DOCKER"):
+            return True
+
+        # Check /proc/mounts for Docker overlay filesystem
+        try:
+            mounts = self.read_file("/proc/mounts")
+            return "docker" in mounts.lower() and "overlay" in mounts.lower()
+        except Exception:
+            return False
+
+    def file_exists(self, path: str) -> bool:
+        """Check if a file exists."""
+        return os.path.exists(path)
 
 
-def _is_x86_like() -> bool:
-    m = platform.machine().lower()
-    return any(x in m for x in ("x86_64", "amd64", "i686", "x86"))
+@dataclasses.dataclass(frozen=True, slots=True)
+class CPUFeature:
+    os_type: OSType
+    simd_type: SIMDType
 
 
-def _is_arm_like() -> bool:
-    m = platform.machine().lower()
-    return any(x in m for x in ("aarch64", "arm64", "armv8", "armv7", "arm"))
+class CPUFeatureDetector:
+    """Encapsulated CPU feature detection with testable interfaces."""
+
+    def __init__(self, system_interface: SystemInterface | None = None):
+        self.system = system_interface or SystemInterface()
+
+    def get_os_type(self) -> OSType:
+        """Detect the operating system type."""
+        n = self.system.get_platform_system()
+        if n == "Windows" or "windows" in n.lower():
+            return OSType.WINDOWS
+        if n == "Linux":
+            return OSType.LINUX
+        if n == "Darwin":
+            return OSType.DARWIN
+        return OSType.OTHER
+
+    def is_x86_like(self) -> bool:
+        """Check if the processor architecture is x86-like."""
+        m = self.system.get_platform_machine().lower()
+        return any(x in m for x in ("x86_64", "amd64", "i686", "x86"))
+
+    def is_arm_like(self) -> bool:
+        """Check if the processor architecture is ARM-like."""
+        m = self.system.get_platform_machine().lower()
+        return any(x in m for x in ("aarch64", "arm64", "armv8", "armv7", "arm"))
+
+    @functools.lru_cache(maxsize=1)
+    def get_cpu_simd_support(self) -> CPUFeature:
+        """
+        Returns CPUFeature.
+        Honors env override: SIGMAKER_SIMD in {'none','basic','simd','simd2','simd512','0'..'4'}
+        """
+
+        os_type = self.get_os_type()
+
+        # 0) Env override
+        env = SIMDType.of_type(self.system.get_env_var("SIGMAKER_SIMD"))
+        if env is not None:
+            return CPUFeature(os_type, env)
+
+        # 1) Windows fallback API
+        if os_type == OSType.WINDOWS:
+            simd_type = WindowsProcessorFeature.supported_simd_type()
+        else:
+            # 2) Unix text fallbacks (mac x86/arm, linux x86)
+            simd_type = UnixLikeProcessorFeature.supported_simd_type(self.system)
+
+        return CPUFeature(os_type, simd_type)
+
+    def is_simd2_available(self) -> bool:
+        """Return True if the CPU supports advanced SIMD instructions.
+
+        This helper checks whether advanced SIMD instruction sets are available
+        (x86 AVX2, ARM Advanced NEON). Advanced SIMD support can enable
+        faster signature scanning routines.
+
+        Returns
+        -------
+        bool
+            True if advanced SIMD instructions are available, False otherwise.
+        """
+        return self.get_cpu_simd_support().simd_type >= SIMDType.SIMD2
+
+    def clear_cache(self):
+        """Clear the internal cache for testing purposes."""
+        self.get_cpu_simd_support.cache_clear()
 
 
 class WindowsProcessorFeature(enum.IntEnum):
-    PF_AVX_INSTRUCTIONS_AVAILABLE = 39  # The AVX instruction set is available.
-    PF_AVX2_INSTRUCTIONS_AVAILABLE = 40  # The AVX2 instruction set is available.
-    PF_AVX512F_INSTRUCTIONS_AVAILABLE = 41  # The AVX512F instruction set is available.
+    """Windows-specific processor feature detection."""
+
+    #: The x86 AVX instruction set is available.
+    PF_AVX_INSTRUCTIONS_AVAILABLE = 39
+    #: The x86 AVX2 instruction set is available.
+    PF_AVX2_INSTRUCTIONS_AVAILABLE = 40
+    #: The x86 AVX512F instruction set is available.
+    PF_AVX512F_INSTRUCTIONS_AVAILABLE = 41
 
     @classmethod
-    def supported_avx_type(cls) -> AVXType:
-        if sys.platform != "win32":
-            return AVXType.BASIC
-        k32 = ctypes.windll.kernel32
-        has_avx512 = bool(
-            k32.IsProcessorFeaturePresent(cls.PF_AVX512F_INSTRUCTIONS_AVAILABLE)
-        )
-        if has_avx512:
-            return AVXType.AVX512
-        has_avx2 = bool(
-            k32.IsProcessorFeaturePresent(cls.PF_AVX2_INSTRUCTIONS_AVAILABLE)
-        )
-        if has_avx2:
-            return AVXType.AVX2
-        has_avx = bool(k32.IsProcessorFeaturePresent(cls.PF_AVX_INSTRUCTIONS_AVAILABLE))
-        if has_avx:
-            return AVXType.AVX
-        # (SSE2 presence implies BASIC baseline)
-        return AVXType.BASIC
+    def supported_simd_type(cls, system: SystemInterface | None = None) -> SIMDType:
+        """Detect SIMD support on Windows using processor feature detection."""
+        # For testing: if system is provided, use mock system platform
+        if system is not None:
+            if system.get_sys_platform().lower() != "win32":
+                return SIMDType.BASIC
+
+            # Skip NONE and BASIC from SIMDType enum, only use SIMD, SIMD2, SIMD512
+            # Check in reverse order to get the highest SIMD level
+            for feature, simd_type in reversed(
+                list(zip(cls, [SIMDType.SIMD, SIMDType.SIMD2, SIMDType.SIMD512]))
+            ):
+                is_present = getattr(
+                    system, "is_processor_feature_present", lambda f: False
+                )(feature)
+                if is_present:
+                    return simd_type
+            return SIMDType.BASIC
+
+        # Production: use actual system platform
+        if sys.platform.lower() != "win32":
+            return SIMDType.BASIC
+
+        # Production: use actual Windows API
+        k32 = ctypes.windll.kernel32  # type: ignore
+
+        # Skip NONE and BASIC from SIMDType enum, only use SIMD, SIMD2, SIMD512
+        # Check in reverse order to get the highest SIMD level
+        for feature, simd_type in reversed(
+            list(zip(cls, [SIMDType.SIMD, SIMDType.SIMD2, SIMDType.SIMD512]))
+        ):
+            if k32.IsProcessorFeaturePresent(feature):
+                return simd_type
+        return SIMDType.BASIC
 
 
-# ---------- Text-based fallbacks for x86 on Linux/macOS ----------
-def nix_avx_type() -> AVXType:
-    try:
-        if _os_type() == OSType.DARWIN:
-            if _is_x86_like():
-                out = subprocess.check_output(
-                    shlex.split(
-                        "sysctl -n machdep.cpu.features machdep.cpu.leaf7_features"
-                    ),
-                    text=True,
-                ).lower()
-                if "avx512" in out:
-                    return AVXType.AVX512
-                if "avx2" in out:
-                    return AVXType.AVX2
-                if "avx " in out or "avx1.0" in out:
-                    return AVXType.AVX
-                return AVXType.BASIC
-            if _is_arm_like():
-                out = subprocess.check_output(
-                    shlex.split("sysctl -n hw.optional.neon"),
-                    text=True,
-                ).lower()
-                if "1" in out:
-                    return AVXType.AVX2
-                return AVXType.BASIC
-        if _os_type() == OSType.LINUX and _is_x86_like():
-            txt = ""
-            try:
-                with open("/proc/cpuinfo", "r", encoding="utf-8", errors="ignore") as f:
-                    txt = f.read().lower()
-            except Exception:
-                pass
-            if not txt:
-                txt = subprocess.check_output(
-                    ["lscpu"], text=True, stderr=subprocess.DEVNULL
-                ).lower()
-            if "avx512" in txt:
-                return AVXType.AVX512
-            if "avx2" in txt:
-                return AVXType.AVX2
-            if " avx " in txt:
-                return AVXType.AVX
-            return AVXType.BASIC
-    except Exception:
-        pass
-    return AVXType.BASIC
+class X86EmulationDetector:
+    """Detects x86-on-ARM emulation scenarios (e.g., Rosetta, Docker on ARM)."""
+
+    @classmethod
+    def is_emulated_x86_on_arm(cls, system: SystemInterface) -> bool:
+        """Detect if we're running x86 code emulated on ARM (e.g., Rosetta, Docker on ARM)."""
+        if not system.is_running_in_docker():
+            return False
+
+        try:
+            # Check if platform.machine() reports x86 (emulated view)
+            platform_machine = system.get_platform_machine().lower()
+            platform_claims_x86 = any(
+                arch in platform_machine for arch in ("x86_64", "amd64", "i686", "x86")
+            )
+
+            if not platform_claims_x86:
+                return False
+
+            # Get lscpu output to check real CPU architecture
+            lscpu_output = system.run_subprocess(
+                ["lscpu"], stderr=subprocess.DEVNULL
+            ).lower()
+
+            # Check if lscpu shows ARM architecture (real view)
+            lscpu_shows_arm = any(
+                arch in lscpu_output
+                for arch in ("aarch64", "arm64", "armv8", "armv7", "arm")
+            )
+
+            # Check for ARM-specific indicators
+            has_apple_vendor = "apple" in lscpu_output
+            has_neon_flags = any(flag in lscpu_output for flag in ("asimd", "neon"))
+
+            # Emulation detected if: platform claims x86 BUT lscpu shows ARM architecture or ARM-specific features
+            return platform_claims_x86 and (
+                lscpu_shows_arm or has_apple_vendor or has_neon_flags
+            )
+        except Exception:
+            return False
+
+    @classmethod
+    def get_emulated_simd_support_from_neon(cls, system: SystemInterface) -> SIMDType:
+        """Map ARM NEON capabilities to equivalent SIMD support levels for emulated environments."""
+        try:
+            # For emulated environments, check for NEON/ASIMD support
+            lscpu_output = system.run_subprocess(
+                ["lscpu"], stderr=subprocess.DEVNULL
+            ).lower()
+
+            # ASIMD (Advanced SIMD) is ARM's equivalent to x86 AVX
+            if "asimd" in lscpu_output or "neon" in lscpu_output:
+                # Modern ARM processors with NEON can emulate x86 AVX2-level operations
+                return SIMDType.SIMD2
+
+            return SIMDType.BASIC
+        except Exception:
+            return SIMDType.BASIC
 
 
-@functools.cache
-def get_cpu_avx_support() -> tuple[OSType, AVXType]:
-    """
-    Returns (OSType, AVXType).
-    Honors env override: SIGMAKER_AVX in {'none','basic','avx','avx2','avx512','0'..'4'}
-    """
-    os_type = _os_type()
+class UnixLikeProcessorFeature:
+    """Unix-like systems (Linux/macOS) processor feature detection."""
 
-    # 0) Env override
-    env = AVXType.of_type(os.getenv("SIGMAKER_AVX"))
-    if env is not None:
-        return os_type, env
+    @classmethod
+    def supported_simd_type(cls, system: SystemInterface | None = None) -> SIMDType:
+        """Detect SIMD support on Unix-like systems (Linux/macOS)."""
+        if system is None:
+            system = SystemInterface()
 
-    # 1) ARM families have no AVX (short-circuit)
-    if _is_arm_like():
-        return os_type, AVXType.BASIC
+        try:
+            # Check for emulated x86 on ARM first (Docker with Rosetta, etc.)
+            if X86EmulationDetector.is_emulated_x86_on_arm(system):
+                return X86EmulationDetector.get_emulated_simd_support_from_neon(system)
 
-    # 2) Windows fallback API
-    if os_type == OSType.WINDOWS:
-        return os_type, WindowsProcessorFeature.supported_avx_type()
+            os_type = cls._get_os_type(system)
 
-    # 4) Unix text fallbacks (mac x86, linux x86)
-    return os_type, nix_avx_type()
+            if os_type == OSType.DARWIN:
+                return cls._detect_darwin_simd(system)
+            elif os_type == OSType.LINUX:
+                return cls._detect_linux_simd(system)
+            else:
+                return SIMDType.BASIC
+
+        except Exception:
+            return SIMDType.BASIC
+
+    @classmethod
+    def _detect_darwin_simd(cls, system: SystemInterface) -> SIMDType:
+        """Detect SIMD support on macOS/Darwin systems."""
+        if cls._is_x86_like(system):
+            return cls._detect_darwin_x86_simd(system)
+        elif cls._is_arm_like(system):
+            return cls._detect_darwin_arm_simd(system)
+        else:
+            return SIMDType.BASIC
+
+    @classmethod
+    def _detect_darwin_x86_simd(cls, system: SystemInterface) -> SIMDType:
+        """Detect SIMD support on macOS x86 systems."""
+        out = system.run_subprocess(
+            "sysctl -n machdep.cpu.features machdep.cpu.leaf7_features"
+        ).lower()
+        return cls._parse_simd_features(out)
+
+    @classmethod
+    def _detect_darwin_arm_simd(cls, system: SystemInterface) -> SIMDType:
+        """Detect SIMD support on macOS ARM systems."""
+        out = system.run_subprocess("sysctl -n hw.optional.neon").lower()
+        if "1" in out:
+            return SIMDType.SIMD2
+        return SIMDType.BASIC
+
+    @classmethod
+    def _detect_linux_simd(cls, system: SystemInterface) -> SIMDType:
+        """Detect SIMD support on Linux systems."""
+        if not cls._is_x86_like(system):
+            return SIMDType.BASIC
+
+        txt = cls._get_linux_cpu_info(system)
+        return cls._parse_simd_features(txt)
+
+    @classmethod
+    def _get_linux_cpu_info(cls, system: SystemInterface) -> str:
+        """Get CPU information on Linux systems."""
+
+        try:
+            result = system.read_file("/proc/cpuinfo").lower()
+            if result:
+                return result
+        except (FileNotFoundError, PermissionError):
+            # File not found or not accessible, fall back to lscpu
+            pass
+
+        # Fall back to lscpu
+        try:
+            return system.run_subprocess(["lscpu"], stderr=subprocess.DEVNULL).lower()
+        except Exception:
+            # lscpu failed, return empty string
+            return ""
+
+    @classmethod
+    def _parse_simd_features(cls, features_text: str) -> SIMDType:
+        """Parse SIMD features from system output and return appropriate SIMD type."""
+        # Split the features text into individual feature names
+        features = features_text.lower().split()
+
+        # Check for AVX-512 features first (highest priority)
+        if any(feature in ("avx512f", "avx512") for feature in features):
+            return SIMDType.SIMD512
+
+        # Check for AVX2 features
+        if "avx2" in features:
+            return SIMDType.SIMD2
+
+        # Check for AVX features
+        if "avx" in features:
+            return SIMDType.SIMD
+
+        return SIMDType.BASIC
+
+    @classmethod
+    def _get_os_type(cls, system: SystemInterface) -> OSType:
+        """Detect the operating system type."""
+        n = system.get_platform_system()
+        if n == "Windows" or "windows" in n.lower():
+            return OSType.WINDOWS
+        if n == "Linux":
+            return OSType.LINUX
+        if n == "Darwin":
+            return OSType.DARWIN
+        return OSType.OTHER
+
+    @classmethod
+    def _is_x86_like(cls, system: SystemInterface) -> bool:
+        """Check if the processor architecture is x86-like."""
+        m = system.get_platform_machine().lower()
+        return any(x in m for x in ("x86_64", "amd64", "i686", "x86"))
+
+    @classmethod
+    def _is_arm_like(cls, system: SystemInterface) -> bool:
+        """Check if the processor architecture is ARM-like."""
+        m = system.get_platform_machine().lower()
+        return any(x in m for x in ("aarch64", "arm64", "armv8", "armv7", "arm"))
 
 
-def _is_avx2_available() -> bool:
-    """Return True if the CPU supports AVX2 instructions.
+# def _is_simd2_available(detector: typing.Optional[CPUFeatureDetector] = None) -> bool:
+#     """Return True if the CPU supports advanced SIMD instructions.
 
-    This helper wraps `_is_processor_feature_present()` and simply checks
-    whether the AVX2 instruction set is available.  AVX2 support can enable
-    faster signature scanning routines.
+#     This helper checks whether advanced SIMD instruction sets are available
+#     (AVX2 on x86, Advanced NEON on ARM). Advanced SIMD support can enable
+#     faster signature scanning routines.
 
-    Returns
-    -------
-    bool
-        True if AVX2 instructions are available, False otherwise.
-    """
+#     Returns
+#     -------
+#     bool
+#         True if advanced SIMD instructions are available, False otherwise.
+#     """
+#     if detector is None:
+#         detector = CPUFeatureDetector()
+#     return detector.is_simd2_available()
 
-    return get_cpu_avx_support()[1] >= AVXType.AVX2
-
+cpu_feature_detector = CPUFeatureDetector()
 
 bit = functools.partial(operator.lshift, 1)
 """Return a bitmask with only bit ``x`` set.
@@ -301,20 +533,20 @@ class ProgressDialog:
     __call__ = configure  # Allow calling instance to reconfigure.
 
     def __enter__(self) -> "ProgressDialog":
-        ida_kernwin.show_wait_box(self._message())
+        idaapi.show_wait_box(self._message())
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
-        ida_kernwin.hide_wait_box()
+        idaapi.hide_wait_box()
 
     def replace_message(self, new_message: str, hide_cancel: bool = False) -> None:
         """Replace the currently displayed message."""
         msg = self._message(message=new_message, hide_cancel=hide_cancel)
-        ida_kernwin.replace_wait_box(msg)
+        idaapi.replace_wait_box(msg)
 
     def user_canceled(self) -> bool:
         """Return True if the user has canceled the wait box."""
-        return ida_kernwin.user_cancelled()
+        return idaapi.user_cancelled()
 
     # Provide alias with alternative spelling for backwards compatibility.
     user_cancelled = user_canceled
@@ -476,7 +708,7 @@ def add_byte_to_signature(signature: Signature, address: int, wildcard: bool) ->
     wildcard : bool
         Whether the added byte should be marked as a wildcard.
     """
-    b = ida_bytes.get_byte(address)
+    b = idaapi.get_byte(address)
     signature.append(SignatureByte(b, wildcard))
 
 
@@ -543,11 +775,11 @@ class Unexpected(Exception):
     """Exception type used throughout the module to indicate unexpected errors."""
 
 
-class ConfigureOperandWildcardBitmaskForm(ida_kernwin.Form):
+class ConfigureOperandWildcardBitmaskForm(idaapi.Form):
     """Interactive form to configure wildcardable operands using checkboxes."""
 
     def __init__(self) -> None:
-        F = ida_kernwin.Form
+        F = idaapi.Form
         # Define the form layout
         form_text = """BUTTON YES* OK
 BUTTON CANCEL Cancel
@@ -573,8 +805,8 @@ Select operand types that should be wildcarded:
         ]
 
         # Processor-specific operand types
-        proc_arch = ida_idp.ph_get_id()
-        if proc_arch == ida_idp.PLFM_386:
+        proc_arch = idaapi.ph_get_id()
+        if proc_arch == idaapi.PLFM_386:
             form_text += """
 <Trace Register :{opt8}>
 <Debug Register :{opt9}>
@@ -598,7 +830,7 @@ Select operand types that should be wildcarded:
                     "opt16",
                 ]
             )
-        elif proc_arch == ida_idp.PLFM_ARM:
+        elif proc_arch == idaapi.PLFM_ARM:
             form_text += """
 <(Unused) :{opt8}>
 <Register list (for LDM/STM) :{opt9}>
@@ -610,7 +842,7 @@ Select operand types that should be wildcarded:
             registers.extend(
                 ["opt8", "opt9", "opt10", "opt11", "opt12", "opt13", "opt14"]
             )
-        elif proc_arch == ida_idp.PLFM_PPC:
+        elif proc_arch == idaapi.PLFM_PPC:
             form_text += """
 <Special purpose register :{opt8}>
 <Two FPRs :{opt9}>
@@ -636,20 +868,20 @@ Select operand types that should be wildcarded:
 
     def OnFormChange(self, fid: int) -> int:
         """Callback invoked when the form state changes."""
-        if fid == self.cWildcardableOperands.id:
+        if fid == self.cWildcardableOperands.id:  # type: ignore
             global WildcardableOperandTypeBitmask
             # Re-shift by one because we skipped o_void
             WildcardableOperandTypeBitmask = (
-                self.GetControlValue(self.cWildcardableOperands) << 1
+                self.GetControlValue(self.cWildcardableOperands) << 1  # type: ignore
             )
         return 1
 
 
-class ConfigureOptionsForm(ida_kernwin.Form):
+class ConfigureOptionsForm(idaapi.Form):
     """Interactive form to configure XREF and signature generation options."""
 
     def __init__(self) -> None:
-        F = ida_kernwin.Form
+        F = idaapi.Form
 
         # Define the form layout
         form_text = """BUTTON YES* OK
@@ -689,16 +921,16 @@ Options
         return result
 
 
-class SignatureMakerForm(ida_kernwin.Form):
+class SignatureMakerForm(idaapi.Form):
     """Main form presented when the user invokes the SigMaker plugin."""
 
     def __init__(self) -> None:
-        F = ida_kernwin.Form
+        F = idaapi.Form
         form_text = (
             f"""STARTITEM 0
 BUTTON YES* OK
 BUTTON CANCEL Cancel
-Signature Maker v{PLUGIN_VERSION} {("(AVX2)" if _is_avx2_available() else "")}"""
+Signature Maker v{PLUGIN_VERSION} {("(SIMD2)" if cpu_feature_detector.is_simd2_available() else "")}"""
             + r"""
 {FormChangeCb}
 Select action:
@@ -730,7 +962,7 @@ Quick Options:
             "rOutputFormat": F.RadGroupControl(
                 ("rIDASig", "rx64DbgSig", "rByteArrayMaskSig", "rRawBytesBitmaskSig")
             ),
-            "cGroupOptions": ida_kernwin.Form.ChkGroupControl(
+            "cGroupOptions": idaapi.Form.ChkGroupControl(
                 ("cWildcardOperands", "cContinueOutside", "cWildcardOptimized"),
                 value=5,
             ),
@@ -763,7 +995,7 @@ def set_wildcardable_operand_type_bitmask() -> None:
     global WildcardableOperandTypeBitmask
 
     # Default wildcard setting depending on processor arch
-    if PROCESSOR_ARCH == ida_idp.PLFM_386:
+    if PROCESSOR_ARCH == idaapi.PLFM_386:
         o_ymmreg = idc.o_xmmreg + 1
         o_zmmreg = o_ymmreg + 1
         o_kreg = o_zmmreg + 1
@@ -784,7 +1016,7 @@ def set_wildcardable_operand_type_bitmask() -> None:
             | bit(o_zmmreg)
             | bit(o_kreg)
         )
-    elif PROCESSOR_ARCH == ida_idp.PLFM_ARM:
+    elif PROCESSOR_ARCH == idaapi.PLFM_ARM:
         WildcardableOperandTypeBitmask = (
             bit(idc.o_mem)
             | bit(idc.o_phrase)
@@ -793,7 +1025,7 @@ def set_wildcardable_operand_type_bitmask() -> None:
             | bit(idc.o_near)
             | bit(idc.o_imm)
         )
-    elif PROCESSOR_ARCH == ida_idp.PLFM_MIPS:
+    elif PROCESSOR_ARCH == idaapi.PLFM_MIPS:
         WildcardableOperandTypeBitmask = (
             bit(idc.o_mem) | bit(idc.o_far) | bit(idc.o_near)
         )
@@ -861,10 +1093,10 @@ class _PopupHook(idaapi.UI_Hooks):
         return self.widget_populator(self, widget, popup_handle, ctx)
 
 
-class SigMaker(ida_idaapi.plugin_t):
+class SigMaker(idaapi.plugin_t):
     """IDA Pro plugin class implementing signature generation and search."""
 
-    flags = ida_idaapi.PLUGIN_KEEP
+    flags = idaapi.PLUGIN_KEEP
     comment = f"{PLUGIN_NAME} v{PLUGIN_VERSION} for IDA Pro by {PLUGIN_AUTHOR}"
     help = "Select location in disassembly and press CTRL+ALT+S to open menu"
     wanted_name = PLUGIN_NAME
@@ -877,7 +1109,7 @@ class SigMaker(ida_idaapi.plugin_t):
         self.progress_dialog = ProgressDialog()
         self._hooks = self._init_hooks(_PopupHook(self.ACTION_SHOW_SIGMAKER))
         self._register_actions()
-        return ida_idaapi.PLUGIN_KEEP
+        return idaapi.PLUGIN_KEEP
 
     def run(self, arg) -> None:
         self.run_plugin()
@@ -916,7 +1148,7 @@ class SigMaker(ida_idaapi.plugin_t):
     # -------------------------
     def is_arm(self) -> bool:
         """Return True if the current processor is ARM."""
-        procname = ida_ida.inf_get_procname()
+        procname = idaapi.inf_get_procname()
         return "ARM" in procname.upper()
 
     def get_operand_offset_arm(
@@ -926,7 +1158,7 @@ class SigMaker(ida_idaapi.plugin_t):
         operand_length: typing.List[int],
     ) -> bool:
         """ARM specific operand extraction."""
-        for op in instruction.ops:
+        for op in instruction:
             if op.type in {
                 idaapi.o_mem,
                 idaapi.o_far,
@@ -957,7 +1189,7 @@ class SigMaker(ida_idaapi.plugin_t):
             return self.get_operand_offset_arm(
                 instruction, operand_offset, operand_length
             )
-        for op in instruction.ops:
+        for op in instruction:
             if op.type == idaapi.o_void:
                 continue
             # Only process operands that are marked in our bitmask.
@@ -980,7 +1212,7 @@ class SigMaker(ida_idaapi.plugin_t):
         seg = idaapi.get_first_seg()
         while seg:
             size = seg.end_ea - seg.start_ea
-            data = ida_bytes.get_bytes(seg.start_ea, size)
+            data = idaapi.get_bytes(seg.start_ea, size)
             if data:
                 buf.extend(data)
             seg = idaapi.get_next_seg(seg.start_ea)
@@ -1012,7 +1244,7 @@ class SigMaker(ida_idaapi.plugin_t):
         qis_signature = ida_signature.replace("?", "??")
         pattern = self.parse_signature(qis_signature)
         results: typing.List[int] = []
-        base_ea = ida_ida.inf_get_min_ea()
+        base_ea = idaapi.inf_get_min_ea()
         data = FILE_BUFFER
         pat_len = len(pattern)
         i = 0
@@ -1031,23 +1263,23 @@ class SigMaker(ida_idaapi.plugin_t):
 
     def find_signature_occurrences(self, ida_signature: str) -> typing.List[int]:
         """Search for occurrences of a binary pattern using IDA's API."""
-        if _is_avx2_available():
-            return self.find_signature_occurrences_qis(ida_signature)
+        # if cpu_feature_detector.is_simd2_available():
+        #     return self.find_signature_occurrences_qis(ida_signature)
         binary_pattern = idaapi.compiled_binpat_vec_t()
         idaapi.parse_binpat_str(
-            binary_pattern, ida_ida.inf_get_min_ea(), ida_signature, 16
+            binary_pattern, idaapi.inf_get_min_ea(), ida_signature, 16
         )
         results: typing.List[int] = []
-        ea = ida_ida.inf_get_min_ea()
-        _bin_search = getattr(ida_bytes, "bin_search", None)
+        ea = idaapi.inf_get_min_ea()
+        _bin_search = getattr(idaapi, "bin_search", None)
         if not _bin_search:
-            _bin_search = getattr(ida_bytes, "bin_search3")
+            _bin_search = getattr(idaapi, "bin_search3")
         while True:
             occurence, _ = _bin_search(
                 ea,
-                ida_ida.inf_get_max_ea(),
+                idaapi.inf_get_max_ea(),
                 binary_pattern,
-                ida_bytes.BIN_SEARCH_NOCASE | ida_bytes.BIN_SEARCH_FORWARD,
+                idaapi.BIN_SEARCH_NOCASE | idaapi.BIN_SEARCH_FORWARD,
             )
             if occurence == idaapi.BADADDR:
                 break
@@ -1074,7 +1306,7 @@ class SigMaker(ida_idaapi.plugin_t):
         """Generate a unique signature for a single address."""
         if ea == idaapi.BADADDR:
             raise Unexpected("Invalid address")
-        if not idaapi.is_code(ida_bytes.get_flags(ea)):
+        if not idaapi.is_code(idaapi.get_flags(ea)):
             raise Unexpected("Cannot create code signature for data")
         signature: Signature = []
         sig_part_length = 0
@@ -1172,7 +1404,7 @@ class SigMaker(ida_idaapi.plugin_t):
             raise Unexpected("Invalid address")
         signature: Signature = []
         sig_part_length = 0
-        if not idaapi.is_code(ida_bytes.get_flags(ea_start)):
+        if not idaapi.is_code(idaapi.get_flags(ea_start)):
             add_bytes_to_signature(signature, ea_start, ea_end - ea_start, False)
             return signature
 
@@ -1260,22 +1492,22 @@ class SigMaker(ida_idaapi.plugin_t):
     ) -> None:
         """Find XREF signatures to a given address."""
         xref_count = 0
-        xb = ida_xref.xrefblk_t()
-        if xb.first_to(ea, ida_xref.XREF_ALL):
+        xb = idaapi.xrefblk_t()
+        if xb.first_to(ea, idaapi.XREF_ALL):
             while True:
-                if idaapi.is_code(ida_bytes.get_flags(xb.frm)):
+                if idaapi.is_code(idaapi.get_flags(xb.frm)):
                     xref_count += 1
                 if not xb.next_to():
                     break
-        xb = ida_xref.xrefblk_t()
-        if not xb.first_to(ea, ida_xref.XREF_ALL):
+        xb = idaapi.xrefblk_t()
+        if not xb.first_to(ea, idaapi.XREF_ALL):
             return
         i = 0
         shortest_signature_length = max_signature_length + 1
         while True:
             if self.progress_dialog.user_canceled():
                 break
-            if not idaapi.is_code(ida_bytes.get_flags(xb.frm)):
+            if not idaapi.is_code(idaapi.get_flags(xb.frm)):
                 if not xb.next_to():
                     break
                 continue
@@ -1435,18 +1667,18 @@ class SigMaker(ida_idaapi.plugin_t):
             form.Free()
             return
 
-        action = form.rAction.value
-        output_format = form.rOutputFormat.value
-        wildcard_operands = bool(form.cGroupOptions.value & 1)
-        continue_outside_of_function = bool(form.cGroupOptions.value & 2)
-        wildcard_optimized = bool(form.cGroupOptions.value & 4)
+        action = form.rAction.value  # type: ignore
+        output_format = form.rOutputFormat.value  # type: ignore
+        wildcard_operands = bool(form.cGroupOptions.value & 1)  # type: ignore
+        continue_outside_of_function = bool(form.cGroupOptions.value & 2)  # type: ignore
+        wildcard_optimized = bool(form.cGroupOptions.value & 4)  # type: ignore
         form.Free()
 
         sig_type = SignatureType(output_format)
 
         try:
             if action == 0:
-                ea = ida_kernwin.get_screen_ea()
+                ea = idaapi.get_screen_ea()
                 with self.progress_dialog("Generating signature..."):
                     sig = self.generate_unique_signature_for_ea(
                         ea,
@@ -1457,7 +1689,7 @@ class SigMaker(ida_idaapi.plugin_t):
                     )
                     self.print_signature_for_ea(sig, ea, sig_type)
             elif action == 1:
-                ea = ida_kernwin.get_screen_ea()
+                ea = idaapi.get_screen_ea()
                 xref_signatures: typing.List[typing.Tuple[int, Signature]] = []
                 with self.progress_dialog(
                     "Finding references and generating signatures. This can take a while..."
@@ -1503,8 +1735,8 @@ def get_selected_addresses(
     is_selected, start_ea, end_ea = idaapi.read_range_selection(ctx)
     if is_selected:
         return start_ea, end_ea
-    p0, p1 = ida_kernwin.twinpos_t(), ida_kernwin.twinpos_t()
-    ida_kernwin.read_selection(ctx, p0, p1)
+    p0, p1 = idaapi.twinpos_t(), idaapi.twinpos_t()
+    idaapi.read_selection(ctx, p0, p1)
     p0.place(ctx)
     p1.place(ctx)
     if p0.at and p1.at:
@@ -1517,7 +1749,7 @@ def get_selected_addresses(
 
     start_ea = idaapi.get_screen_ea()
     try:
-        end_ea = ida_kernwin.ask_addr(start_ea, "Enter end address for selection:")
+        end_ea = idaapi.ask_addr(start_ea, "Enter end address for selection:")
     finally:
         idc.jumpto(start_ea)
 

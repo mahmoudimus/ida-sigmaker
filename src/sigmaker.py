@@ -27,7 +27,7 @@ import idaapi
 import idc
 
 __author__ = "mahmoudimus"
-__version__ = "1.1.2"
+__version__ = "1.3.0"
 
 PLUGIN_NAME: str = "Signature Maker (py)"
 PLUGIN_VERSION: str = __version__

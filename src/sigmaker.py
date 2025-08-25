@@ -7,6 +7,7 @@ by @mahmoudimus (Mahmoud Abdelkader)
 
 from __future__ import annotations
 
+import contextlib
 import ctypes
 import dataclasses
 import enum
@@ -1017,11 +1018,12 @@ class SigMaker(ida_idaapi.plugin_t):
                 return signature
 
             current_address += current_instruction_length
+            
 
             if (
                 not continue_outside_of_function
                 and current_function
-                and idaapi.get_func(current_address) != current_function
+                and current_address > current_function.end_ea
             ):
                 raise Unexpected("Signature left function scope")
         raise Unexpected("Unknown")
@@ -1278,7 +1280,13 @@ class SigMaker(ida_idaapi.plugin_t):
             idc.msg("Signature does not match!\n")
             return
         for ea in signature_matches:
-            idc.msg(f"Match @ {ea:X}\n")
+            fn_name = None
+            with contextlib.suppress(BaseException):
+                fn_name = idaapi.get_func_name(ea)
+            if fn_name:
+                idc.msg(f"Match @ {ea:X} in {fn_name}\n")
+            else:
+                idc.msg(f"Match @ {ea:X}\n")
 
     # -------------------------
     # Main plugin UI and dispatch

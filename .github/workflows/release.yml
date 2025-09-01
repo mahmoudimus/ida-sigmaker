@@ -32,7 +32,7 @@ jobs:
 
             - name: ✏️ Create release body
               run: |
-                  RELEASE_BODY=$(cat << 'EOF'
+                  echo RELEASE_BODY=$(cat << 'EOF'
                   # sigmaker.py - IDA Python Standalone Python Release
 
                   ## Release Information
@@ -51,7 +51,7 @@ jobs:
                   ## License
                   See the main repository for license information.
                   EOF
-                  )
+                  ) >> $GITHUB_ENV
 
             - name: 📦 Generate Release
               uses: softprops/action-gh-release@v2
@@ -59,10 +59,10 @@ jobs:
                   files: |
                       sigmaker.py
                   draft: false
-                  generate_release_notes: true
+                  generate_release_notes: false
                   tag_name: ${{ steps.version.outputs.version }}
                   body: ${{ env.RELEASE_BODY }}
-                  prerelease: false
-                  name: Release ${{ steps.version.outputs.version }} - IDA Python Standalone Python Release
+                  prerelease: ${{ github.ref != 'refs/heads/main' }}
+                  name: ${{ steps.version.outputs.version }}
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

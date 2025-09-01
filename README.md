@@ -4,27 +4,12 @@
 
 An IDA Pro 9.0+ cross-platform signature maker plugin that works on MacOS/Linux/Windows. The primary goal of this plugin is to work with future versions of IDA without needing to compile against the IDA SDK as well as to allow for easier community contributions.
 
-## What is a "sigmaker"?
-
-Sigmaker stands for "signature maker." It enables users to create unique binary pattern signatures that can identify specific addresses or routines within a binary, even after the binary has been updated.
-
-In malware analysis or binary reverse engineering, a common challenge is pinpointing an important address, such as a function or global variable. However, when the binary is updated, all the effort spent identifying these locations can be lost if their addresses change.
-
-To preserve this work, reverse engineers take advantage of the fact that most programs do not change drastically between updates. While some functions or data may be modified, much of the binary remains the same. Most often, previously identified addresses are simply relocated. This is where `sigmaker` comes in.
-
-Sigmaker lets you create unique patterns to track important parts of a program, making your analysis more resilient to updates. By generating signatures for specific functions, data references, or other critical locations, you can quickly relocate these points in a new version of the binary, saving time and effort in future reverse engineering tasks.
-
-## Requirements
-
-- IDA Pro 9.0+
-- IDA Python
-- Python 3.10+
-
 ## Installation
 
 sigmaker's main value proposition is its cross-platform (Windows, macOS, Linux) Python 3 support. It uses zero third party dependencies, making the code both portable and easy to install.
 
-- Copy `sigmaker.py` into the /plugins/ folder to the plugin directory!
+- Copy [`src/sigmaker/__init__.py`](./src/sigmaker/__init__.py) into the /plugins/ folder to the plugin directory!
+- Rename it to `sigmaker.py`
 - Restart your disassembler.
 
 That's it!
@@ -44,6 +29,22 @@ Default location:
 
 - On Windows: `%APPDATA%/Hex-Rays/IDA Pro`
 - On Linux and Mac: `$HOME/.idapro`
+
+## Requirements
+
+- IDA Pro 9.0+
+- IDA Python
+- Python 3.10+
+
+## What is a "sigmaker"?
+
+Sigmaker stands for "signature maker." It enables users to create unique binary pattern signatures that can identify specific addresses or routines within a binary, even after the binary has been updated.
+
+In malware analysis or binary reverse engineering, a common challenge is pinpointing an important address, such as a function or global variable. However, when the binary is updated, all the effort spent identifying these locations can be lost if their addresses change.
+
+To preserve this work, reverse engineers take advantage of the fact that most programs do not change drastically between updates. While some functions or data may be modified, much of the binary remains the same. Most often, previously identified addresses are simply relocated. This is where `sigmaker` comes in.
+
+Sigmaker lets you create unique patterns to track important parts of a program, making your analysis more resilient to updates. By generating signatures for specific functions, data references, or other critical locations, you can quickly relocate these points in a new version of the binary, saving time and effort in future reverse engineering tasks.
 
 ## Usage
 

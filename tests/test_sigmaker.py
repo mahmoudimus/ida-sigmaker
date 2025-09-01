@@ -126,7 +126,7 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
     def setUpClass(cls):
         """Build the test binary, open database once for all tests"""
         cls.tests_dir = Path(__file__).parent
-        cls.binary_path = cls.tests_dir / "resources/bin/test_binary.exe"
+        cls.binary_path = cls.tests_dir / "_resources/bin/test_binary.exe"
         cls.tempdir = None
         cls.temp_binary_path = None
         cls.database_opened = False
@@ -283,7 +283,7 @@ class TestSignatureSearch(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tests_dir = Path(__file__).parent
-        cls.binary_path = cls.tests_dir / "resources/bin/test_binary.exe"
+        cls.binary_path = cls.tests_dir / "_resources/bin/test_binary.exe"
 
         if not cls.binary_path.exists():
             raise unittest.SkipTest("Test binary not available")
@@ -356,7 +356,7 @@ class TestSignatureGeneration(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tests_dir = Path(__file__).parent
-        cls.binary_path = cls.tests_dir / "resources/bin/test_binary.exe"
+        cls.binary_path = cls.tests_dir / "_resources/bin/test_binary.exe"
 
         if not cls.binary_path.exists():
             raise unittest.SkipTest("Test binary not available")

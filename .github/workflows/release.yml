@@ -1,0 +1,66 @@
+name: Release
+
+on:
+    push:
+        # Sequence of patterns matched against refs/tags
+        tags:
+            - "v*" # Push events to matching v*, i.e. v1.0, v20.15.10
+
+jobs:
+    release:
+        runs-on: ubuntu-24.04
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@v4
+
+            - name: Set up Python
+              uses: actions/setup-python@v5
+              with:
+                  python-version: "3.10"
+
+            - name: Extract version from tag
+              id: version
+              run: |
+                  echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+                  echo "version_clean=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+            - name: Create sigmaker.py from __init__.py
+              run: |
+                  cp src/sigmaker/__init__.py sigmaker.py
+
+            - name: ✏️ Create release body
+              run: |
+                  RELEASE_BODY=$(cat << 'EOF'
+                  # sigmaker.py - IDA Python Standalone Python Release
+
+                  ## Release Information
+                  - **Version**: ${{ steps.version.outputs.version }}
+                  - **Source**: https://github.com/mahmoudimus/ida-sigmaker
+                  - **Author**: @mahmoudimus (Mahmoud Abdelkader)
+
+                  ## Description
+                  This is a standalone release of the IDA Pro signature maker plugin. The file `sigmaker.py` contains the complete plugin code that can be directly imported into IDA Pro.
+
+                  ## Installation
+                  1. Copy `sigmaker.py` to your IDA Pro plugins directory
+                  2. Restart IDA Pro
+                  3. Use Ctrl+Alt+S to access the Signature Maker menu
+
+                  ## License
+                  See the main repository for license information.
+                  EOF
+                  )
+
+            - name: 📦 Generate Release
+              uses: softprops/action-gh-release@v2
+              with:
+                  files: |
+                      sigmaker.py
+                  draft: false
+                  generate_release_notes: true
+                  tag_name: ${{ steps.version.outputs.version }}
+                  body: ${{ env.RELEASE_BODY }}
+                  prerelease: false
+                  name: Release ${{ steps.version.outputs.version }} - IDA Python Standalone Python Release
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -8,9 +8,18 @@ An IDA Pro 9.0+ cross-platform signature maker plugin that works on MacOS/Linux/
 
 sigmaker's main value proposition is its cross-platform (Windows, macOS, Linux) Python 3 support. It uses zero third party dependencies, making the code both portable and easy to install.
 
+### Quick Install
+
 - Copy [`src/sigmaker/__init__.py`](./src/sigmaker/__init__.py) into the /plugins/ folder to the plugin directory!
 - Rename it to `sigmaker.py`
 - Restart your disassembler.
+
+### From Releases
+
+- Download the latest release from the [Releases page](https://github.com/mahmoudimus/ida-sigmaker/releases)
+- Extract `sigmaker.py` from the release package
+- Copy it to your IDA Pro plugins directory
+- Restart IDA Pro
 
 That's it!
 
@@ -92,6 +101,31 @@ Match(es) of your signature will be printed to console:
 ## Acknowledgements
 
 Thank you to to [@A200K](https://github.com/A200K)'s [IDA-Pro-SigMaker](https://github.com/A200K/IDA-Pro-SigMaker) plugin which served as an inspiration and the initial port of this plugin.
+
+## Development & Releases
+
+### Creating Releases
+
+This project uses automated GitHub Actions workflows to create releases. When a version tag is pushed, the workflow automatically:
+
+1. Creates a standalone `sigmaker.py` file
+2. Generates release documentation
+3. Creates a GitHub release with all assets
+4. Includes an automated installation script
+
+### Release Process
+
+- **Automated**: Push a version tag (e.g., `v1.3.0`) to trigger the workflow
+- **Manual**: Use the included `scripts/create_release.py` script for local testing
+- **Documentation**: See [RELEASE_PROCESS.md](./RELEASE_PROCESS.md) for detailed instructions
+
+### Contributing
+
+1. Fork the repository
+2. Create a feature branch
+3. Make your changes
+4. Test thoroughly
+5. Submit a pull request
 
 ## Contact
 

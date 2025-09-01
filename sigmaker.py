@@ -1,1 +1,1 @@
-src/sigmaker.py
+src/sigmaker/__init__.py

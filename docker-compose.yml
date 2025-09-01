@@ -46,7 +46,7 @@ services:
         ports:
             - "65434:65433" # Different port to avoid conflicts
     idapro-tests:
-        image: ghcr.io/mahmoudimus/idapro-linux:baked@sha256:26481cc7cb968cfcda4e50d203ee22d77f76faff3feb99d2c4f56839da8d2cd9
+        image: ghcr.io/mahmoudimus/idapro-linux:baked@sha256:6acc4756c48d3eecfbb85904361365e6f138844f784a93827597074d3d451ab2
         entrypoint: ["python3"]
         working_dir: /work
         environment:
@@ -59,7 +59,6 @@ services:
             - PYTHONWARNINGS=ignore
         volumes:
             - ./src/:/root/.idapro/plugins:ro # the plugin
-            - ./tests:/work:ro # the test suite to operate on
-            - ./tests/out:/out # artifacts and results
+            - ./:/work # the test suite to operate on
 volumes:
     idausr:

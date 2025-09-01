@@ -73,7 +73,7 @@ jobs:
 
             - name: Run test_sigmaker.py
               run: |
-                  docker compose run --rm idapro-tests test_sigmaker.py ||  { docker compose logs ; exit 1 ; }
+                  docker compose run --rm --entrypoint bash idapro-tests -c 'python -m unittest discover . -p "test_*.py" -v' ||  { docker compose logs ; exit 1 ; }
                   docker compose logs
 
             - name: Save Docker image to cache

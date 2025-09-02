@@ -12,7 +12,7 @@ on:
                 required: false
                 default: ""
     workflow_run:
-        workflows: ["ida-sigmaker tests"] # Reference the test workflow name
+        workflows: [ida-sigmaker tests] # Reference the test workflow name
         types:
             - completed
 
@@ -27,54 +27,85 @@ jobs:
     release:
         runs-on: ubuntu-latest
 
-        # if: >
-        #     (
-        #       github.event_name == 'workflow_run' &&
-        #       github.event.workflow_run.conclusion == 'success' &&
-        #       github.event.workflow_run.event == 'release'
-        #     ) || github.event_name == 'workflow_dispatch'
+        if: >
+            (
+              github.event_name == 'workflow_run' &&
+              github.event.workflow_run.conclusion == 'success'
+            ) || (
+              github.event_name == 'push' &&
+              startsWith(github.ref, 'refs/tags/v')
+            ) || (
+              github.event_name == 'workflow_dispatch'
+            )
         steps:
             - name: Look at environment variables
               run: |
-                  echo -e "GITHUB_REF=${{ github.ref }}\n"
-                  echo -e "GITHUB_HEAD_REF=${{ github.head_ref }}\n"
+                  echo -e "GITHUB_REF=${{ github.ref }}"
+                  echo -e "GITHUB_HEAD_REF=${{ github.head_ref }}"
                   echo -e "GITHUB_BASE_REF=${{ github.base_ref }}\n"
-                  echo -e "GITHUB_ACTOR=${{ github.actor }}\n"
-                  echo -e "GITHUB_REPOSITORY=${{ github.repository }}\n"
-                  echo -e "GITHUB_SHA=${{ github.sha }}\n"
-                  echo -e "GITHUB_EVENT_NAME=${{ github.event_name }}\n"
-                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_CONCLUSION=${{ github.event.workflow_run.conclusion }}\n"
-                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_EVENT=${{ github.event.workflow_run.event }}\n"
-                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_REF=${{ github.event.workflow_run.ref }}\n"
-                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_HEAD_BRANCH=${{ github.event.workflow_run.head_branch }}\n"
-                  echo -e "GITHUB_EVENT_INPUTS_TAG=${{ github.event.inputs.tag }}\n"
+                  echo -e "GITHUB_ACTOR=${{ github.actor }}"
+                  echo -e "GITHUB_REPOSITORY=${{ github.repository }}"
+                  echo -e "GITHUB_SHA=${{ github.sha }}"
+                  echo -e "GITHUB_EVENT_NAME=${{ github.event_name }}"
+                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_CONCLUSION=${{ github.event.workflow_run.conclusion }}"
+                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_EVENT=${{ github.event.workflow_run.event }}"
+                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_REF=${{ github.event.workflow_run.ref }}"
+                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_HEAD_BRANCH=${{ github.event.workflow_run.head_branch }}"
+                  echo -e "GITHUB_EVENT_INPUTS_TAG=${{ github.event.inputs.tag }}"
             - name: Dump GitHub context
               env:
                   GITHUB_CONTEXT: ${{ toJson(github) }}
               run: echo "$GITHUB_CONTEXT"
+
+            - name: Extract version from tag
+              id: version
+              run: |
+                  if [ "${{ github.event_name }}" = "workflow_run" ]; then
+                    # get tags pointing at this exact commit
+                    TAGS=$(git tag --points-at HEAD | tr -d '\r')
+                    echo "found tags:"
+                    printf '%s\n' "$TAGS"
+                    # pick the first v* tag (if any)
+                    TAG=$(printf '%s\n' "$TAGS" | grep -E '^v' | head -n1 || true)
+                    if [ -z "$TAG" ]; then
+                        echo "No v* tag points at $GITHUB_SHA; exiting."
+                        exit 78  # neutral (skips job without failing)
+                    fi
+                    echo "ref=refs/tags/$TAG" >> $GITHUB_OUTPUT
+                    echo "tag=$TAG" >> $GITHUB_OUTPUT
+                    echo "version=${TAG#v}" >> $GITHUB_OUTPUT
+                  elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+                    TAG="${{ inputs.tag }}"
+                    echo "ref=${{ inputs.tag  }}" >> $GITHUB_OUTPUT
+                    echo "tag=${TAG#refs/tags/}" >> $GITHUB_OUTPUT
+                    echo "version=${TAG#refs/tags/v}" >> $GITHUB_OUTPUT
+                  else
+                    echo "ref=refs/tags/${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+                    echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+                    echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+                  fi
+
+              #   if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+              #       REF=${{ github.event.inputs.tag_name }}"
+              #       echo "version=${REF#refs/tags/}" >> $GITHUB_OUTPUT
+              #       echo "version_clean=${REF#refs/tags/v}" >> $GITHUB_OUTPUT
+              #   else
+              #       echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+              #       echo "version_clean=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+              #       # echo "::set-output name=tag::$(echo ${{ github.event.workflow_run.ref }} | sed 's|refs/tags/||')"
+              #   fi
+
             - name: Checkout code
               uses: actions/checkout@v4
               with:
-                  ref: ${{ github.event.workflow_run.head_branch }}
+                  ref: ${{ steps.version.outputs.ref }}
+            #   with:
+            #       ref: ${{ github.event.workflow_run.head_branch }}
 
             - name: Set up Python
               uses: actions/setup-python@v5
               with:
                   python-version: "3.10"
-
-            - name: Extract version from tag
-              id: version
-              run: |
-                  if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-                      REF=${{ github.event.inputs.tag_name }}"
-                      echo "version=${REF#refs/tags/}" >> $GITHUB_OUTPUT
-                      echo "version_clean=${REF#refs/tags/v}" >> $GITHUB_OUTPUT                    
-                  else
-                      REF='${{ github.event.workflow_run.ref }}'
-                      echo "version=${REF#refs/tags/}" >> $GITHUB_OUTPUT
-                      echo "version_clean=${REF#refs/tags/v}" >> $GITHUB_OUTPUT
-                      # echo "::set-output name=tag::$(echo ${{ github.event.workflow_run.ref }} | sed 's|refs/tags/||')"
-                  fi
 
             - name: Create sigmaker.py from __init__.py
               run: |

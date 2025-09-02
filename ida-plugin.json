@@ -2,13 +2,12 @@
     "IDAMetadataDescriptorVersion": 1,
     "plugin": {
         "name": "SigMaker",
-        "entryPoint": "src/sigmaker.py",
+        "entryPoint": "src/sigmaker/__init__.py",
         "categories": [
             "collaboration-and-productivity",
             "decompilation",
             "debugging-and-tracing"
         ],
-        "logoPath": "sigmaker_logo.png",
         "idaVersions": ">=9.0",
         "description": "SigMaker is a cross-platform signature maker plugin that works on MacOS/Linux/Windows. The primary goal of this plugin is to work with future versions of IDA without needing to compile against the IDA SDK as well as to allow for easier community contributions",
         "version": "1.3.0"

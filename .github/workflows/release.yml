@@ -110,6 +110,7 @@ jobs:
               run: |
                   cat > release_body.md << 'EOF'
                   # sigmaker.py - IDA Python Standalone Python Release
+
                   ## Release Information
                   - **Version**: ${{ steps.version.outputs.version }}
                   - **Source**: https://github.com/mahmoudimus/ida-sigmaker
@@ -126,6 +127,7 @@ jobs:
                   ## License
                   See the main repository for license information.
                   EOF
+
                   echo "RELEASE_BODY<<EOF" >> $GITHUB_ENV
                   cat release_body.md >> $GITHUB_ENV
                   echo "EOF" >> $GITHUB_ENV
@@ -137,12 +139,12 @@ jobs:
               with:
                   files: |
                       sigmaker.py
-                      tag_name: ${{ steps.version.outputs.tag }} # e.g. v1.3.0
-                      name: ${{ steps.version.outputs.tag }}
-                      body: ${{ env.RELEASE_BODY }}
-                      draft: false
-                      generate_release_notes: false
-                      prerelease: ${{ contains(steps.version.outputs.version, '-') }}
+                  tag_name: ${{ steps.version.outputs.tag }} # e.g. v1.3.0
+                  name: ${{ steps.version.outputs.tag }}
+                  body: ${{ env.RELEASE_BODY }}
+                  draft: false
+                  generate_release_notes: false
+                  prerelease: ${{ contains(steps.version.outputs.version, '-') }}
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     # releases only when tag push and manual dispatch.

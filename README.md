@@ -104,21 +104,6 @@ Thank you to to [@A200K](https://github.com/A200K)'s [IDA-Pro-SigMaker](https://
 
 ## Development & Releases
 
-### Creating Releases
-
-This project uses automated GitHub Actions workflows to create releases. When a version tag is pushed, the workflow automatically:
-
-1. Creates a standalone `sigmaker.py` file
-2. Generates release documentation
-3. Creates a GitHub release with all assets
-4. Includes an automated installation script
-
-### Release Process
-
-- **Automated**: Push a version tag (e.g., `v1.3.0`) to trigger the workflow
-- **Manual**: Use the included `scripts/create_release.py` script for local testing
-- **Documentation**: See [RELEASE_PROCESS.md](./RELEASE_PROCESS.md) for detailed instructions
-
 ### Contributing
 
 1. Fork the repository

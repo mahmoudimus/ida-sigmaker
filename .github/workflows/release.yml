@@ -1,17 +1,37 @@
 name: Release
 
 on:
+    push:
+        # Sequence of patterns matched against refs/tags
+        tags:
+            - "v*" # Push events to matching v*, i.e. v1.0, v20.15.10
+    workflow_dispatch:
+        inputs:
+            tag:
+                description: "Release tag name (e.g. v1.2.3). If empty, will use latest."
+                required: false
+                default: ""
     workflow_run:
         workflows: ["ida-sigmaker tests"] # Reference the test workflow name
         types:
             - completed
 
+concurrency:
+    group: ${{ github.workflow }}
+    cancel-in-progress: true
+
+permissions:
+    contents: write
+
 jobs:
     release:
-        runs-on: ubuntu-24.04
-        if: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.ref, 'refs/tags/v') }}
-        permissions:
-            contents: write
+        runs-on: ubuntu-latest
+        if: >
+            (
+              github.event_name == 'workflow_run' &&
+              github.event.workflow_run.conclusion == 'success' &&
+              github.event.workflow_run.event == 'release'
+            ) || github.event_name == 'workflow_dispatch'
         steps:
             - name: Checkout code
               uses: actions/checkout@v4
@@ -26,9 +46,16 @@ jobs:
             - name: Extract version from tag
               id: version
               run: |
-                  REF='${{ github.event.workflow_run.ref }}'
-                  echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-                  echo "version_clean=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+                  if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+                      REF=${{ github.event.inputs.tag_name }}"
+                      echo "version=${REF#refs/tags/}" >> $GITHUB_OUTPUT
+                      echo "version_clean=${REF#refs/tags/v}" >> $GITHUB_OUTPUT                    
+                  else
+                      REF='${{ github.event.workflow_run.ref }}'
+                      echo "version=${REF#refs/tags/}" >> $GITHUB_OUTPUT
+                      echo "version_clean=${REF#refs/tags/v}" >> $GITHUB_OUTPUT
+                      # echo "::set-output name=tag::$(echo ${{ github.event.workflow_run.ref }} | sed 's|refs/tags/||')"
+                  fi
 
             - name: Create sigmaker.py from __init__.py
               run: |

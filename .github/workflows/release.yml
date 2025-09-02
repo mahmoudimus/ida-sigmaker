@@ -26,13 +26,32 @@ permissions:
 jobs:
     release:
         runs-on: ubuntu-latest
-        if: >
-            (
-              github.event_name == 'workflow_run' &&
-              github.event.workflow_run.conclusion == 'success' &&
-              github.event.workflow_run.event == 'release'
-            ) || github.event_name == 'workflow_dispatch'
+
+        # if: >
+        #     (
+        #       github.event_name == 'workflow_run' &&
+        #       github.event.workflow_run.conclusion == 'success' &&
+        #       github.event.workflow_run.event == 'release'
+        #     ) || github.event_name == 'workflow_dispatch'
         steps:
+            - name: Look at environment variables
+              run: |
+                  echo -e "GITHUB_REF=${{ github.ref }}\n"
+                  echo -e "GITHUB_HEAD_REF=${{ github.head_ref }}\n"
+                  echo -e "GITHUB_BASE_REF=${{ github.base_ref }}\n"
+                  echo -e "GITHUB_ACTOR=${{ github.actor }}\n"
+                  echo -e "GITHUB_REPOSITORY=${{ github.repository }}\n"
+                  echo -e "GITHUB_SHA=${{ github.sha }}\n"
+                  echo -e "GITHUB_EVENT_NAME=${{ github.event_name }}\n"
+                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_CONCLUSION=${{ github.event.workflow_run.conclusion }}\n"
+                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_EVENT=${{ github.event.workflow_run.event }}\n"
+                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_REF=${{ github.event.workflow_run.ref }}\n"
+                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_HEAD_BRANCH=${{ github.event.workflow_run.head_branch }}\n"
+                  echo -e "GITHUB_EVENT_INPUTS_TAG=${{ github.event.inputs.tag }}\n"
+            - name: Dump GitHub context
+              env:
+                  GITHUB_CONTEXT: ${{ toJson(github) }}
+              run: echo "$GITHUB_CONTEXT"
             - name: Checkout code
               uses: actions/checkout@v4
               with:

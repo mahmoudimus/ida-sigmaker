@@ -9,7 +9,7 @@ on:
 jobs:
     release:
         runs-on: ubuntu-24.04
-        if: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.ref, 'refs/tags/v') }}
+        if: ${{ github.event.workflow_run.conclusion == 'success' && startsWith(github.event.workflow_run.ref, 'refs/tags/v') }}
         permissions:
             contents: write
         steps:
@@ -26,6 +26,7 @@ jobs:
             - name: Extract version from tag
               id: version
               run: |
+                  REF='${{ github.event.workflow_run.ref }}'
                   echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
                   echo "version_clean=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
@@ -69,7 +70,7 @@ jobs:
                   generate_release_notes: false
                   tag_name: ${{ steps.version.outputs.version }}
                   body: ${{ env.RELEASE_BODY }}
-                  prerelease: ${{ github.ref != 'refs/heads/main' }}
+                  prerelease: ${{ contains(steps.version.outputs.version, '-') }}
                   name: ${{ steps.version.outputs.version }}
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

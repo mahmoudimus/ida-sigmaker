@@ -361,29 +361,6 @@ FORMATTER_MAP: typing.Dict[SignatureType, SignatureFormatter] = {
 }
 
 
-def get_regex_matches(
-    string: str, regex: typing.Pattern[str], matches: typing.List[str]
-) -> bool:
-    """Find and return all matches of a regex in a string.
-
-    Parameters
-    ----------
-    string : str
-        The input string to search.
-    regex : Pattern[str]
-        The compiled regular expression to match.
-    matches : list of str
-        A list which will be cleared and extended with all matches.
-
-    Returns
-    -------
-    bool
-        True if at least one match was found, False otherwise.
-    """
-    matches[:] = re.findall(regex, string)
-    return bool(matches)
-
-
 @dataclasses.dataclass(slots=True, frozen=True)
 class WildcardPolicy:
     """
@@ -531,31 +508,6 @@ class WildcardPolicy:
         ```
         """
         return cls._Use(policy, cls)
-
-
-@dataclasses.dataclass(slots=True)
-class SearchResults:
-    """Result container for signature search operations."""
-
-    matches: list[Match]
-    signature_str: str
-
-    def display(self) -> None:
-        """Display the search results to the user."""
-        idc.msg(f"Signature: {self.signature_str}\n")
-
-        if not self.matches:
-            idc.msg("Signature does not match!\n")
-            return
-
-        for ea in self.matches:
-            fn_name = None
-            with contextlib.suppress(BaseException):
-                fn_name = idaapi.get_func_name(int(ea))
-            if fn_name:
-                idc.msg(f"Match @ {ea} in {fn_name}\n")
-            else:
-                idc.msg(f"Match @ {ea}\n")
 
 
 @dataclasses.dataclass(slots=True, frozen=True)
@@ -1024,6 +976,54 @@ class XrefFinder:
                 if not xb.next_to():
                     break
         return cnt
+
+
+@dataclasses.dataclass(slots=True)
+class SearchResults:
+    """Result container for signature search operations."""
+
+    matches: list[Match]
+    signature_str: str
+
+    def display(self) -> None:
+        """Display the search results to the user."""
+        idc.msg(f"Signature: {self.signature_str}\n")
+
+        if not self.matches:
+            idc.msg("Signature does not match!\n")
+            return
+
+        for ea in self.matches:
+            fn_name = None
+            with contextlib.suppress(BaseException):
+                fn_name = idaapi.get_func_name(int(ea))
+            if fn_name:
+                idc.msg(f"Match @ {ea} in {fn_name}\n")
+            else:
+                idc.msg(f"Match @ {ea}\n")
+
+
+def get_regex_matches(
+    string: str, regex: typing.Pattern[str], matches: typing.List[str]
+) -> bool:
+    """Find and return all matches of a regex in a string.
+
+    Parameters
+    ----------
+    string : str
+        The input string to search.
+    regex : Pattern[str]
+        The compiled regular expression to match.
+    matches : list of str
+        A list which will be cleared and extended with all matches.
+
+    Returns
+    -------
+    bool
+        True if at least one match was found, False otherwise.
+    """
+    matches[:] = re.findall(regex, string)
+    return bool(matches)
 
 
 @dataclasses.dataclass(slots=True)

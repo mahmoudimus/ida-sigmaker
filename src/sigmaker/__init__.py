@@ -9,13 +9,9 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
-import ctypes
 import dataclasses
 import enum
-import functools
-import operator
 import os
-import platform
 import re
 import string
 import traceback
@@ -32,13 +28,49 @@ PLUGIN_VERSION: str = __version__
 PLUGIN_AUTHOR: str = __author__
 
 
+class Unexpected(Exception):
+    """Exception type used throughout the module to indicate unexpected errors."""
+
+
 WILDCARD_POLICY_CTX: contextvars.ContextVar["WildcardPolicy"] = contextvars.ContextVar(
     "wildcard_policy"
 )
 
 
-bit = functools.partial(operator.lshift, 1)
-""" equivalent to `1 << x` """
+@dataclasses.dataclass
+class SigMakerConfig:
+    """Configuration for SigMaker operations.
+
+    This class holds all the configuration parameters needed for
+    SigMaker operations.
+    """
+
+    output_format: SignatureType
+    wildcard_operands: bool
+    continue_outside_of_function: bool
+    wildcard_optimized: bool
+    ask_longer_signature: bool = True
+    print_top_x: int = 5
+    max_single_signature_length: int = 100
+    max_xref_signature_length: int = 250
+
+
+@dataclasses.dataclass(slots=True, frozen=True, repr=False)
+class Match:
+    """Container for a single match."""
+
+    address: int
+
+    def __repr__(self) -> str:
+        return f"Match(address={hex(self.address)})"
+
+    def __str__(self) -> str:
+        return hex(self.address)
+
+    def __int__(self) -> int:
+        return self.address
+
+    __index__ = __int__
 
 
 class ProgressDialog:
@@ -136,10 +168,15 @@ class Clipboard:
 class SignatureType(enum.Enum):
     """Enumeration representing the various supported signature output formats."""
 
-    IDA = 0
-    x64Dbg = 1
-    Signature_Mask = 2
-    SignatureByteArray_Bitmask = 3
+    IDA = "ida"
+    x64Dbg = "x64dbg"
+    Mask = "mask"
+    BitMask = "bitmask"
+
+    @classmethod
+    def at(cls, index: int) -> "SignatureType":
+        """Return the enum member at a given index (definition order)."""
+        return list(cls.__members__.values())[index]
 
 
 class SignatureByte(typing.NamedTuple):
@@ -153,163 +190,175 @@ class SignatureByte(typing.NamedTuple):
     is_wildcard: bool
 
 
-class Signature(typing.List[SignatureByte]):
-    """List of signature bytes."""
+class Signature(list[SignatureByte]):
+    """
+    A data container for a sequence of signature bytes.
 
-    def build_ida_signature_string(self, double_qm: bool = False) -> str:
-        """Render a signature into IDA or x64Dbg text format.
+    This class is responsible for storing and manipulating the raw data of a
+    signature. It does not handle formatting into string representations.
+    """
 
-        Parameters
-        ----------
-        signature : list of SignatureByte
-            The signature bytes to format.
-        double_qm : bool, optional
-            If True, wildcards are rendered as '??' instead of '?', by default False.
+    def add_byte_to_signature(self, address: int, is_wildcard: bool) -> None:
+        """Appends a single byte from the IDA database to the signature."""
+        byte_value = idaapi.get_byte(address)
+        self.append(SignatureByte(byte_value, is_wildcard))
 
-        Returns
-        -------
-        str
-            The formatted signature string without trailing whitespace.
-        """
-        result: typing.List[str] = []
-        for b in self:
-            if b.is_wildcard:
-                result.append("??" if double_qm else "?")
-            else:
-                result.append(f"{b.value:02X}")
-            result.append(" ")
-        return "".join(result).rstrip()
-
-    def build_byte_array_with_mask_signature_string(self) -> str:
-        """Render a signature into a C byte array string with a mask.
-
-        The returned string contains an escaped hex byte sequence followed by a
-        string mask indicating which bytes are significant.
-
-        Parameters
-        ----------
-        signature : list of SignatureByte
-            The signature bytes to format.
-
-        Returns
-        -------
-        str
-            The formatted pattern and mask separated by a space.
-        """
-        pattern_parts: typing.List[str] = []
-        mask_parts: typing.List[str] = []
-        for b in self:
-            pattern_parts.append(f"\\x{b.value:02X}" if not b.is_wildcard else "\\x00")
-            mask_parts.append("x" if not b.is_wildcard else "?")
-        return "".join(pattern_parts) + " " + "".join(mask_parts)
-
-    def build_bytes_with_bitmask_signature_string(self) -> str:
-        """Render a signature into a C byte array followed by a bitmask string.
-
-        The bitmask is constructed by reversing the order of the significance flags.
-
-        Parameters
-        ----------
-        signature : list of SignatureByte
-            The signature bytes to format.
-
-        Returns
-        -------
-        str
-            The formatted byte list and bitmask separated by a space.
-        """
-        pattern_parts: typing.List[str] = []
-        mask_bits: typing.List[str] = []
-        for b in self:
-            pattern_parts.append(
-                f"0x{b.value:02X}, " if not b.is_wildcard else "0x00, "
-            )
-            mask_bits.append("1" if not b.is_wildcard else "0")
-        pattern_str = "".join(pattern_parts).rstrip(", ")
-        mask_str = "".join(mask_bits)[::-1]
-        return f"{pattern_str} 0b{mask_str}"
-
-    def format_signature(self, sig_type: SignatureType) -> str:
-        """Format a signature according to the requested `SignatureType`.
-
-        Parameters
-        ----------
-        signature : list of SignatureByte
-            The signature to format.
-        sig_type : SignatureType
-            The desired output format.
-
-        Returns
-        -------
-        str
-            The formatted signature string, or an empty string if the type is not
-            recognized.
-        """
-        if sig_type == SignatureType.IDA:
-            return self.build_ida_signature_string()
-        if sig_type == SignatureType.x64Dbg:
-            return self.build_ida_signature_string(True)
-        if sig_type == SignatureType.Signature_Mask:
-            return self.build_byte_array_with_mask_signature_string()
-        if sig_type == SignatureType.SignatureByteArray_Bitmask:
-            return self.build_bytes_with_bitmask_signature_string()
-        return ""
-
-    def add_byte_to_signature(self, address: int, wildcard: bool) -> None:
-        """Append a single byte from the IDA database to a signature.
-
-        Parameters
-        ----------
-        signature : list of SignatureByte
-            The signature to extend.
-        address : int
-            The linear address from which to read the byte.
-        wildcard : bool
-            Whether the added byte should be marked as a wildcard.
-        """
-        b = idaapi.get_byte(address)
-        self.append(SignatureByte(b, wildcard))
-
-    def add_bytes_to_signature(self, address: int, count: int, wildcard: bool) -> None:
-        """Append multiple bytes from the IDA database to a signature.
-
-        Parameters
-        ----------
-        signature : list of SignatureByte
-            The signature to extend.
-        address : int
-            The starting linear address from which to read bytes.
-        count : int
-            Number of bytes to add.
-        wildcard : bool
-            Whether the added bytes should be marked as wildcards.
-        """
-        for i in range(count):
-            self.add_byte_to_signature(address + i, wildcard)
-        # self.extend(
-        #     SignatureByte(b, wildcard) for b in idaapi.get_bytes(address, count)
-        # )
+    def add_bytes_to_signature(
+        self, address: int, count: int, is_wildcard: bool
+    ) -> None:
+        """Appends multiple bytes from the IDA database to the signature."""
+        # Using get_bytes is more efficient than a loop of get_byte
+        bytes_data = idaapi.get_bytes(address, count)
+        if bytes_data:
+            self.extend(SignatureByte(b, is_wildcard) for b in bytes_data)
 
     def trim_signature(self) -> None:
-        """Remove trailing wildcard bytes from a signature.
-
-        This function modifies the signature list in place by popping off any
-        wildcard bytes at the end.
-
-        Parameters
-        ----------
-        signature : list of SignatureByte
-            The signature to trim.
-        """
-        # we do it this way b/c cython makes it faster.
-        print("trimming signature:", str(self))
+        """Removes trailing wildcard bytes from the signature in-place."""
         n = len(self)
         while n > 0 and self[n - 1].is_wildcard:
             n -= 1
-        self[:] = self[:n]
+        # Efficiently truncate the list
+        del self[n:]
 
     def __str__(self) -> str:
-        return f'Signature("{self.build_ida_signature_string(True)}")'
+        """
+        Provides the default string representation.
+        This is equivalent to format(self, '').
+        """
+        return self.__format__("")
+
+    def __format__(self, format_spec: str) -> str:
+        """
+        Formats the signature according to the provided format specifier.
+
+        This method allows the Signature object to be used with f-strings
+        and the format() built-in function.
+
+        Supported format_spec values:
+            - '' (default) or 'ida': "55 8B ? EC"
+            - 'x64dbg': "55 8B ?? EC"
+            - 'mask': "\\x55\\x8B\\x00\\xEC xx?x"
+            - 'bitmask': "0x55, 0x8B, 0x00, 0xEC 0b1101"
+        """
+        # Use .lower() to make specifiers case-insensitive
+        spec = format_spec.lower()
+        try:
+            formatter = FORMATTER_MAP[SignatureType(spec)]
+        except KeyError:
+            raise ValueError(
+                f"Unknown format code '{format_spec}' for object of type 'Signature'"
+            )
+        return formatter.format(self)
+
+
+class SignatureFormatter(typing.Protocol):
+    """
+    A protocol for objects that can format a Signature into a string.
+    """
+
+    def format(self, signature: "Signature") -> str:
+        """Formats the given Signature object into a string."""
+        ...
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class IdaFormatter:
+    """
+    Formats a signature into the IDA style ('DE AD ? EF').
+    The wildcard character can be configured.
+    """
+
+    wildcard_byte: str = "?"
+
+    def format(self, signature: "Signature") -> str:
+        parts = []
+        for byte in signature:
+            if byte.is_wildcard:
+                parts.append(self.wildcard_byte)
+            else:
+                parts.append(f"{byte.value:02X}")
+        return " ".join(parts)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class X64DbgFormatter(IdaFormatter):
+    """
+    Formats a signature for x64Dbg by specializing IdaFormatter
+    to use '??' as the wildcard.
+    """
+
+    wildcard_byte: str = "??"
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class MaskedBytesFormatter:
+    """Formats into a C-style byte array and a mask string ('\\xDE\\xAD', 'xx?')."""
+
+    wildcard_byte: str = "\\x00"
+    mask: str = "x"
+    wildcard_mask: str = "?"
+
+    @staticmethod
+    def build_signature_parts(
+        signature: "Signature",
+        byte_format: str,
+        wildcard_byte: str,
+        mask_char: str,
+        wildcard_mask_char: str,
+    ) -> tuple[list[str], list[str]]:
+        """
+        Iterates over a signature and builds lists of its pattern and mask parts.
+        This is the common logic shared by multiple masked byte formatters.
+        """
+        pattern_parts = []
+        mask_parts = []
+        for byte in signature:
+            if byte.is_wildcard:
+                pattern_parts.append(wildcard_byte)
+                mask_parts.append(wildcard_mask_char)
+            else:
+                pattern_parts.append(byte_format.format(byte.value))
+                mask_parts.append(mask_char)
+        return pattern_parts, mask_parts
+
+    def format(self, signature: "Signature") -> str:
+        pattern_parts, mask_parts = self.build_signature_parts(
+            signature,
+            "\\x{:02X}",
+            self.wildcard_byte,
+            self.mask,
+            self.wildcard_mask,
+        )
+        return "".join(pattern_parts) + " " + "".join(mask_parts)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ByteArrayBitmaskFormatter:
+    """Formats into a C-style byte array and a bitmask ('0xDE,', '0b1101')."""
+
+    wildcard_byte: str = "0x00"
+    mask: str = "1"
+    wildcard_mask: str = "0"
+
+    def format(self, signature: "Signature") -> str:
+        pattern_parts, mask_parts = MaskedBytesFormatter.build_signature_parts(
+            signature,
+            "0x{:02X}",
+            self.wildcard_byte,
+            self.mask,
+            self.wildcard_mask,
+        )
+        pattern_str = ", ".join(pattern_parts)
+        mask_str = "".join(mask_parts)[::-1]
+        return f"{pattern_str} 0b{mask_str}"
+
+
+FORMATTER_MAP: typing.Dict[SignatureType, SignatureFormatter] = {
+    SignatureType.IDA: IdaFormatter(),
+    SignatureType.x64Dbg: X64DbgFormatter(),
+    SignatureType.Mask: MaskedBytesFormatter(),
+    SignatureType.BitMask: ByteArrayBitmaskFormatter(),
+}
 
 
 def get_regex_matches(
@@ -484,88 +533,6 @@ class WildcardPolicy:
         return cls._Use(policy, cls)
 
 
-class Unexpected(Exception):
-    """Exception type used throughout the module to indicate unexpected errors."""
-
-
-@dataclasses.dataclass
-class SigMakerConfig:
-    """Configuration for SigMaker operations.
-
-    This class holds all the configuration parameters needed for
-    SigMaker operations.
-    """
-
-    output_format: SignatureType
-    wildcard_operands: bool
-    continue_outside_of_function: bool
-    wildcard_optimized: bool
-    ask_longer_signature: bool = True
-    print_top_x: int = 5
-    max_single_signature_length: int = 100
-    max_xref_signature_length: int = 250
-
-
-@dataclasses.dataclass(slots=True)
-class SignatureResult:
-    """Result container for signature generation operations."""
-
-    signature: Signature
-    address: int | Match | None = None
-
-    def display(self) -> None:
-        """Display the signature result to the user."""
-        if not self.signature:
-            idc.msg("Error: Empty signature\n")
-            return
-
-        sig_str = self.signature.format_signature(SignatureType.IDA)
-        if self.address is not None:
-            idc.msg(f"Signature for {self.address:X}: {sig_str}\n")
-        else:
-            idc.msg(f"Signature: {sig_str}\n")
-
-        if not Clipboard.set_text(sig_str):
-            idc.msg("Failed to copy to clipboard!")
-
-
-@dataclasses.dataclass(slots=True)
-class XrefResults:
-    """Result container for XREF signature finding operations."""
-
-    signatures: list[tuple[Match, Signature]]
-
-    def display(self, cfg: SigMakerConfig) -> None:
-        """Display the XREF signatures to the user."""
-        if not self.signatures:
-            idc.msg("No XREFs have been found for your address\n")
-            return
-
-        top_length = min(cfg.print_top_x, len(self.signatures))
-        idc.msg(f"Top {top_length} Signatures out of {len(self.signatures)} xrefs:\n")
-        for i in range(top_length):
-            origin_address, signature = self.signatures[i]
-            sig_str = signature.format_signature(SignatureType.IDA)
-            idc.msg(f"XREF Signature #{i+1} @ {origin_address:X}: {sig_str}\n")
-            if i == 0:
-                Clipboard.set_text(sig_str)
-
-
-@dataclasses.dataclass(slots=True, frozen=True, repr=False)
-class Match:
-    """Container for a single match."""
-
-    address: int
-
-    def __repr__(self) -> str:
-        return f"Match(address={hex(self.address)})"
-
-    def __int__(self) -> int:
-        return self.address
-
-    __index__ = __int__
-
-
 @dataclasses.dataclass(slots=True)
 class SearchResults:
     """Result container for signature search operations."""
@@ -586,9 +553,60 @@ class SearchResults:
             with contextlib.suppress(BaseException):
                 fn_name = idaapi.get_func_name(int(ea))
             if fn_name:
-                idc.msg(f"Match @ {ea:X} in {fn_name}\n")
+                idc.msg(f"Match @ {ea} in {fn_name}\n")
             else:
-                idc.msg(f"Match @ {ea:X}\n")
+                idc.msg(f"Match @ {ea}\n")
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class GeneratedSignature:
+    """Result container for signature generation operations."""
+
+    signature: Signature
+    address: Match | None = None
+
+    def display(self, cfg: SigMakerConfig) -> None:
+        """Display the signature result to the user."""
+        if not self.signature:
+            idc.msg("Error: Empty signature\n")
+            return
+        t = cfg.output_format.value
+        fmted = format(self.signature, t)
+        if self.address is not None:
+            idc.msg(f"Signature for {self.address}: {fmted}\n")
+        else:
+            idc.msg(f"Signature: {fmted}\n")
+
+        if not Clipboard.set_text(fmted):
+            idc.msg("Failed to copy to clipboard!")
+
+    def __lt__(self, other) -> bool:
+        if not isinstance(other, GeneratedSignature):
+            return NotImplemented
+        return len(self.signature) < len(other.signature)
+
+
+@dataclasses.dataclass(slots=True)
+class XrefGeneratedSignature:
+    """Result container for XREF signature finding operations."""
+
+    signatures: list[GeneratedSignature]
+
+    def display(self, cfg: SigMakerConfig) -> None:
+        """Display the XREF signatures to the user."""
+        if not self.signatures:
+            idc.msg("No XREFs have been found for your address\n")
+            return
+        t = cfg.output_format.value
+        top_length = min(cfg.print_top_x, len(self.signatures))
+        idc.msg(f"Top {top_length} Signatures out of {len(self.signatures)} xrefs:\n")
+        for i, generated_signature in enumerate(self.signatures[:top_length], start=1):
+            address = generated_signature.address
+            signature = generated_signature.signature
+            fmted = format(signature, t)
+            idc.msg(f"XREF Signature #{i} @ {address}: {fmted}\n")
+            if i == 0:
+                Clipboard.set_text(fmted)
 
 
 class SigText:
@@ -767,7 +785,7 @@ class SignatureMaker:
     # ---- public API (stable) ----
     def make_signature(
         self, ea: int | Match, cfg: SigMakerConfig, end: int | None = None
-    ) -> SignatureResult:
+    ) -> GeneratedSignature:
         if end is None:
             sig = self._unique_sig_for_ea(
                 ea,
@@ -777,11 +795,11 @@ class SignatureMaker:
                 max_len=cfg.max_single_signature_length,
                 ask_longer=cfg.ask_longer_signature,
             )
-            return SignatureResult(sig, ea)
+            return GeneratedSignature(sig, ea if isinstance(ea, Match) else Match(ea))
         sig = self._range_sig(
             int(ea), end, cfg.wildcard_operands, cfg.wildcard_optimized
         )
-        return SignatureResult(sig)
+        return GeneratedSignature(sig)
 
     # ---- helpers (small, testable units) ----
     @staticmethod
@@ -811,7 +829,7 @@ class SignatureMaker:
         sig.add_bytes_to_signature(ea, ins.size, False)
 
     def _check_unique(self, sig: Signature) -> bool:
-        return self._is_signature_unique(sig.build_ida_signature_string())
+        return self._is_signature_unique(f"{sig:ida}")
 
     # ---- core algorithms ----
     def _unique_sig_for_ea(
@@ -857,9 +875,7 @@ class SignatureMaker:
                 if ask == 1:
                     used = 0
                 elif ask == 0:
-                    idc.msg(
-                        f"NOT UNIQUE Signature for {ea:X}: {sig.build_ida_signature_string()}\n"
-                    )
+                    idc.msg(f"NOT UNIQUE Signature for {ea:X}: {sig:ida}\n")
                     raise Unexpected("Signature not unique")
                 else:
                     raise Unexpected("Aborted")
@@ -946,17 +962,17 @@ class XrefFinder:
         self.progress_dialog = ProgressDialog()
         self.signature_maker = SignatureMaker()
 
-    def find_xrefs(self, ea: int, cfg: SigMakerConfig) -> XrefResults:
+    def find_xrefs(self, ea: int, cfg: SigMakerConfig) -> XrefGeneratedSignature:
         """Find XREF signatures to a given address."""
-        xref_signatures: list[tuple[Match, Signature]] = []
+        xref_signatures: list[GeneratedSignature] = []
 
         xref_count = self._count_xrefs(ea)
         if xref_count == 0:
-            return XrefResults([])
+            return XrefGeneratedSignature([])
 
         xb = idaapi.xrefblk_t()
         if not xb.first_to(ea, idaapi.XREF_ALL):
-            return XrefResults([])
+            return XrefGeneratedSignature([])
 
         i = 0
         shortest_len = cfg.max_xref_signature_length + 1
@@ -989,13 +1005,13 @@ class XrefFinder:
             if sig:
                 if len(sig) < shortest_len:
                     shortest_len = len(sig)
-                xref_signatures.append((Match(xb.frm), sig))
+                xref_signatures.append(GeneratedSignature(sig, Match(xb.frm)))
 
             if not xb.next_to():
                 break
 
-        xref_signatures.sort(key=lambda t: len(t[1]))
-        return XrefResults(xref_signatures)
+        xref_signatures.sort()
+        return XrefGeneratedSignature(xref_signatures)
 
     def _count_xrefs(self, ea: int) -> int:
         """Count the number of XREFs to a given address."""
@@ -1013,7 +1029,7 @@ class XrefFinder:
 @dataclasses.dataclass(slots=True)
 class SignatureSearcher:
     """Parses a signature string and searches the DB for matches."""
-    
+
     signature_maker: SignatureMaker = dataclasses.field(default_factory=SignatureMaker)
     input_signature: str = ""
 
@@ -1053,7 +1069,7 @@ class SignatureSearcher:
                         for i, b in enumerate(bytestr)
                     ]
                 )
-                return sig.build_ida_signature_string()
+                return f"{sig:ida}"
             if get_regex_matches(
                 input_str, re.compile(r"(?:0x[0-9A-F]{2})+", re.I), bytestr
             ) and len(bytestr) == len(mask):
@@ -1063,7 +1079,7 @@ class SignatureSearcher:
                         for i, b in enumerate(bytestr)
                     ]
                 )
-                return sig.build_ida_signature_string()
+                return f"{sig:ida}"
             idc.msg(f'Detected mask "{mask}" but failed to match corresponding bytes\n')
             return ""
 
@@ -1404,7 +1420,7 @@ class SigMakerPlugin(idaapi.plugin_t):
 
         # Create SigMakerConfig
         config = SigMakerConfig(
-            output_format=SignatureType(output_format),
+            output_format=SignatureType.at(int(output_format)),
             wildcard_operands=wildcard_operands,
             continue_outside_of_function=continue_outside_of_function,
             wildcard_optimized=wildcard_optimized,
@@ -1413,9 +1429,8 @@ class SigMakerPlugin(idaapi.plugin_t):
         try:
             if action == 0:
                 ea = idaapi.get_screen_ea()
-                # signature = SignatureMaker().make_signature(ea, config)
                 signature = SignatureMaker().make_signature(ea, config)
-                signature.display()
+                signature.display(config)
             elif action == 1:
                 ea = idaapi.get_screen_ea()
                 signatures = XrefFinder().find_xrefs(ea, config)
@@ -1424,7 +1439,7 @@ class SigMakerPlugin(idaapi.plugin_t):
                 start, end = self.get_selected_addresses(idaapi.get_current_viewer())
                 if start and end:
                     signature = SignatureMaker().make_signature(start, config, end=end)
-                    signature.display()
+                    signature.display(config)
                 else:
                     idc.msg("Select a range to copy the code!\n")
             elif action == 3:

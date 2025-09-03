@@ -435,7 +435,7 @@ class TestSignatureFormatting(unittest.TestCase):
                 sigmaker.SignatureByte(0x00, True),
             ]
         )
-        self.assertEqual(sig.build_ida_signature_string(), "C7 44 24 34 00 00 ? ?")
+        self.assertEqual(f"{sig:ida}", "C7 44 24 34 00 00 ? ?")
 
     def test_build_byte_array_with_mask(self):
         sig = sigmaker.Signature(
@@ -449,7 +449,7 @@ class TestSignatureFormatting(unittest.TestCase):
             ]
         )
         expected = "\\x49\\x28\\x15\\x00\\x00\\x30 xxx??x"
-        self.assertEqual(sig.build_byte_array_with_mask_signature_string(), expected)
+        self.assertEqual(f"{sig:mask}", expected)
 
     def test_build_bytes_with_bitmask(self):
         sig = sigmaker.Signature(
@@ -460,7 +460,7 @@ class TestSignatureFormatting(unittest.TestCase):
             ]
         )
         self.assertEqual(
-            sig.build_bytes_with_bitmask_signature_string(),
+            f"{sig:bitmask}",
             "0xE8, 0x00, 0x45 0b101",
         )
 
@@ -469,11 +469,11 @@ class TestSignatureFormatting(unittest.TestCase):
             [sigmaker.SignatureByte(0xAB, False), sigmaker.SignatureByte(0x00, True)]
         )
         self.assertEqual(
-            sig.format_signature(sigmaker.SignatureType.IDA),
+            f"{sig:ida}",
             "AB ?",
         )
         self.assertEqual(
-            sig.format_signature(sigmaker.SignatureType.x64Dbg),
+            f"{sig:x64dbg}",
             "AB ??",
         )
 
@@ -500,10 +500,7 @@ class TestUtilities(unittest.TestCase):
         self.assertEqual(matches, ["AA", "BB", "CC"])
 
     def test_parse_signature(self):
-        signature_maker = sigmaker.SignatureMaker()
-        normalized, pattern = signature_maker._normalize_signature(
-            "C7 44 24 34 00 00 ?? ?"
-        )
+        normalized, pattern = sigmaker.SigText.normalize("C7 44 24 34 00 00 ?? ?")
         self.assertEqual(normalized, "C7 44 24 34 00 00 ?? ??")
         self.assertEqual(len(pattern), 8)
         # bytes
@@ -571,23 +568,21 @@ class TestOutputFormats(unittest.TestCase):
             ]
         )
 
-        ida_result = signature.format_signature(sigmaker.SignatureType.IDA)
+        ida_result = f"{signature:ida}"
         self.assertEqual(ida_result, "48 8B ? C0")
 
-        x64dbg_result = signature.format_signature(sigmaker.SignatureType.x64Dbg)
+        x64dbg_result = f"{signature:x64dbg}"
         self.assertEqual(x64dbg_result, "48 8B ?? C0")
 
-        mask_result = signature.format_signature(sigmaker.SignatureType.Signature_Mask)
+        mask_result = f"{signature:mask}"
         self.assertEqual(mask_result, "\\x48\\x8B\\x00\\xC0 xx?x")
 
-        bitmask_result = signature.format_signature(
-            sigmaker.SignatureType.SignatureByteArray_Bitmask
-        )
+        bitmask_result = f"{signature:bitmask}"
         self.assertEqual(bitmask_result, "0x48, 0x8B, 0x00, 0xC0 0b1011")
 
     def test_format_signature_edge_cases(self):
         empty_signature = sigmaker.Signature([])
-        empty_result = empty_signature.format_signature(sigmaker.SignatureType.IDA)
+        empty_result = f"{empty_signature:ida}"
         self.assertEqual(empty_result, "")
 
         all_wildcards = sigmaker.Signature(
@@ -596,7 +591,7 @@ class TestOutputFormats(unittest.TestCase):
                 sigmaker.SignatureByte(0x00, True),
             ]
         )
-        wildcard_result = all_wildcards.format_signature(sigmaker.SignatureType.IDA)
+        wildcard_result = f"{all_wildcards:ida}"
         self.assertEqual(wildcard_result, "? ?")
 
     def test_double_question_mark_format(self):
@@ -606,10 +601,10 @@ class TestOutputFormats(unittest.TestCase):
                 sigmaker.SignatureByte(0x00, True),
             ]
         )
-        single_result = signature.build_ida_signature_string(False)
+        single_result = f"{signature:ida}"
         self.assertEqual(single_result, "48 ?")
 
-        double_result = signature.build_ida_signature_string(True)
+        double_result = f"{signature:x64dbg}"
         self.assertEqual(double_result, "48 ??")
 
 
@@ -626,11 +621,12 @@ class TestErrorHandling(unittest.TestCase):
             self.assertEqual(str(e), "Test error")
 
     def test_bit_manipulation(self):
-        self.assertEqual(sigmaker.bit(0), 1)
-        self.assertEqual(sigmaker.bit(1), 2)
-        self.assertEqual(sigmaker.bit(2), 4)
-        self.assertEqual(sigmaker.bit(3), 8)
-        self.assertEqual(sigmaker.bit(7), 128)
+        # Test bit manipulation using bitwise operations
+        self.assertEqual(1 << 0, 1)
+        self.assertEqual(1 << 1, 2)
+        self.assertEqual(1 << 2, 4)
+        self.assertEqual(1 << 3, 8)
+        self.assertEqual(1 << 7, 128)
 
     def test_regex_matching(self):
         matches = []

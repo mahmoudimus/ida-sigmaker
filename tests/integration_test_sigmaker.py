@@ -308,7 +308,7 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
                 ask_longer_signature=False,
             )
             result = signature_maker.make_signature(func_ea, ctx)
-            self.assertIsInstance(result, sigmaker.SignatureResult)
+            self.assertIsInstance(result, sigmaker.GeneratedSignature)
             self.assertIsInstance(result.signature, sigmaker.Signature)
             self.assertGreater(
                 len(result.signature), 0, "Should generate non-empty signature"
@@ -376,7 +376,7 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
         sig_txt_dq = " ".join(
             [x if x != "?" else "??" for x in sig_txt_ida.split(" ")]
         )  # ida uses ? for wildcards, x64dbg uses ??
-        self.assertEqual(result.signature.build_ida_signature_string(True), sig_txt_dq)
+        self.assertEqual(f"{result.signature:x64dbg}", sig_txt_dq)
         self.assertTrue(any(b.is_wildcard for b in result.signature))
 
     def test_generate_signature_for_range(self):
@@ -396,7 +396,7 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
                 wildcard_optimized=False,
             )
             result = signature_maker.make_signature(start_ea, ctx, end=end_ea)
-            self.assertIsInstance(result, sigmaker.SignatureResult)
+            self.assertIsInstance(result, sigmaker.GeneratedSignature)
             self.assertIsInstance(result.signature, sigmaker.Signature)
             self.assertGreater(
                 len(result.signature), 0, "Should generate non-empty signature"

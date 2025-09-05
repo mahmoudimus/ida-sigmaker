@@ -1,0 +1,33 @@
+[run]
+branch = True
+
+source =
+    src
+    sigmaker
+
+[report]
+omit =
+    */site-packages/*
+    /Applications/IDA*/Contents/MacOS/python/*
+    /Applications/IDA*/Contents/MacOS/idalib/*
+    ~/.idapro/*
+    */.idapro/*
+    tests/*
+
+
+exclude_also =
+    pragma: no cover
+    ; def __repr__
+    if self.debug:
+    if settings.DEBUG
+    raise AssertionError
+    raise NotImplementedError
+    if 0:
+    if __name__ == .__main__.:
+    class .*\bProtocol\):
+    @(abc\.)?abstractmethod
+    ; 1. Comments to turn coverage on and off:
+    ; no cover: start -> no cover: stop
+    no cover: start(?s:.)*?no cover: stop
+    ; 2. A pragma comment that excludes an entire file:
+    \A(?s:.*# pragma: exclude file.*)\Z

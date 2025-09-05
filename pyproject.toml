@@ -4,26 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sigmaker"
-requires-python = ">= 3.10"
-version = "1.4.0"
 authors = [
     { name = "Mahmoud Abdelkader", email = "m{_no-spam_}@mahmoudimus.com" },
 ]
-description = "An IDA Pro 9.0+ cross-platform signature maker plugin that works on MacOS/Linux/Windows. It creates unique binary pattern signatures to identify specific functions or addresses within binaries, even after updates. It helps reverse engineers preserve their analysis work by generating resilient signatures that can quickly relocate important code locations in new binary versions."
-license = "MIT"
-license-files = ["LICENSE"]
-classifiers = [
-    "Development Status :: 4 - Beta",
-    "Environment :: Plugins",
-    "Intended Audience :: Developers",
-    "Operating System :: OS Independent",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.15",
-    "Topic :: Software Development :: Debuggers",
-    "Topic :: Software Development :: Disassemblers",
-    "Topic :: Software Development :: Libraries :: Python Modules",
-    "Topic :: Software Development",
-]
+dynamic = ["readme", "version"]
+description = "Sigmaker is an IDA Pro 9.0+ cross-platform signature maker plugin that works on MacOS/Linux/Windows. It creates unique binary pattern signatures to identify specific functions or addresses within binaries, even after updates. It helps reverse engineers preserve their analysis work by generating resilient signatures that can quickly relocate important code locations in new binary versions."
 keywords = [
     "ida pro",
     "signature",
@@ -35,7 +20,22 @@ keywords = [
     "malware analysis",
     "function identification",
 ]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Plugins",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.10",
+    "Topic :: Software Development :: Debuggers",
+    "Topic :: Software Development :: Disassemblers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development",
+]
+requires-python = ">= 3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 dependencies = []
+
 
 [project.optional-dependencies]
 ci = ["coverage"]
@@ -45,3 +45,14 @@ Homepage = "https://mahmoudimus.com"
 Documentation = "https://github.com/mahmoudimus/ida-sigmaker/blob/main/README.md"
 Source = "https://github.com/mahmoudimus/ida-sigmaker"
 Issues = "https://github.com/mahmoudimus/ida-sigmaker/issues"
+
+
+[tool.setuptools.packages.find]
+where = ["src"]
+namespaces = true
+
+## include = []
+## exclude = []
+[tool.setuptools.dynamic]
+readme = { file = ["README.md", "LICENSE"], content-type = "text/markdown" }
+version = { attr = "sigmaker.__version__" }

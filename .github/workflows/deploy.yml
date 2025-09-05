@@ -129,6 +129,7 @@ jobs:
             - &build-wheel-sdist
               name: Build a wheel and sdist
               run: |
+                  rm -rf dist/*
                   python -m build
 
             - &display-content-dist-folder

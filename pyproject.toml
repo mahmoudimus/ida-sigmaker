@@ -11,4 +11,4 @@ description = "IDA Pro plugin to generate signatures for code"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["coverage"]
+ci = ["coverage"]

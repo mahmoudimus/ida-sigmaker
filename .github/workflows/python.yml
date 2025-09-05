@@ -71,9 +71,17 @@ jobs:
                   echo "Loading Docker image from cache..."
                   docker load -i /tmp/docker-cache/idapro-baked.tar || echo "No cached image to load."
 
-            - name: Run test_sigmaker.py
+            - name: Run tests
               run: |
-                  docker compose run --rm --entrypoint bash idapro-tests -c 'python -m unittest discover . -p "test_*.py" -v' ||  { docker compose logs ; exit 1 ; }
+                  set -e
+                  docker compose run --rm --entrypoint bash idapro-tests -c "
+                      set -e
+                      pip install -e .[ci]
+                      python -m unittest discover . -p '*_test_*.py' -v
+                      coverage combine .coverage.unit .coverage.integration
+                      coverage report -m
+                      coverage html
+                  "
                   docker compose logs
 
             - name: Save Docker image to cache

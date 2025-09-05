@@ -32,8 +32,7 @@ classifiers = [
     "Topic :: Software Development",
 ]
 requires-python = ">= 3.10"
-license = "MIT"
-license-files = ["LICENSE"]
+license = { text = "MIT" }
 dependencies = []
 
 

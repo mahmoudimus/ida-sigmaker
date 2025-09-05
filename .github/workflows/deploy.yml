@@ -124,7 +124,10 @@ jobs:
             - &install-build-twine
               name: Install pypa/build pypa/twine
               run: |
-                  pip install build==1.3.0 twine==6.2.0 setuptools>=65.0.0 packaging>=25.0
+                  pip install --upgrade pip
+                  pip install build==1.3.0 twine==6.2.0 setuptools>=65.0.0 packaging==25.0
+                  echo "Installed versions:"
+                  pip list | grep -E "(twine|packaging|setuptools|build)"
 
             - &build-wheel-sdist
               name: Build a wheel and sdist

@@ -7,17 +7,19 @@ to ensure reliable testing across different platforms and architectures.
 
 import gc
 import logging
-import os
+import pathlib
 import re
 import sys
 import time
 import unittest
-
-# Patch sigmaker's idaapi and idc import to avoid loading an unnecessary dependency using unittest.mock
 from unittest.mock import MagicMock, patch
 
+TEST_DIR = pathlib.Path(__file__).parent
+# SRC_DIR = TEST_DIR.parent / "src"
+# sys.path.insert(0, SRC_DIR.as_posix())
 # Add the src directory to the path so we can import sigmaker
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
+sys.path.insert(0, TEST_DIR.as_posix())
+from coveredtestcase import CoverageTestCase
 
 # Use a context manager to patch sys.modules before importing sigmaker
 with patch.dict("sys.modules", {"idaapi": MagicMock(), "idc": MagicMock()}):
@@ -83,91 +85,11 @@ def make_buf_with_pattern(
     return bytes(b)
 
 
-class TestBenchmarkExamples(unittest.TestCase):
-    """Example benchmark tests demonstrating time.perf_counter() usage."""
-
-    def test_simple_timing_example(self):
-        """Demonstrate basic timing with time.perf_counter()."""
-
-        # Example operation to time (simulated work)
-        def dummy_operation(iterations: int) -> int:
-            result = 0
-            for i in range(iterations):
-                result += i * i
-            return result
-
-        # Benchmark with multiple iterations
-        iterations = [100, 1000, 10000]
-        results = {}
-
-        for num_iterations in iterations:
-            times = []
-
-            # Run multiple times for statistical significance
-            for _ in range(5):
-                start_time = time.perf_counter()
-                dummy_operation(num_iterations)
-                end_time = time.perf_counter()
-                times.append(end_time - start_time)
-
-            results[num_iterations] = {
-                "min_time": min(times),
-                "max_time": max(times),
-                "avg_time": sum(times) / len(times),
-                "iterations": len(times),
-            }
-
-        # Verify timing increased with complexity
-        self.assertLess(
-            results[100]["avg_time"],
-            results[1000]["avg_time"],
-            "More iterations should take longer",
-        )
-        self.assertLess(
-            results[1000]["avg_time"],
-            results[10000]["avg_time"],
-            "Even more iterations should take longer",
-        )
-
-        # Print results for demonstration
-        print("\n⏱️  Simple Benchmark Results:")
-        for num_iter, stats in results.items():
-            print(f"{num_iter}: {stats['avg_time']:.6f}s")
-
-    def test_memory_and_timing_benchmark(self):
-        """Demonstrate combined memory usage and timing benchmark."""
-
-        def create_objects(count: int) -> list:
-            """Create objects to simulate memory usage."""
-            return [{"data": "x" * 100, "index": i} for i in range(count)]
-
-        object_counts = [100, 500, 1000]
-
-        print("\n📊 Memory & Timing Benchmark:")
-
-        for count in object_counts:
-            # Force garbage collection before starting
-            gc.collect()
-
-            times = []
-            for _ in range(3):  # Fewer iterations for memory testing
-                start_time = time.perf_counter()
-                objects = create_objects(count)
-                # Simulate some processing
-                processed = [obj["data"].upper() for obj in objects]
-                end_time = time.perf_counter()
-                times.append(end_time - start_time)
-
-                # Clean up
-                del objects, processed
-
-            avg_time = sum(times) / len(times)
-            print(f"{count}: {avg_time:.6f}s")
-        # Verify scaling behavior
-        self.assertGreater(avg_time, 0, "Benchmark should take some measurable time")
+class CoveredUnitTest(CoverageTestCase):
+    coverage_data_file = ".coverage.unit"
 
 
-class TestSigTextNormalize(unittest.TestCase):
+class TestSigTextNormalize(CoveredUnitTest):
 
     # ----------------------------
     # Fast-path: pure hex (no '?')
@@ -421,7 +343,8 @@ class TestSigTextNormalize(unittest.TestCase):
         )
 
 
-class TestSignatureFormatting(unittest.TestCase):
+class TestSignatureFormatting(CoveredUnitTest):
+
     def test_build_ida_signature_string(self):
         sig = sigmaker.Signature(
             [
@@ -478,7 +401,8 @@ class TestSignatureFormatting(unittest.TestCase):
         )
 
 
-class TestUtilities(unittest.TestCase):
+class TestUtilities(CoveredUnitTest):
+
     def test_trim_signature(self):
         sig = sigmaker.Signature(
             [
@@ -511,7 +435,7 @@ class TestUtilities(unittest.TestCase):
         self.assertEqual(pattern[7], (0, True))
 
 
-class TestSignatureManipulation(unittest.TestCase):
+class TestSignatureManipulation(CoveredUnitTest):
     """Test signature building and manipulation functions"""
 
     def test_signature_trimming(self):
@@ -555,7 +479,7 @@ class TestSignatureManipulation(unittest.TestCase):
         self.assertTrue(wild_byte.is_wildcard)
 
 
-class TestOutputFormats(unittest.TestCase):
+class TestOutputFormats(CoveredUnitTest):
     """Test signature output formatting"""
 
     def test_all_signature_types(self):
@@ -608,7 +532,7 @@ class TestOutputFormats(unittest.TestCase):
         self.assertEqual(double_result, "48 ??")
 
 
-class TestErrorHandling(unittest.TestCase):
+class TestErrorHandling(CoveredUnitTest):
     """Test error handling and edge cases"""
 
     def test_unexpected_exception(self):
@@ -619,14 +543,6 @@ class TestErrorHandling(unittest.TestCase):
             raise sigmaker.Unexpected("Test error")
         except sigmaker.Unexpected as e:
             self.assertEqual(str(e), "Test error")
-
-    def test_bit_manipulation(self):
-        # Test bit manipulation using bitwise operations
-        self.assertEqual(1 << 0, 1)
-        self.assertEqual(1 << 1, 2)
-        self.assertEqual(1 << 2, 4)
-        self.assertEqual(1 << 3, 8)
-        self.assertEqual(1 << 7, 128)
 
     def test_regex_matching(self):
         matches = []
@@ -649,5 +565,5 @@ class TestErrorHandling(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    # Run the tests
+    # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

@@ -4,34 +4,30 @@ import shutil
 import sys
 import tempfile
 import unittest
-import unittest.mock
 import warnings
 
-# Set up logging for tests
+sys.path.insert(0, pathlib.Path(__file__).parent.as_posix())
+
+# Import the base test case
+from coveredtestcase import CoverageTestCase
+
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 # Context manager to suppress warnings from IDA Pro modules during import
 with warnings.catch_warnings():
-    warnings.filterwarnings(
-        "ignore", category=ResourceWarning, message=".*unclosed file.*"
-    )
-    warnings.filterwarnings(
-        "ignore", category=DeprecationWarning, message=".*swigvarlink.*"
-    )
-    # CRITICAL: Import idapro as the FIRST import for idalib
+    warnings.filterwarnings("ignore")
     import idapro
-    import ida_bytes
     import idaapi
-
-    # Add both src directory and IDA plugins directory to Python path
-    sys.path.insert(0, str((pathlib.Path(__file__).resolve().parents[1] / "src")))
-    sys.path.insert(0, "/root/.idapro/plugins")
 
     import sigmaker
 
 
-class TestIntegrationWithRealBinary(unittest.TestCase):
+class CoveredIntegrationTest(CoverageTestCase):
+    coverage_data_file = ".coverage.integration"
+
+
+class TestIntegrationWithRealBinary(CoveredIntegrationTest):
     """Integration tests that use real IDA Pro API against a compiled binary"""
 
     @classmethod
@@ -91,6 +87,9 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
 
         logger.debug("Total segments found: %d", seg_count)
 
+        # Call parent setUpClass to start coverage
+        super().setUpClass()
+
     @classmethod
     def tearDownClass(cls):
         """Close database and clean up temporary directory"""
@@ -102,6 +101,9 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
         if cls.tempdir and cls.tempdir.exists():
             logger.debug("Cleaning up temporary directory...")
             shutil.rmtree(cls.tempdir)
+
+        # Call parent tearDownClass to stop coverage and generate reports
+        super().tearDownClass()
 
     def get_code_address(self):
         """Get a code address for testing by looking through segments."""
@@ -152,7 +154,7 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
         # Verify we can read bytes from the database
         if seg:
             # Read some bytes from the first segment
-            bytes_data = ida_bytes.get_bytes(
+            bytes_data = idaapi.get_bytes(
                 seg.start_ea, min(16, seg.end_ea - seg.start_ea)
             )
             self.assertIsInstance(
@@ -174,7 +176,7 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
         current_ea = self.min_ea
         while current_ea < self.max_ea - 3:
             # Read bytes at current position and check for pattern
-            bytes_at_pos = ida_bytes.get_bytes(current_ea, 3)
+            bytes_at_pos = idaapi.get_bytes(current_ea, 3)
             if bytes_at_pos == search_pattern:
                 mov_positions.append(current_ea)
             current_ea += 1
@@ -187,11 +189,11 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
         found_target_instruction = False
         for pos in mov_positions:
             if pos + 4 < self.max_ea:
-                displacement = ida_bytes.get_byte(pos + 3)
+                displacement = idaapi.get_byte(pos + 3)
                 if displacement == 0x34:  # [rsp+0x34]
                     # This is our target instruction
                     # Verify the full pattern C7 44 24 34 00 00 00 00
-                    full_pattern = ida_bytes.get_bytes(pos, 8)
+                    full_pattern = idaapi.get_bytes(pos, 8)
                     expected = b"\xc7\x44\x24\x34\x00\x00\x00\x00"
                     self.assertEqual(
                         full_pattern,
@@ -215,7 +217,7 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
         matches = []
         current_ea = self.min_ea
         while current_ea < self.max_ea - 3:
-            bytes_at_pos = ida_bytes.get_bytes(current_ea, 3)
+            bytes_at_pos = idaapi.get_bytes(current_ea, 3)
             if bytes_at_pos == test_pattern:
                 if current_ea + 8 <= self.max_ea:
                     matches.append(current_ea)
@@ -229,7 +231,7 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
 
         found_displacements = set()
         for match_pos in matches:
-            displacement = ida_bytes.get_byte(match_pos + 3)
+            displacement = idaapi.get_byte(match_pos + 3)
             found_displacements.add(displacement)
 
         self.assertIn(0x30, found_displacements, "Should find [rsp+0x30] displacement")
@@ -238,25 +240,30 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
     def test_search_signature_string_ida_format(self):
         searcher = sigmaker.SignatureSearcher.from_signature("48 8B ? 48 89")
         results = searcher.search()  # Should not raise exception
-        print(results)
+        self.assertIsInstance(results, sigmaker.SearchResults)
+        self.assertEqual(results.signature_str, "48 8B ? 48 89")
+        self.assertEqual(len(results.matches), 4)
+        self.assertIsInstance(results.matches[0], sigmaker.Match)
 
     def test_search_signature_string_byte_array_format(self):
         searcher = sigmaker.SignatureSearcher.from_signature(
             "\\x48\\x8B\\x00\\x48\\x89 xx?xx"
         )
         results = searcher.search()  # Should not raise exception
-        print(results)
+        self.assertIsInstance(results, sigmaker.SearchResults)
+        self.assertEqual(results.signature_str, "48 8B ? 48 89")
+        self.assertEqual(len(results.matches), 4)
+        self.assertIsInstance(results.matches[0], sigmaker.Match)
 
     def test_search_signature_string_bitmask_format(self):
         searcher = sigmaker.SignatureSearcher.from_signature(
             "0x48, 0x8B, 0x00, 0x48, 0x89 0b11011"
         )
-
-        try:
-            results = searcher.search()  # Should not raise exception
-        except Exception as e:
-            self.fail(f"Unexpected exception: {e}")
-        print(results)
+        results = searcher.search()  # Should not raise exception
+        self.assertIsInstance(results, sigmaker.SearchResults)
+        self.assertEqual(results.signature_str, "48 8B ? 48 89")
+        self.assertEqual(len(results.matches), 4)
+        self.assertIsInstance(results.matches[0], sigmaker.Match)
 
     def test_signature_occurrence_finding(self):
         test_signatures = [
@@ -340,7 +347,7 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
             sm._append_operand_aware(
                 sig, cur, ins, ctx.wildcard_operands, ctx.wildcard_optimized
             )
-            txt = sig.build_ida_signature_string()
+            txt = f"{sig:ida}"
             hits = sm._find_signature_occurrences(txt)
             print(f"len={len(sig):4d} used={used+n:4d} hits={len(hits)} ea={hex(cur)}")
             if len(hits) == 1:
@@ -370,7 +377,6 @@ class TestIntegrationWithRealBinary(unittest.TestCase):
             max_single_signature_length=100,
             ask_longer_signature=False,
         )
-        print(f"anchor_ea={hex(anchor_ea)}", gen_ctx)
         result = sigmaker.SignatureMaker().make_signature(anchor_ea, gen_ctx)
         self.assertIsInstance(result.signature, sigmaker.Signature)
         sig_txt_dq = " ".join(

@@ -5,6 +5,10 @@ on:
     release:
         types:
             - published
+    workflow_run:
+        workflows: ["Release"]
+        types:
+            - completed
 
 # make concurrency tag-aware so one run doesn't cancel the other incorrectly
 concurrency:
@@ -109,6 +113,8 @@ jobs:
         runs-on: ubuntu-latest
 
         steps:
+            - uses: actions/checkout@v5
+
             - &display-version
               name: Display version
               run: |
@@ -159,7 +165,11 @@ jobs:
               working-directory: dist
 
             - uses: pypa/gh-action-pypi-publish@release/v1
-              if: ${{ github.event_name == 'release' && github.event.action == 'published' && github.repository_owner == 'mahmoudimus' }}
+              if: ${{
+                  github.repository_owner == 'mahmoudimus' && (
+                  (github.event_name == 'release' && github.event.action == 'published') ||
+                  (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'))
+                  }}
               # See https://docs.pypi.org/trusted-publishers/using-a-publisher/
               with:
                   skip-existing: true

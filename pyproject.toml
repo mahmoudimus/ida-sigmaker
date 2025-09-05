@@ -7,7 +7,7 @@ name = "sigmaker"
 requires-python = ">= 3.10"
 version = "1.4.0"
 authors = [
-    { name = "Mahmoud Abdelkader", email = "m[@][no-spam]mahmoudimus.com" },
+    { name = "Mahmoud Abdelkader", email = "m{_no-spam_}@mahmoudimus.com" },
 ]
 description = "An IDA Pro 9.0+ cross-platform signature maker plugin that works on MacOS/Linux/Windows. It creates unique binary pattern signatures to identify specific functions or addresses within binaries, even after updates. It helps reverse engineers preserve their analysis work by generating resilient signatures that can quickly relocate important code locations in new binary versions."
 license = "MIT"

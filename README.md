@@ -16,8 +16,7 @@ sigmaker's main value proposition is its cross-platform (Windows, macOS, Linux) 
 
 ### From Releases
 
-- Download the latest release from the [Releases page](https://github.com/mahmoudimus/ida-sigmaker/releases)
-- Extract `sigmaker.py` from the release package
+- Download the latest conveniently renamed `sigmaker.py` release from the [Releases page](https://github.com/mahmoudimus/ida-sigmaker/releases)
 - Copy it to your IDA Pro plugins directory
 - Restart IDA Pro
 

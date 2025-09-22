@@ -164,3 +164,22 @@ cython_debug/
 
 # ignore ida db
 **/*.i64
+
+# C
+build/
+# Cython debug symbols
+c*?_debug/
+
+
+# Don't ignore header files
+!include/**/*.h
+!include/**/*.hpp
+!include/**/*.hxx
+!include/**/*.hpp
+
+# Ignore compiled source files
+src/**/*.cpp
+src/**/*.so
+src/**/*.dll
+src/**/*.html
+src/**/*.so.dSYM

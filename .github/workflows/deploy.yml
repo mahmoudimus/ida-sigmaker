@@ -58,37 +58,6 @@ jobs:
         steps:
             - uses: actions/checkout@v5
 
-            - *install-build-twine
-
-            - name: Build sdist
-              run: |
-                  rm -rf dist/*
-                  python -m build --sdist
-
-            - *display-content-dist-folder
-
-            - *run-twine-check
-
-            - uses: actions/upload-artifact@v4
-              with:
-                  name: cibw-sdist
-                  path: dist/*.tar.gz
-
-    # upload job below uses the existing 'upload_to_pypi'
-
-    package:
-        name: Package
-        runs-on: ubuntu-latest
-
-        steps:
-            - uses: actions/checkout@v5
-
-            - &display-version
-              name: Display version
-              run: |
-                  python --version
-                  pip --version
-
             - &install-build-twine
               name: Install pypa/build pypa/twine
               run: |
@@ -115,6 +84,32 @@ jobs:
               name: Run twin check
               run: |
                   twine check dist/*
+
+            - name: Upload wheel artifact
+              uses: actions/upload-artifact@v4
+              with:
+                  name: cibw-sdist
+                  path: dist/*.tar.gz
+
+    # upload job below uses the existing 'upload_to_pypi'
+
+    package:
+        name: Package
+        runs-on: ubuntu-latest
+
+        steps:
+            - uses: actions/checkout@v5
+
+            - &display-version
+              name: Display version
+              run: |
+                  python --version
+                  pip --version
+
+            - *install-build-twine
+            - *build-wheel-sdist
+            - *display-content-dist-folder
+            - *run-twine-check
 
             - &upload-artifact
               name: Upload artifact

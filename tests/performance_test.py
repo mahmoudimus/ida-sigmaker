@@ -48,7 +48,7 @@ class TestBenchmarkPerformance(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.tests_dir = pathlib.Path(__file__).parent
-        cls.binary_path = cls.tests_dir / "resources/bin/test_binary.exe"
+        cls.binary_path = cls.tests_dir / "_resources/bin/test_binary.exe"
 
         if not cls.binary_path.exists():
             raise unittest.SkipTest("Test binary not available")
@@ -96,7 +96,7 @@ class TestBenchmarkPerformance(unittest.TestCase):
         if not func_ea:
             self.skipTest("No code address found for benchmarking")
 
-        ctx = sigmaker.Context(
+        ctx = sigmaker.SigMakerConfig(
             output_format=sigmaker.SignatureType.IDA,
             wildcard_operands=False,
             continue_outside_of_function=True,
@@ -130,7 +130,7 @@ class TestBenchmarkPerformance(unittest.TestCase):
             self.skipTest("No code address found for benchmarking")
 
         end_ea = start_ea + 32  # Small range for consistent benchmarking
-        ctx = sigmaker.Context(
+        ctx = sigmaker.SigMakerConfig(
             output_format=sigmaker.SignatureType.IDA,
             wildcard_operands=False,
             continue_outside_of_function=False,
@@ -169,13 +169,13 @@ class TestBenchmarkPerformance(unittest.TestCase):
             start_time = time.perf_counter()
             for pattern in search_patterns:
                 searcher = sigmaker.SignatureSearcher.from_signature(pattern)
-                ctx = sigmaker.Context(
+                ctx = sigmaker.SigMakerConfig(
                     output_format=sigmaker.SignatureType.IDA,
                     wildcard_operands=False,
                     continue_outside_of_function=False,
                     wildcard_optimized=False,
                 )
-                results = searcher.search(ctx)
+                results = searcher.search()
                 total_matches += len(results.matches)
             end_time = time.perf_counter()
             times.append(end_time - start_time)
@@ -330,7 +330,7 @@ class TestBenchmarkPerformance(unittest.TestCase):
         print("=" * 60)
 
         for config in configurations:
-            ctx = sigmaker.Context(
+            ctx = sigmaker.SigMakerConfig(
                 output_format=sigmaker.SignatureType.IDA,
                 wildcard_operands=config["wildcard_operands"],
                 continue_outside_of_function=True,
@@ -372,7 +372,7 @@ class TestBenchmarkPerformance(unittest.TestCase):
         if not func_ea:
             self.skipTest("No code address found for benchmarking")
 
-        ctx = sigmaker.Context(
+        ctx = sigmaker.SigMakerConfig(
             output_format=sigmaker.SignatureType.IDA,
             wildcard_operands=False,
             continue_outside_of_function=True,

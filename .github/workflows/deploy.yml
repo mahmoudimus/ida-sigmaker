@@ -41,7 +41,8 @@ jobs:
               env:
                   # Build CPython 3.10+ wheels only (as required by project)
                   CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-*"
-                  CIBW_SKIP: "pp*"
+                  # if no annotation for this build group, this shouldn't be skipped
+                  # CIBW_SKIP: "pp*"
               with:
                   package-dir: .
                   output-dir: wheelhouse
@@ -58,6 +59,12 @@ jobs:
         steps:
             - uses: actions/checkout@v5
 
+            - &display-version
+              name: Display version
+              run: |
+                  python --version
+                  pip --version
+
             - &install-build-twine
               name: Install pypa/build pypa/twine
               run: |
@@ -69,11 +76,11 @@ jobs:
                   echo "Installed versions:"
                   pip list | grep -E "(twine|packaging|setuptools|build)"
 
-            - &build-wheel-sdist
-              name: Build a wheel and sdist
+            - &build-sdist
+              name: Build sdist
               run: |
                   rm -rf dist/*
-                  python -m build
+                  python -m build --sdist
 
             - &display-content-dist-folder
               name: Display content dist folder
@@ -85,38 +92,11 @@ jobs:
               run: |
                   twine check dist/*
 
-            - name: Upload wheel artifact
+            - name: Upload artifact
               uses: actions/upload-artifact@v4
               with:
+                  path: ./dist/*.tar.gz
                   name: cibw-sdist
-                  path: dist/*.tar.gz
-
-    # upload job below uses the existing 'upload_to_pypi'
-
-    package:
-        name: Package
-        runs-on: ubuntu-latest
-
-        steps:
-            - uses: actions/checkout@v5
-
-            - &display-version
-              name: Display version
-              run: |
-                  python --version
-                  pip --version
-
-            - *install-build-twine
-            - *build-wheel-sdist
-            - *display-content-dist-folder
-            - *run-twine-check
-
-            - &upload-artifact
-              name: Upload artifact
-              uses: actions/upload-artifact@v4
-              with:
-                  path: ./dist/*
-                  name: dist
 
     upload_to_pypi:
         needs: [build_wheels, build_sdist]
@@ -127,7 +107,12 @@ jobs:
             id-token: write
         steps:
             - name: Download dist
-              uses: actions/download-artifact@v4
+              uses: actions/download-artifact@v5
+              with:
+                  # unpacks all CIBW artifacts into dist/
+                  pattern: cibw-*
+                  path: dist
+                  merge-multiple: true
 
             - name: Display downloaded files
               run: |

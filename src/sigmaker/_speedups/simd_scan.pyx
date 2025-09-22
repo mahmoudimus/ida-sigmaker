@@ -5,7 +5,7 @@ from libc.stdint cimport uint8_t
 from libc.stdlib cimport malloc, free
 from libc.string cimport memcmp, memchr
 
-from sigmaker._speedups.simd_scan cimport Signature
+from sigmaker._speedups.simd_scan cimport Signature, SimdLevel, simd_support_best_level
 
 cdef extern from "simd_support.hpp":
     unsigned _tzcnt32_inline(unsigned x) noexcept nogil
@@ -13,10 +13,15 @@ cdef extern from "simd_support.hpp":
                                     const unsigned char* base_kminus1,
                                     unsigned char p0, unsigned char pk,
                                     int m0, int mk) noexcept nogil
+    unsigned _scan16_anchors_sse2_inline(const unsigned char* base,
+                                         const unsigned char* base_kminus1,
+                                         unsigned char p0, unsigned char pk,
+                                         int m0, int mk) noexcept nogil
     unsigned _scan16_anchors_inline(const unsigned char* base,
                                     const unsigned char* base_kminus1,
                                     unsigned char p0, unsigned char pk,
                                     int m0, int mk) noexcept nogil
+
 
 cdef inline unsigned _tzcnt32(unsigned x) noexcept nogil:
     return _tzcnt32_inline(x)
@@ -57,31 +62,27 @@ cdef class Signature:
         """
         simd_kind: 0=portable, 1=AVX2(x86), 2=NEON(ARM)
         """
+        if simd_kind == SimdLevel.SIMD_BEST_SUPPORTED:
+            simd_kind = <int>simd_support_best_level()
         self._data = NULL
         self._size = 0
         self._has_mask = <bint>False
-        self._simd_kind = 0  # default portable; will set to provided value below
+        self._simd_kind = <SimdLevel>simd_kind
 
         cdef:
             bytes data_b = data.encode('ascii')
             bytes mask_b = mask.encode('ascii') if mask is not None else b""
-            const char* d = data_b
-            Py_ssize_t dn = len(data_b)
-            const char* m = mask_b
-            Py_ssize_t mn = len(mask_b)
+            const char* d = <const char*>data_b
+            Py_ssize_t dn = <Py_ssize_t>len(data_b)
+            const char* m = <const char*>mask_b
+            Py_ssize_t mn = <Py_ssize_t>len(mask_b)
 
         # Variables for parsing
         cdef:
             size_t k = 0
-            const char* src
-            Py_ssize_t remaining
             size_t mask_k = 0
-            const char* mask_src
-            Py_ssize_t mask_remaining
             size_t i
             int up_c, lo_c
-            uint8_t mask_byte
-            bint has_upper_wildcard, has_lower_wildcard
             Py_ssize_t pos
             Py_ssize_t mask_pos
             Py_ssize_t parse_pos
@@ -92,7 +93,7 @@ cdef class Signature:
             raise ValueError("invalid signature: empty")
 
         # Parse the string to count bytes and validate format
-        pos = 0
+        pos = <Py_ssize_t>0
         while pos < dn:
             if k > 0:
                 # Expect a space separator
@@ -116,7 +117,7 @@ cdef class Signature:
 
         if mn != 0:
             # Parse mask string to validate format and count bytes
-            mask_pos = 0
+            mask_pos = <Py_ssize_t>0
             while mask_pos < mn:
                 if mask_k > 0:
                     if mask_pos >= mn or mask_b[mask_pos] != 32:
@@ -142,15 +143,15 @@ cdef class Signature:
         self._has_mask = <bint>((mn != 0) or has_q)
         self._size = k
 
-        cdef size_t total = k + (k if self._has_mask else <size_t>0)
-        cdef size_t total_ = total if total > <size_t>0 else <size_t>1
-        self._data = <uint8_t*>malloc(total_ * sizeof(uint8_t))
+        cdef size_t total = k + (k if self._has_mask else 0)
+        cdef size_t malloc_size = <size_t>((total if total > 0 else 1) * (sizeof(uint8_t)))
+        self._data = <uint8_t*>malloc(malloc_size)
         if self._data == NULL:
             raise MemoryError("Could not allocate memory for signature")
 
         # Write pattern bytes
         i = 0
-        parse_pos = 0
+        parse_pos = <Py_ssize_t>0
         cdef uint8_t* dst = self._data
 
         while i < k:
@@ -180,14 +181,20 @@ cdef class Signature:
             i += 1
 
         # Set SIMD kind before potential early return
-        self._simd_kind = simd_kind if simd_kind in (0, 1, 2) else 0
+        
+        self._simd_kind = <SimdLevel>(<int>simd_kind if <int>simd_kind in (
+            SimdLevel.SIMD_SCALAR, 
+            SimdLevel.SIMD_X86_SSE2, 
+            SimdLevel.SIMD_X86_AVX2, 
+            SimdLevel.SIMD_ARM_NEON
+        ) else SimdLevel.SIMD_SCALAR)
 
         if not self._has_mask:
             return
 
         # Initial mask from '?' nibbles
         cdef uint8_t* mptr = self._data + k
-        mask_parse_pos = 0
+        mask_parse_pos = <Py_ssize_t>0
         i = 0
 
         while i < k:
@@ -255,7 +262,8 @@ cdef class Signature:
         self._data = NULL
         self._size = 0
         self._has_mask = <bint>False
-        self._simd_kind = 0
+        with gil:
+            self._simd_kind = simd_support_best_level()
 
     cdef const uint8_t* _data_ptr(self) noexcept nogil: 
         return self._data
@@ -264,19 +272,24 @@ cdef class Signature:
         if self._has_mask and self._data != NULL:
             return self._data + self._size
         else:
-            return NULL
+            return <const uint8_t*>NULL
         
     cdef size_t _get_size(self) noexcept nogil: 
         return self._size
         
-    cdef int _simd_kind_val(self) noexcept nogil: 
+    cdef SimdLevel _simd_kind_val(self) noexcept nogil: 
         return self._simd_kind
         
-    cdef void _set_simd_kind_val(self, int kind) noexcept nogil:
-        if kind == 1 or kind == 2:
+    cdef void _set_simd_kind_val(self, SimdLevel kind) noexcept nogil:
+        if kind in (
+            SimdLevel.SIMD_SCALAR, 
+            SimdLevel.SIMD_X86_SSE2, 
+            SimdLevel.SIMD_X86_AVX2, 
+            SimdLevel.SIMD_ARM_NEON
+        ):
             self._simd_kind = kind
         else:
-            self._simd_kind = 0
+            self._simd_kind = SimdLevel.SIMD_SCALAR
 
     @property
     def size_bytes(self) -> int: 
@@ -388,7 +401,7 @@ cdef class Signature:
             The SIMD kind is automatically detected based on CPU capabilities
             during signature creation, but can be overridden for performance tuning.
         """
-        return self._simd_kind_val()
+        return <int>self._simd_kind_val()
 
     def set_simd_kind(self, int kind):
         """Set the SIMD instruction set to use for scanning with this signature.
@@ -412,11 +425,9 @@ cdef class Signature:
             >>> sig.set_simd_kind(1)  # Force AVX2 usage
             >>> # All subsequent scans with sig will use AVX2 if available
         """
-        self._set_simd_kind_val(kind)
+        self._set_simd_kind_val(<SimdLevel>kind)
 
-# -----------------------------------------------------------------------------
 # Portable search: first/last anchors + memcmp / masked middle verify
-# -----------------------------------------------------------------------------
 cdef inline const uint8_t* _safe_search(const uint8_t* s, const uint8_t* e,
                                         const uint8_t* p, const uint8_t* m,
                                         size_t k) noexcept nogil:
@@ -482,7 +493,11 @@ ctypedef unsigned (*anchor_fn_t)(const unsigned char* base,
                                  unsigned char p0, unsigned char pk,
                                  int m0, int mk) noexcept nogil
 
-
+ctypedef size_t (*scan_core_fn_t)(const uint8_t* s, const uint8_t* e,
+                                  const uint8_t* p, const uint8_t* m,
+                                  size_t k) noexcept nogil
+                                  
+                                  
 cdef inline const uint8_t* _simd_then_scalar(const uint8_t* s, const uint8_t* e,
                                              const uint8_t* p, const uint8_t* m,
                                              size_t k,
@@ -533,7 +548,7 @@ cdef inline const uint8_t* _simd_then_scalar(const uint8_t* s, const uint8_t* e,
                 em &= (em - 1)
             i += 1  # Increment by 1, not stride! We need to check all positions
 
-    # ✅ Correct tail: start scalar at first unprocessed start
+    # tail search: start scalar at first unprocessed start position
     return _safe_search(s + i, e, p, m, k)
 
 
@@ -547,6 +562,11 @@ cdef inline const uint8_t* _neon_search(const uint8_t* s, const uint8_t* e,
                                         const uint8_t* p, const uint8_t* m,
                                         size_t k) noexcept nogil:
     return _simd_then_scalar(s, e, p, m, k, 16, _scan16_anchors_inline)
+    
+cdef inline const uint8_t* _sse2_search(const uint8_t* s, const uint8_t* e,
+                                        const uint8_t* p, const uint8_t* m,
+                                        size_t k) noexcept nogil:
+    return _simd_then_scalar(s, e, p, m, k, 16, _scan16_anchors_sse2_inline)
     
     
 cdef inline const uint8_t* _scan_range(const uint8_t* s, const uint8_t* e,
@@ -566,9 +586,9 @@ cdef inline const uint8_t* _scan_range(const uint8_t* s, const uint8_t* e,
             return i
         s = e - r - k + 1
     return _safe_search(s, e, p, m, k)
-# -----------------------------------------------------------------------------
+    
+
 # Public scanner core (used by Python wrapper after it chooses the path)
-# -----------------------------------------------------------------------------
 cdef size_t sig_scan(const uint8_t* data, size_t size, Signature search) noexcept nogil:
     if data == NULL or size == 0:
         return <size_t>-1
@@ -588,15 +608,28 @@ cdef size_t sig_scan(const uint8_t* data, size_t size, Signature search) noexcep
         const uint8_t* m = search._mask_ptr()
     return <size_t>(_scan_range(s, e, p, m, k) - s)
 
-# -----------------------------------------------------------------------------
-# Python-facing wrapper: runtime dispatch via sigmaker.cpu_feature_detector
-# -----------------------------------------------------------------------------
-def NPOS() -> int:
-    return -1
 
 
-cdef size_t npos_value() noexcept nogil:
-    return <size_t>-1
+
+def simd_best_level() -> int:
+    """Get the best available SIMD instruction set for the current CPU.
+    
+    This function detects the highest level of SIMD support available on the
+    current CPU and returns the corresponding SimdLevel enum value.
+    
+    Returns:
+        int: The best available SIMD level:
+            - 0: SIMD_SCALAR (portable fallback)
+            - 1: SIMD_X86_SSE2 (x86 SSE2 support)
+            - 2: SIMD_X86_AVX2 (x86 AVX2 support)
+            - 3: SIMD_ARM_NEON (ARM NEON support)
+    
+    Example:
+        >>> from sigmaker._speedups import simd_scan
+        >>> level = simd_scan.simd_best_level()
+        >>> print(f"Best SIMD level: {level}")
+    """
+    return <int>simd_support_best_level()
 
 
 def scan_bytes(const unsigned char[:] data_view, Signature sig) -> int:
@@ -645,11 +678,27 @@ def scan_bytes(const unsigned char[:] data_view, Signature sig) -> int:
     cdef const uint8_t* p = sig._data_ptr()
     cdef const uint8_t* m = sig._mask_ptr()
     cdef const uint8_t* hit
+    cdef int lvl
 
-    cdef int kind = sig._simd_kind_val()
-    if kind == 1:    # AVX2
+    cdef int kind = sig.simd_kind()
+    if kind == 0:
+        # Auto-select based on runtime/compile-time conservative probe
+        lvl = simd_best_level()
+        if lvl == SimdLevel.SIMD_X86_AVX2:
+            hit = _avx_search(s, e, p, m, k)
+        elif lvl == SimdLevel.SIMD_ARM_NEON:
+            hit = _neon_search(s, e, p, m, k)
+        elif lvl == SimdLevel.SIMD_X86_SSE2:
+            hit = _sse2_search(s, e, p, m, k)
+        else:
+            hit = _scan_range(s, e, p, m, k)
+    elif kind == 1:    # SCALAR
+        hit = _scan_range(s, e, p, m, k)
+    elif kind == 2:    # SSE2
+        hit = _sse2_search(s, e, p, m, k)
+    elif kind == 3:    # AVX2
         hit = _avx_search(s, e, p, m, k)
-    elif kind == 2:  # NEON
+    elif kind == 4:    # NEON
         hit = _neon_search(s, e, p, m, k)
     else:
         hit = _scan_range(s, e, p, m, k)

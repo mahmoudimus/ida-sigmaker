@@ -2,6 +2,15 @@
 from libc.stddef cimport size_t
 from libc.stdint cimport uint8_t
 
+cdef extern from "simd_support.hpp":
+    cdef enum SimdLevel:
+        SIMD_BEST_SUPPORTED # 0
+        SIMD_SCALAR # 1
+        SIMD_X86_SSE2 # 2
+        SIMD_X86_AVX2 # 3
+        SIMD_ARM_NEON # 4
+    SimdLevel simd_support_best_level() noexcept
+
 cdef class Signature:
     """Cython implementation of signature scanning with SIMD support.
 
@@ -12,7 +21,7 @@ cdef class Signature:
         uint8_t* _data        # [size_] data bytes [+ size_ mask bytes if _has_mask]
         size_t   _size
         bint     _has_mask
-        int      _simd_kind   # 0=portable, 1=AVX2(x86), 2=NEON(ARM)
+        SimdLevel      _simd_kind 
 
     cdef void _reset(self) noexcept nogil
     """Reset the signature object to clean state."""
@@ -26,14 +35,11 @@ cdef class Signature:
     cdef size_t _get_size(self) noexcept nogil
     """Get the size of the signature in bytes (for internal use)."""
 
-    cdef int _simd_kind_val(self) noexcept nogil
+    cdef SimdLevel _simd_kind_val(self) noexcept nogil
     """Get the current SIMD configuration value (for internal use)."""
 
-    cdef void _set_simd_kind_val(self, int kind) noexcept nogil
+    cdef void _set_simd_kind_val(self, SimdLevel kind) noexcept nogil
     """Set the SIMD configuration value (for internal use)."""
-
-cdef size_t npos_value() noexcept nogil
-"""Get the sentinel value indicating 'not found' for scan operations."""
 
 cdef size_t sig_scan(const uint8_t* data, size_t size, Signature search) noexcept nogil
 """Scan a data buffer for a signature pattern using SIMD acceleration.

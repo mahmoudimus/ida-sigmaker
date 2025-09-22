@@ -459,6 +459,152 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
             else:
                 self.assertFalse(sig_byte.is_wildcard)
 
+    def test_real_binary_pattern_search(self):
+        """Test searching for the actual pattern that exists in the test binary."""
+        # Read the actual test binary
+
+        try:
+            with open(self.binary_path, "rb") as f:
+                binary_data = f.read()
+
+            data_view = memoryview(binary_data)
+
+            # Test the exact pattern from the failing integration test
+            pattern = "E8 ?? ?? ?? ?? 48 89 C7"
+            print(f"\n=== Testing pattern '{pattern}' in real binary ===")
+
+            # Create SIMD signature
+            sig = sigmaker.simd_scan.Signature(pattern)
+
+            # Search for the pattern
+            result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+
+            print(f"Pattern '{pattern}' found at offset: {result}")
+
+            if result == -1:
+                print("Pattern not found! This indicates a bug in SIMD search.")
+                # Let's try some debugging
+                print("Binary size:", len(binary_data))
+                print("Pattern length:", len(pattern.split()))
+
+                # Check if the pattern exists at the expected location
+                expected_offset = 3595  # 0xe0b
+                if expected_offset + 8 <= len(binary_data):
+                    bytes_at_expected = binary_data[
+                        expected_offset : expected_offset + 8
+                    ]
+                    print(
+                        f"Bytes at expected offset {expected_offset}: {' '.join(f'{b:02X}' for b in bytes_at_expected)}"
+                    )
+
+                    # Test exact match at expected location
+                    exact_pattern = "E8 80 0A 00 00 48 89 C7"
+                    exact_sig = sigmaker.simd_scan.Signature(exact_pattern)
+                    exact_result = sigmaker.simd_scan.scan_bytes(data_view, exact_sig)
+                    print(f"Exact pattern search result: {exact_result}")
+
+                    if exact_result != expected_offset:
+                        print(
+                            f"ERROR: Expected exact pattern at {expected_offset}, but found at {exact_result}"
+                        )
+                    else:
+                        print(
+                            "Exact pattern found correctly, wildcard search is the issue"
+                        )
+
+            # The pattern should be found at offset 3595
+            expected_offset = 3595
+            self.assertEqual(
+                result,
+                expected_offset,
+                f"Pattern should be found at offset {expected_offset}, got {result}",
+            )
+
+        except FileNotFoundError:
+            self.skipTest(f"Test binary not found at {self.binary_path}")
+        except Exception as e:
+            self.fail(f"Error reading test binary: {e}")
+
+    def test_ida_environment_simulation(self):
+        """Test SIMD search under conditions that simulate the IDA environment."""
+        # Read the actual test binary
+
+        try:
+            with open(self.binary_path, "rb") as f:
+                binary_data = f.read()
+
+            print("\n=== IDA Environment Simulation ===")
+            print(f"Binary size: {len(binary_data)} bytes")
+
+            # Simulate InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.FILE)
+            # This should create a memoryview similar to what IDA does
+            data_view = memoryview(binary_data)
+
+            # Test the exact pattern from the failing test
+            pattern = "E8 ?? ?? ?? ?? 48 89 C7"
+            sig = sigmaker.simd_scan.Signature(pattern)
+
+            print(f"Testing pattern: {pattern}")
+            print(f"Data view type: {type(data_view)}")
+            print(f"Data view length: {len(data_view)}")
+
+            # Check if the pattern exists at the expected location
+            expected_offset = 3595
+            if expected_offset + 8 <= len(data_view):
+                bytes_at_expected = bytes(
+                    data_view[expected_offset : expected_offset + 8]
+                )
+                print(
+                    f"Bytes at offset {expected_offset}: {' '.join(f'{b:02X}' for b in bytes_at_expected)}"
+                )
+
+                # Verify the pattern matches
+                expected_bytes = b"\xe8\x80\x0a\x00\x00\x48\x89\xc7"
+                pattern_matches = bytes_at_expected == expected_bytes
+                print(f"Pattern matches expected: {pattern_matches}")
+
+            # Now test the SIMD search
+            result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+            print(f"SIMD search result: {result}")
+
+            if result == -1:
+                print("SIMD search failed to find pattern!")
+                # Let's try a different approach - search for smaller patterns
+                print("\n=== Debugging with smaller patterns ===")
+
+                # Test exact pattern without wildcards
+                exact_pattern = "E8 80 0A 00 00 48 89 C7"
+                exact_sig = sigmaker.simd_scan.Signature(exact_pattern)
+                exact_result = sigmaker.simd_scan.scan_bytes(data_view, exact_sig)
+                print(f"Exact pattern search result: {exact_result}")
+
+                # Test single byte pattern
+                single_pattern = "E8"
+                single_sig = sigmaker.simd_scan.Signature(single_pattern)
+                single_result = sigmaker.simd_scan.scan_bytes(data_view, single_sig)
+                print(f"Single byte 'E8' search result: {single_result}")
+
+                if single_result != -1:
+                    print(f"Found 'E8' at offset {single_result}")
+                    # Check what comes after
+                    if single_result + 8 <= len(data_view):
+                        next_bytes = bytes(data_view[single_result : single_result + 8])
+                        print(
+                            f"Next 8 bytes after 'E8': {' '.join(f'{b:02X}' for b in next_bytes)}"
+                        )
+
+            # The test should pass if SIMD finds the pattern
+            self.assertEqual(
+                result,
+                expected_offset,
+                f"SIMD search should find pattern at offset {expected_offset}, got {result}",
+            )
+
+        except FileNotFoundError:
+            self.skipTest(f"Test binary not found at {self.binary_path}")
+        except Exception as e:
+            self.fail(f"Error in IDA simulation test: {e}")
+
 
 if __name__ == "__main__":
     unittest.main()

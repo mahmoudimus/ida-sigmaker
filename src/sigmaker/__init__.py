@@ -12,6 +12,7 @@ import contextvars
 import dataclasses
 import enum
 import os
+import pathlib
 import re
 import string
 import traceback
@@ -32,6 +33,16 @@ WILDCARD_POLICY_CTX: contextvars.ContextVar["WildcardPolicy"] = contextvars.Cont
 )
 
 
+SIMD_SPEEDUP_AVAILABLE = False
+with contextlib.suppress(ImportError):
+    from sigmaker._speedups import simd_scan
+
+    _SimdSignature = simd_scan.Signature
+    _simd_scan_bytes = simd_scan.scan_bytes
+
+    SIMD_SPEEDUP_AVAILABLE = True
+
+
 class Unexpected(Exception):
     """Exception type used throughout the module to indicate unexpected errors."""
 
@@ -39,6 +50,126 @@ class Unexpected(Exception):
 def is_address_marked_as_code(ea: int) -> bool:
     """Returns True if the specified address (ea) is marked as code in the disassembled binary."""
     return idaapi.is_code(idaapi.get_flags(ea))
+
+
+# Buffer used to cache the entire database when scanning for signatures.
+@dataclasses.dataclass(slots=True)
+class InMemoryBuffer:
+    """
+    Provides fast access to the IDA database as a contiguous buffer, supporting
+    both segment-based and input-file-based loading. Also provides helpers to
+    translate between file offsets and IDA addresses.
+    """
+
+    class LoadMode(enum.Enum):
+        SEGMENTS = "segments"
+        FILE = "file"
+
+    file_path: pathlib.Path
+    mode: LoadMode = dataclasses.field(default=LoadMode.SEGMENTS)
+    _buffer: bytearray = dataclasses.field(
+        default_factory=bytearray, init=False, repr=False
+    )
+
+    @property
+    def file_size(self) -> int:
+        return idaapi.retrieve_input_file_size()
+
+    @property
+    def imagebase(self) -> int:
+        return idaapi.get_imagebase()
+
+    def _load_segments(self):
+        """Load all IDA segments into a single contiguous bytearray buffer."""
+        buf = self._buffer
+        seg = idaapi.get_first_seg()
+        while seg:
+            size = seg.end_ea - seg.start_ea
+            data = idaapi.get_bytes(seg.start_ea, size)
+            if data:
+                buf.extend(data)
+            seg = idaapi.get_next_seg(seg.start_ea)
+
+    def _load_input_file(self):
+        """Load the original input file into a buffer."""
+        if not self.file_path.exists():
+            raise RuntimeError(f"Input file {self.file_path} does not exist.")
+        with self.file_path.open("rb") as f:
+            self._buffer = bytearray(f.read())
+
+    @classmethod
+    def load(
+        cls,
+        file_path: str | pathlib.Path | None = None,
+        mode: "InMemoryBuffer.LoadMode" = LoadMode.SEGMENTS,
+    ) -> "InMemoryBuffer":
+        """
+        Load the buffer using the specified mode.
+        mode: _LoadMode.SEGMENTS (default) or _LoadMode.FILE
+        """
+        if file_path is None:
+            file_path = idaapi.get_input_file_path()
+        if isinstance(file_path, str):
+            file_path = pathlib.Path(file_path)
+        instance = cls(file_path=file_path, mode=mode)
+        if mode == cls.LoadMode.FILE:
+            instance._load_input_file()
+        else:
+            instance._load_segments()
+        return instance
+
+    def data(self) -> memoryview:
+        """
+        Return a memoryview of the buffer, loading if necessary.
+        mode: _LoadMode.SEGMENTS or _LoadMode.FILE
+        """
+        return memoryview(self._buffer)
+
+    def clear(self):
+        """Clear the buffer (for testing or reloading)."""
+        self._buffer.clear()
+
+    # --- Address translation helpers ---
+
+    def file_offset_to_ida_addr(self, file_offset: int) -> int:
+        """
+        Convert a file offset (from the input file) to an IDA address.
+        Only valid in 'file' mode.
+        """
+        if self.mode != self.LoadMode.FILE:
+            raise RuntimeError("file_offset_to_ida_addr is only valid in 'file' mode.")
+        return self.imagebase + file_offset
+
+    def ida_addr_to_file_offset(self, ida_addr: int) -> int:
+        """
+        Convert an IDA address to a file offset (from the input file).
+        Only valid in 'file' mode.
+        """
+        if self.mode != self.LoadMode.FILE:
+            raise RuntimeError("ida_addr_to_file_offset is only valid in 'file' mode.")
+        return ida_addr - self.imagebase
+
+    def segment_offset_to_ida_addr(self, seg_offset: int) -> int:
+        """
+        Convert a segment buffer offset to an IDA address.
+        Only valid in 'segments' mode.
+        """
+        if self.mode != self.LoadMode.SEGMENTS:
+            raise RuntimeError(
+                "segment_offset_to_ida_addr is only valid in 'segments' mode."
+            )
+        return self.imagebase + seg_offset
+
+    def ida_addr_to_segment_offset(self, ida_addr: int) -> int:
+        """
+        Convert an IDA address to a segment buffer offset.
+        Only valid in 'segments' mode.
+        """
+        if self.mode != self.LoadMode.SEGMENTS:
+            raise RuntimeError(
+                "ida_addr_to_segment_offset is only valid in 'segments' mode."
+            )
+        return ida_addr - self.imagebase
 
 
 @dataclasses.dataclass
@@ -1070,9 +1201,49 @@ class SignatureSearcher:
             return SearchResults([], "")
         matches = self.find_all(sig_str)
         return SearchResults(matches, sig_str)
+    
+    @staticmethod
+    def _find_all_simd(ida_signature: str, skip_more_than_one: bool = False
+    ) -> list[Match]:
+        simd_signature, _ = SigText.normalize(ida_signature)
+        with ProgressDialog("Please stand by, copying segments..."):
+            buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
+        data_mv = buf.data()
+        print(
+            "searching for",
+            simd_signature,
+            "starting from",
+            hex(buf.imagebase),
+            "with size",
+            hex(buf.file_size),
+            "buf length:",
+            len(data_mv),
+        )
+
+        sig = _SimdSignature(simd_signature)
+        results: list[Match] = []
+        base = idaapi.inf_get_min_ea()
+        if (k := sig.size_bytes) == 0:
+            return [Match(base)]
+
+        n = len(data_mv)
+        off = 0
+        while off <= n - k:
+            idx = _simd_scan_bytes(data_mv[off:], sig)
+            if idx < 0:
+                break
+            ea = base + off + idx
+            results.append(Match(ea))
+            if skip_more_than_one and len(results) > 1:
+                break
+            off += idx + 1
+        return results
 
     @staticmethod
     def find_all(ida_signature: str) -> list[Match]:
+        # Use SIMD if available
+        if SIMD_SPEEDUP_AVAILABLE:
+            return SignatureSearcher._find_all_simd(ida_signature)
         binary = idaapi.compiled_binpat_vec_t()
         idaapi.parse_binpat_str(binary, idaapi.inf_get_min_ea(), ida_signature, 16)
         out: list[Match] = []

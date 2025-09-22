@@ -7,7 +7,6 @@ environment variable ``IDA_SDK``.
 """
 
 import functools
-import json
 import os
 import pathlib
 import platform
@@ -44,97 +43,9 @@ else:
     LIBRARY_EXT = ".dll"
 
 
-def get_simd_info():
-    simd_probe_path = pathlib.Path(__file__).parent / "simd_probe.json"
-    if not simd_probe_path.exists():
-        msg = f"simd_probe.json not found at {simd_probe_path}, "
-        msg += "will run `python probe_compiler_intrinsics.py` to generate it"
-        print(msg)
-        subprocess.run([sys.executable, "probe_compiler_intrinsics.py"], check=True)
-        if not simd_probe_path.exists():
-            msg = f"simd_probe.json not found at {simd_probe_path}, "
-            msg += "tried to run `python probe_compiler_intrinsics.py` to generate it, "
-            msg += "but it did not succeed. "
-            msg += "Please run it manually: python probe_compiler_intrinsics.py"
-            raise FileNotFoundError(msg)
-    with open(simd_probe_path, "r") as f:
-        return json.load(f)
-
-
-# ----------------------------
-# SIMD flag selection (from probe)
-# ----------------------------
 def determine_simd_flags() -> list[str]:
-    """
-    Choose compiler flags to enable the highest supported SIMD level.
-
-    Strategy:
-    - If probe method is 'build-try-compile', use the *exact flags* that succeeded.
-    - Else (runtime), map detected features to conventional flags per compiler.
-    - Preference on x86: AVX2 > AVX > SSE2.
-    - On AArch64, NEON is baseline; avoid adding flags. On ARMv7, add -mfpu=neon for gcc/clang if present.
-    """
-    info = get_simd_info()
-    driver = info.get("driver", "unknown")
-    arch = info.get("arch", "unknown")
-
-    def _from_try_compile():
-        sup = info.get("supports", {})
-        # x86: prefer highest supported feature
-        for feat in ("avx2", "avx", "sse2"):
-            f = sup.get(feat)
-            if isinstance(f, dict) and f.get("supported") and f.get("flags"):
-                return f["flags"]
-        # ARM: neon flags (primarily armv7)
-        f = sup.get("neon")
-        if isinstance(f, dict) and f.get("supported") and f.get("flags"):
-            return f["flags"]
-        return []
-
-    def _from_runtime():
-        rt = info.get("runtime", {})
-
-        if arch == "x86":
-            x86 = rt.get("x86", {})
-            if not x86:
-                return []
-            if driver in ("msvc", "clang-cl"):
-                if x86.get("avx2"):
-                    return ["/arch:AVX2"]
-                if x86.get("avx"):
-                    return ["/arch:AVX"]
-                if x86.get("sse2"):
-                    return ["/arch:SSE2"]
-                return []
-            else:  # gcc/clang posix
-                if x86.get("avx2"):
-                    return ["-mavx2"]
-                if x86.get("avx"):
-                    return ["-mavx"]
-                if x86.get("sse2"):
-                    return ["-msse2"]
-                return []
-
-        if arch == "arm":
-            arm = rt.get("arm", {})
-            if not arm:
-                return []
-            # AArch64: NEON baseline → no flags. For 32-bit ARM, -mfpu=neon may be needed.
-            mach = platform.machine().lower()
-            is_armv7 = mach.startswith("arm") and not (
-                "aarch64" in mach or "arm64" in mach
-            )
-            if is_armv7 and driver in ("gcc", "clang") and arm.get("neon"):
-                return ["-mfpu=neon"]
-            return []
-
-        return []
-
-    if info.get("method") == "build-try-compile":
-        return _from_try_compile()
-
-    flags = _from_runtime()
-    return flags if flags else _from_try_compile()
+    # SIMD selection occurs at runtime inside the extension; keep compile flags baseline.
+    return []
 
 
 def compile_args(debug_mode=False):

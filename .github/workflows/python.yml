@@ -76,7 +76,7 @@ jobs:
                   set -e
                   docker compose run --rm --entrypoint bash idapro-tests -c "
                       set -e
-                      pip install -e .[ci]
+                      pip install -e .[ci,speedups]
                       python -m unittest discover . -p '*_test_*.py' -v
                       coverage combine .coverage.unit .coverage.integration
                       coverage report -m

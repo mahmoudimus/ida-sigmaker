@@ -1,4 +1,3 @@
-
 # cython: language_level=3, boundscheck=False, wraparound=False, cdivision=True
 from libc.stddef cimport size_t
 from libc.stdint cimport uint8_t

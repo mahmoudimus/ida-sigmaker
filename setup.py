@@ -170,7 +170,7 @@ def using_ida_sdk(include_dirs, library_dirs):
 
 def ext_modules(with_ida_sdk=False, debug_mode=False):
     include_dirs = [
-        pathlib.Path(__file__).parent / "include",
+        pathlib.Path(__file__).parent / "src" / "include",
     ]
     library_dirs = []
     libraries = []
@@ -179,7 +179,7 @@ def ext_modules(with_ida_sdk=False, debug_mode=False):
 
     include_paths = [str(path) for path in include_dirs]
     library_paths = [str(path) for path in library_dirs]
-
+    print(include_paths)
     modules = []
     macros: list[tuple[str, str | None]] = [("__EA64__", "1")] if x64 else []
 
@@ -210,7 +210,7 @@ def ext_modules(with_ida_sdk=False, debug_mode=False):
     )
     modules += partialed_cythonize(
         Extension(
-            "*",
+            "sigmaker._speedups.simd_scan",
             ["src/**/*.pyx"],
             language="c++",
             include_dirs=include_paths,
@@ -228,11 +228,10 @@ def ext_modules(with_ida_sdk=False, debug_mode=False):
 DEBUG_MODE = os.environ.get("DEBUG", "0") == "1"
 setup(
     name="ida-sigmaker",
-    version="1.3.0",
     description="IDA Pro plugin to generate signatures for code",
     ext_modules=ext_modules(with_ida_sdk=False, debug_mode=DEBUG_MODE),
-    packages=find_packages(include=("sigmaker*",)),
-    package_dir={"": "src"},
-    python_requires=">=3.10",
-    zip_safe=False,
+    # packages=find_packages(include=("sigmaker*",)),
+    # package_dir={"": "src"},
+    # python_requires=">=3.10",
+    # zip_safe=False,
 )

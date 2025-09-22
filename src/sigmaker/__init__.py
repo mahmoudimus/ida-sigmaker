@@ -1201,9 +1201,10 @@ class SignatureSearcher:
             return SearchResults([], "")
         matches = self.find_all(sig_str)
         return SearchResults(matches, sig_str)
-    
+
     @staticmethod
-    def _find_all_simd(ida_signature: str, skip_more_than_one: bool = False
+    def _find_all_simd(
+        ida_signature: str, skip_more_than_one: bool = False
     ) -> list[Match]:
         simd_signature, _ = SigText.normalize(ida_signature)
         with ProgressDialog("Please stand by, copying segments..."):

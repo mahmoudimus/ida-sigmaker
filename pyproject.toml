@@ -38,7 +38,7 @@ dependencies = []
 
 
 [project.optional-dependencies]
-ci = ["coverage"]
+ci = ["coverage", "cython>=3.1.3"]
 speedups = ["cython>=3.1.3"]
 
 [project.urls]
@@ -49,11 +49,38 @@ Issues = "https://github.com/mahmoudimus/ida-sigmaker/issues"
 
 
 [tool.setuptools.packages.find]
-where = ["src"]
-namespaces = true
+where = ["src", "include"]
+#exclude = ["test*"]
+# namespaces = true
 
 ## include = []
 ## exclude = []
 [tool.setuptools.dynamic]
 readme = { file = ["README.md", "LICENSE"], content-type = "text/markdown" }
 version = { attr = "sigmaker.__version__" }
+
+[tool.setuptools.package-data]
+# # Check the <mypkg>.egg-info/SOURCES.txt file generated after a `build` or `pip install` to check if the following files are correctly included in the sdist.
+# # Check also the list of files included by default: https://packaging.python.org/en/latest/guides/using-manifest-in/
+"*" = [
+    "*.md",
+    "LICENSE*",
+    "README*",
+    "*.pyx",    # include the cython implementation sourcecode in the wheel, so that the user can cythonize later, this is necessary, it's not included by default even with extensions in setup.py
+    "*.pxd",
+    "*.c",
+    "*.cpp",    # include the cythonized intermediary .c file for source distributions such as Gentoo, so that they do not need to install Cython v3 - no need since we use src-layout, it's automatically included
+    #"tests",  # to help linux distros package builders, they may want to run the unit test to check their package is working OK - no need, tests folder is packaged by default in sdist nowadays
+    "*.h",
+    "*.hpp",
+]
+
+#[tool.setuptools.exclude-package-data]
+#"*" = [
+#    "docs/_build",
+#    "tests/__pycache__",
+#    "tests/.mypy_cache",
+#]
+
+# [tool.cibuildwheel.config-settings]
+# --build-option = "--cythonize"

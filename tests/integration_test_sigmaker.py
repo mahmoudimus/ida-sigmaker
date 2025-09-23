@@ -131,6 +131,19 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
 
         logger.warning("No code addresses found in any segments")
         return None
+    
+    def test_ida_version(self):
+        """Test the IDA version"""       
+        version_str: str = idaapi.get_kernel_version()
+        major, minor = map(int, version_str.split("."))
+        
+        self.assertIsInstance(sigmaker.IDAVersionInfo.ida_version(), sigmaker.IDAVersionInfo)
+        self.assertEqual(sigmaker.ida_version(), (major, minor))
+        self.assertGreater(sigmaker.IDAVersionInfo.ida_version(), (major, max(0, minor - 1)))
+        self.assertLess(sigmaker.IDAVersionInfo.ida_version(), (major, minor + 1))
+        self.assertEqual(sigmaker.IDAVersionInfo.ida_version().sdk_version, idaapi.IDA_SDK_VERSION)
+        self.assertEqual(sigmaker.IDAVersionInfo.ida_version().major, major)
+        self.assertEqual(sigmaker.IDAVersionInfo.ida_version().minor, minor)
 
     def test_load_binary_with_ida(self):
         """Test loading the binary with IDA and basic analysis"""

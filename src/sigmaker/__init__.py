@@ -11,6 +11,7 @@ import contextlib
 import contextvars
 import dataclasses
 import enum
+import functools
 import os
 import pathlib
 import re
@@ -45,6 +46,46 @@ with contextlib.suppress(ImportError):
 
 class Unexpected(Exception):
     """Exception type used throughout the module to indicate unexpected errors."""
+
+
+@functools.total_ordering
+@dataclasses.dataclass(frozen=True)
+class IDAVersionInfo:
+    major: int
+    minor: int
+    sdk_version: int
+
+    def __eq__(self, other):
+        if isinstance(other, IDAVersionInfo):
+            return (self.major, self.minor) == (other.major, other.minor)
+        if isinstance(other, tuple):
+            return (self.major, self.minor) == tuple(other[:2])
+        return NotImplemented
+
+    def __lt__(self, other):
+        if isinstance(other, IDAVersionInfo):
+            return (self.major, self.minor) < (other.major, other.minor)
+        if isinstance(other, tuple):
+            return (self.major, self.minor) < tuple(other[:2])
+        return NotImplemented
+
+    @staticmethod
+    @functools.cache
+    def ida_version():
+        """
+        Returns an IDAVersionInfo instance for the current IDA kernel version.
+
+        The returned object supports comparison with tuples, e.g.:
+            if IDAVersionInfo.ida_version() >= (9, 2):
+                ...
+        """
+        version_str: str = idaapi.get_kernel_version()  # e.g. "9.1"
+        sdk_version: int = idaapi.IDA_SDK_VERSION
+        major, minor = map(int, version_str.split("."))
+        return IDAVersionInfo(major, minor, sdk_version)
+
+
+ida_version = IDAVersionInfo.ida_version
 
 
 def is_address_marked_as_code(ea: int) -> bool:
@@ -1332,9 +1373,13 @@ class Clipboard:
 
     @staticmethod
     def _set_text_pyqt5(text: str) -> bool:
-        """Set clipboard text via PyQt5 if available."""
+        """Set clipboard text via PyQt if available."""
         try:
-            from PyQt5.QtWidgets import QApplication  # type: ignore
+            if ida_version() < (9, 2):
+                from PyQt5.QtWidgets import QApplication  # type: ignore
+            else:
+                import PySide6
+                from PySide6.QtGui import QGuiApplication as QApplication  # type: ignore
 
             QApplication.clipboard().setText(text)
             return True
@@ -1518,7 +1563,7 @@ class SignatureMakerForm(idaapi.Form):
             f"""STARTITEM 0
 BUTTON YES* OK
 BUTTON CANCEL Cancel
-Signature Maker v{PLUGIN_VERSION}"""
+{PLUGIN_NAME} v{PLUGIN_VERSION} {"(SIMD)" if SIMD_SPEEDUP_AVAILABLE else ""}"""
             + r"""
 {FormChangeCb}
 Select action:

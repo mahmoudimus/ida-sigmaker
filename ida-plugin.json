@@ -11,6 +11,6 @@
         "logoPath": "assets/sigmaker-logo.png",
         "idaVersions": ">=9.0",
         "description": "SigMaker is a cross-platform signature maker plugin that works on MacOS/Linux/Windows. The primary goal of this plugin is to work with future versions of IDA without needing to compile against the IDA SDK as well as to allow for easier community contributions",
-        "version": "1.3.0"
+        "version": "1.6.0"
     }
 }

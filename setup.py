@@ -11,11 +11,10 @@ import os
 import pathlib
 import platform
 import re
-import subprocess
 import sys
 
 from Cython.Build import cythonize
-from setuptools import Extension, find_packages, setup
+from setuptools import Extension, setup
 
 # ---------------------------------------------------------------------------
 # Platform detection
@@ -230,8 +229,4 @@ setup(
     name="ida-sigmaker",
     description="IDA Pro plugin to generate signatures for code",
     ext_modules=ext_modules(with_ida_sdk=False, debug_mode=DEBUG_MODE),
-    # packages=find_packages(include=("sigmaker*",)),
-    # package_dir={"": "src"},
-    # python_requires=">=3.10",
-    # zip_safe=False,
 )

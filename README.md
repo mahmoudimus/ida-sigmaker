@@ -2,7 +2,7 @@
 
 <img src="https://github.com/mahmoudimus/ida-sigmaker/blob/main/assets/sigmaker-logo.png?raw=true" width="104px" height="100px" alt="Magnifying glass with the word 'sigmaker' and a cross-hair over the 'A' in sigmaker" /> [![ida-sigmaker tests](https://github.com/mahmoudimus/ida-sigmaker/actions/workflows/python.yml/badge.svg)](https://github.com/mahmoudimus/ida-sigmaker/actions/workflows/python.yml)
 
-An IDA Pro 9.0+ cross-platform signature maker plugin that works on MacOS/Linux/Windows. The primary goal of this plugin is to work with future versions of IDA without needing to compile against the IDA SDK as well as to allow for easier community contributions.
+An IDA Pro 9.0+ zero-dependency cross-platform signature maker plugin with optional SIMD (e.g. AVX2/NEON/SSE2) speedups that works on MacOS/Linux/Windows. The primary goal of this plugin is to work with future versions of IDA without needing to compile against the IDA SDK as well as to allow for easier community contributions.
 
 ## Installation
 
@@ -12,12 +12,14 @@ sigmaker's main value proposition is its cross-platform (Windows, macOS, Linux) 
 
 - Copy [`src/sigmaker/__init__.py`](./src/sigmaker/__init__.py) into the /plugins/ folder to the plugin directory!
 - Rename it to `sigmaker.py`
-- Restart your disassembler.
+- *OPTIONALLY*, if you would like `SIMD` speedups, just `pip install sigmaker`
+- Restart IDA Pro.
 
 ### From Releases
 
 - Download the latest conveniently renamed `sigmaker.py` release from the [Releases page](https://github.com/mahmoudimus/ida-sigmaker/releases)
 - Copy it to your IDA Pro plugins directory
+- *OPTIONALLY*, if you would like `SIMD` speedups, just `pip install sigmaker`
 - Restart IDA Pro
 
 That's it!
@@ -38,6 +40,18 @@ Default location:
 - On Windows: `%APPDATA%/Hex-Rays/IDA Pro`
 - On Linux and Mac: `$HOME/.idapro`
 
+## SIMD Speedups
+
+If you just followed the installation above and ran `pip install sigmaker`, then based on your system and architecture (i.e. Windows (x64), Linux (x64), Mac (x64), Mac (ARM/Silicon)), the plugin will install the appropriate wheel and will automatically use them if they're available. You do not have to do anything else. The plugin is designed to display the status of whether or not SIMD speedups are installed. They are shown in the top right menu bar of the plugin:
+
+### SIMD Enabled
+
+![](./assets/simd_enabled.png)
+
+### No SIMD Speedups
+
+![](./assets/no_simd_speedup.png)
+
 ## Requirements
 
 - IDA Pro 9.0+
@@ -57,27 +71,30 @@ Sigmaker lets you create unique patterns to track important parts of a program, 
 ## Usage
 
 In disassembly view, select a line you want to generate a signature for, and press
-**CTRL+ALT+S**
-![](https://i.imgur.com/b4MKkca.png)
+**CTRL+ALT+S**:
+![](./assets/gen_signature.png)
 
-The generated signature will be printed to the output console, as well as copied to the clipboard:
-![](https://i.imgur.com/mTFbKce.png)
+*OR* *Right-Click* and select *SigMaker*:
+![](./assets/right_click.png)
+
+The generated signature will be printed to the output console, **as well as copied to the clipboard**:
+![](./assets/output_sig.png)
 
 ___
 
 | Signature type | Example preview |
 | --- | ----------- |
-| IDA Signature | E8 ? ? ? ? 45 33 F6 66 44 89 34 33 |
-| x64Dbg Signature | E8 ?? ?? ?? ?? 45 33 F6 66 44 89 34 33 |
-| C Byte Array Signature + String mask | \xE8\x00\x00\x00\x00\x45\x33\xF6\x66\x44\x89\x34\x33 x????xxxxxxxx |
-| C Raw Bytes Signature + Bitmask | 0xE8, 0x00, 0x00, 0x00, 0x00, 0x45, 0x33, 0xF6, 0x66, 0x44, 0x89, 0x34, 0x33  0b1111111100001 |
+| IDA Signature | `E8 ? ? ? ? 45 33 F6 66 44 89 34 33` |
+| x64Dbg Signature | `E8 ?? ?? ?? ?? 45 33 F6 66 44 89 34 33` |
+| C Byte Array Signature + String mask | `\xE8\x00\x00\x00\x00\x45\x33\xF6\x66\x44\x89\x34\x33 x????xxxxxxxx` |
+| C Raw Bytes Signature + Bitmask | `0xE8, 0x00, 0x00, 0x00, 0x00, 0x45, 0x33, 0xF6, 0x66, 0x44, 0x89, 0x34, 0x33  0b1111111100001` |
 
 ___
 
 ### Finding XREFs
 
 Generating code Signatures by data or code xrefs and finding the shortest ones is also supported:
-![](https://i.imgur.com/P0VRIFQ.png)
+![](./assets/xref_search.png)
 
 ___
 
@@ -85,17 +102,35 @@ ___
 
 Searching for Signatures works for supported formats:
 
-![](https://i.imgur.com/lD4Zfwb.png)
+![](./assets/sig_search.png)
+
+It also supports wildcard nibble search support:
+
+![](./assets/nibble_wildcard_search.png)
 
 Just enter any string containing your Signature, it will automatically try to figure out what kind of Signature format is being used:
 
-![](https://i.imgur.com/oWMs7LN.png)
+![](./assets/smart_format_sig_search.png)
 
 Currently, all output formats you can generate are supported.
 
-Match(es) of your signature will be printed to console:
+Match(es) of your signature will be printed to console alongside the containing function name:
 
-![](https://i.imgur.com/Pe4REkX.png)
+![](./assets/matches_console.png)
+
+If the matched address is not a function name or has no function name, it falls back to just printing the address:
+
+![](./assets/matches_console_no_func.png)
+
+### Signature Configuration
+
+`sigmaker` also supports configurable wildcardable operands for unique signature creation:
+
+![](./assets/operand_selection.png)
+
+There are also various options that be configured via the `Other options` button:
+
+![](./assets/optional_configuration.png)
 
 ## Acknowledgements
 

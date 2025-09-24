@@ -12,6 +12,7 @@ import contextvars
 import dataclasses
 import enum
 import functools
+import logging
 import os
 import pathlib
 import re
@@ -23,11 +24,12 @@ import idaapi
 import idc
 
 __author__ = "mahmoudimus"
-__version__ = "1.5.0"
+__version__ = "1.6.0"
 
 PLUGIN_NAME: str = "Signature Maker (py)"
 PLUGIN_VERSION: str = __version__
 PLUGIN_AUTHOR: str = __author__
+
 
 WILDCARD_POLICY_CTX: contextvars.ContextVar["WildcardPolicy"] = contextvars.ContextVar(
     "wildcard_policy"
@@ -42,6 +44,40 @@ with contextlib.suppress(ImportError):
     _simd_scan_bytes = simd_scan.scan_bytes
 
     SIMD_SPEEDUP_AVAILABLE = True
+
+
+def configure_logging(
+    logger=None,
+    logging_name="sigmaker",
+    level=logging.INFO,
+    handler_filters=None,
+    fmt_str="[%(levelname)s] @ %(message)s",
+):
+    if logger is None:
+        logger = logging.getLogger(logging_name)
+
+    logger.propagate = False
+    logger.setLevel(level)
+    formatter = logging.Formatter(fmt_str)
+    handler = logging.StreamHandler()
+    handler.setFormatter(formatter)
+    handler.setLevel(level)
+
+    # Add the custom filter if every_n is specified.
+    if handler_filters is not None:
+        for _filter in handler_filters:
+            handler.addFilter(_filter)
+
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+
+    if not logger.handlers:
+        logger.addHandler(handler)
+    return logger
+
+
+LOGGER = configure_logging()
 
 
 class Unexpected(Exception):
@@ -170,7 +206,7 @@ class InMemoryBuffer:
         """Clear the buffer (for testing or reloading)."""
         self._buffer.clear()
 
-    # --- Address translation helpers ---
+    # Address translation helpers
 
     def file_offset_to_ida_addr(self, file_offset: int) -> int:
         """
@@ -520,7 +556,7 @@ class WildcardPolicy:
             if self.token is not None:
                 self.policy_class.reset_current(self.token)
 
-    # ---- construction helpers ----
+    # construction helpers
     @classmethod
     def for_x86(cls) -> "WildcardPolicy":
         return cls(frozenset(cls.BaseKind) | frozenset(cls.X86Kind))
@@ -1251,7 +1287,7 @@ class SignatureSearcher:
         with ProgressDialog("Please stand by, copying segments..."):
             buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
         data_mv = buf.data()
-        print(
+        LOGGER.debug(
             "searching for",
             simd_signature,
             "starting from",
@@ -1320,7 +1356,9 @@ class ProgressDialog:
     When used as a context manager the progress dialog will display a wait box
     on entry and hide it on exit.
 
-    The message may be updated via `replace_message()` and cancelation can be tested with `user_canceled()` from this class or `idaapi.user_cancelled()` from IDA API.
+    The message may be updated via `replace_message()` and cancelation can be
+    tested with `user_canceled()` from this class or `idaapi.user_cancelled()`
+    from IDA API.
     """
 
     def __init__(self, message: str = "Please wait...", hide_cancel: bool = False):
@@ -1379,7 +1417,9 @@ class Clipboard:
                 from PyQt5.QtWidgets import QApplication  # type: ignore
             else:
                 import PySide6
-                from PySide6.QtGui import QGuiApplication as QApplication  # type: ignore
+                from PySide6.QtGui import (
+                    QGuiApplication as QApplication,  # type: ignore
+                )
 
             QApplication.clipboard().setText(text)
             return True
@@ -1563,7 +1603,7 @@ class SignatureMakerForm(idaapi.Form):
             f"""STARTITEM 0
 BUTTON YES* OK
 BUTTON CANCEL Cancel
-{PLUGIN_NAME} v{PLUGIN_VERSION} {"(SIMD)" if SIMD_SPEEDUP_AVAILABLE else ""}"""
+{PLUGIN_NAME} v{PLUGIN_VERSION} {"(SIMD ENABLED)" if SIMD_SPEEDUP_AVAILABLE else "(NO SIMD SPEEDUP)"}"""
             + r"""
 {FormChangeCb}
 Select action:
@@ -1776,7 +1816,7 @@ class SigMakerPlugin(idaapi.plugin_t):
         except Unexpected as e:
             idaapi.msg(f"Error: {str(e)}\n")
         except Exception as e:
-            print(e, os.linesep, traceback.format_exc())
+            LOGGER.error(e, os.linesep, traceback.format_exc())
             return
 
     def term(self) -> None:
@@ -1810,13 +1850,13 @@ class SigMakerPlugin(idaapi.plugin_t):
             idaapi.jumpto(start_ea)
 
         if end_ea and end_ea <= start_ea:
-            print(
+            idaapi.msg(
                 f"Error: End address 0x{end_ea:X} must be greater than start address 0x{start_ea:X}."
             )
             end_ea = None
         if end_ea is None:
             end_ea = idc.get_item_end(start_ea)
-            print(f"No end address selected, using line end: 0x{end_ea:X}")
+            idaapi.msg(f"No end address selected, using line end: 0x{end_ea:X}")
 
         return start_ea, end_ea
 

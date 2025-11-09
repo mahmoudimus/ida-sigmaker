@@ -6,6 +6,7 @@ to ensure reliable testing across different platforms and architectures.
 """
 
 import array
+import functools
 import gc
 import itertools
 import logging
@@ -15,6 +16,7 @@ import random
 import re
 import sys
 import time
+import typing
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -36,6 +38,30 @@ SigText = sigmaker.SigText
 # Set up logging for tests
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+
+class PromptStub:
+    def __init__(self):
+        self.calls: list[tuple[tuple[typing.Any, ...], dict[str, typing.Any]]] = []
+        self.reports: list[dict[str, typing.Any]] = []
+
+    def __call__(self, func):
+        @functools.wraps(func)
+        def wrapped(*args, **kwargs):
+            kwargs.setdefault("prompt", self)
+            self.calls.append((args, kwargs))
+            return func(*args, **kwargs)
+
+        return wrapped
+
+    def report_progress(
+        self,
+        *,
+        message: str | None = None,
+        metadata: typing.Optional[dict[str, typing.Any]] = None,
+        **kwargs,
+    ) -> None:
+        self.reports.append({"message": message, "metadata": metadata or {}, **kwargs})
 
 
 def _assert_sig(
@@ -1641,6 +1667,268 @@ class TestSIMDScannerEquivalence(CoveredUnitTest):
             hay = bytes(b)
             # Verify
             self._assert_match_all_kinds(hay, pat, at)
+
+
+class TestCheckContinuePrompt(CoveredUnitTest):
+
+    def setUp(self):
+        super().setUp()
+        self.fake_time = [0.0]
+        self.time_patcher = patch("sigmaker.time.time", lambda: self.fake_time[0])
+        self.time_patcher.start()
+        self.addCleanup(self.time_patcher.stop)
+
+        # Ensure idaapi. ask_yn exists and has deterministic constants.
+        self.ask_patch = patch.object(sigmaker.idaapi, "ask_yn", MagicMock())
+        self.ask_mock = self.ask_patch.start()
+        self.addCleanup(self.ask_patch.stop)
+        sigmaker.idaapi.ASKBTN_NO = 0
+        sigmaker.idaapi.ASKBTN_YES = 1
+
+    def test_uses_qmessagebox_when_available(self):
+        prompt = sigmaker.CheckContinuePrompt(
+            metadata={"Task": "Search"},
+            prompt_interval=5,
+        )
+
+        self.fake_time[0] = 10.0
+        call_log = []
+
+        class DummyMessageBox:
+            Yes = 1
+            No = 2
+
+            @classmethod
+            def question(cls, parent, title, message, buttons, default):
+                call_log.append((title, message))
+                return cls.Yes
+
+        run_log = []
+
+        def run_target(prompt=None):
+            run_log.append(prompt)
+            return "done"
+
+        with patch("sigmaker._load_qmessage_box_cls", return_value=DummyMessageBox):
+            wrapped = prompt(run_target)
+            result = wrapped()
+
+        self.assertEqual(result, "done")
+        self.assertEqual(run_log, [prompt])
+        self.assertEqual(len(call_log), 1)
+        self.assertIn("Task: Search", call_log[0][1])
+        self.ask_mock.assert_not_called()
+
+    def test_raises_when_user_declines_without_cancel_func(self):
+        prompt = sigmaker.CheckContinuePrompt(prompt_interval=1)
+        self.fake_time[0] = 5.0
+        self.ask_mock.return_value = sigmaker.idaapi.ASKBTN_NO
+
+        def target(prompt=None):
+            return None
+
+        with patch("sigmaker._load_qmessage_box_cls", return_value=None):
+            wrapped = prompt(target)
+            with self.assertRaises(sigmaker.UserCanceledError):
+                wrapped()
+
+        self.ask_mock.assert_called_once()
+
+    def test_invokes_cancel_func_when_user_declines(self):
+        canceled = MagicMock(return_value="stopped")
+        prompt = sigmaker.CheckContinuePrompt(cancel_func=canceled, prompt_interval=1)
+        self.fake_time[0] = 5.0
+        self.ask_mock.return_value = sigmaker.idaapi.ASKBTN_NO
+
+        with patch("sigmaker._load_qmessage_box_cls", return_value=None):
+            target_called = []
+
+            def target(prompt=None):
+                target_called.append(True)
+
+            wrapped = prompt(target)
+            result = wrapped()
+
+        canceled.assert_called_once_with()
+        self.assertEqual(result, "stopped")
+        self.assertEqual(target_called, [])
+        self.ask_mock.assert_called()
+
+    def test_report_progress_updates_prompt_message(self):
+        prompt = sigmaker.CheckContinuePrompt(metadata={"Task": "Search"}, prompt_interval=1)
+
+        self.fake_time[0] = 0.2
+
+        def target(idx: int, prompt=None):
+            prompt.report_progress(message=f"Idx {idx}", metadata={"Processed": idx})
+
+        with patch("sigmaker._load_qmessage_box_cls", return_value=None):
+            wrapped = prompt(target)
+            wrapped(1)
+
+            self.fake_time[0] = 2.0
+            self.ask_mock.return_value = sigmaker.idaapi.ASKBTN_YES
+            wrapped(2)
+
+        self.ask_mock.assert_called_once()
+        asked_msg = self.ask_mock.call_args[0][1]
+        self.assertIn("Processed: 1", asked_msg)
+        self.assertIn("Idx 1", asked_msg)
+
+    def test_passes_prompt_instance_when_supported(self):
+        prompt = sigmaker.CheckContinuePrompt(prompt_interval=1)
+        self.fake_time[0] = 0.0
+
+        received = []
+
+        def target(idx: int, prompt=None):
+            received.append(prompt)
+
+        with patch("sigmaker._load_qmessage_box_cls", return_value=None):
+            wrapped = prompt(target)
+            wrapped(5)
+
+        self.assertEqual(received, [prompt])
+
+
+class TestSignatureGenerationPrompt(CoveredUnitTest):
+
+    def _base_config(self, **overrides):
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=True,
+            wildcard_optimized=False,
+        )
+        for key, value in overrides.items():
+            setattr(cfg, key, value)
+        return cfg
+
+    @staticmethod
+    def _append_byte(sig, *_args, **_kwargs):
+        sig.append(sigmaker.SignatureByte(0x90, False))
+
+    def test_unique_generator_reports_progress(self):
+        prompt_stub = PromptStub()
+        cfg = self._base_config()
+        processor = MagicMock()
+        processor.append_instruction_to_sig.side_effect = self._append_byte
+
+        instructions = [
+            (0x1000, MagicMock(), 1),
+            (0x1001, MagicMock(), 1),
+        ]
+
+        with patch.object(sigmaker, "InstructionWalker", return_value=iter(instructions)), patch.object(
+            sigmaker, "is_address_marked_as_code", return_value=True
+        ), patch.object(
+            sigmaker.idaapi, "get_func", return_value=None
+        ), patch.object(
+            sigmaker.SignatureSearcher, "is_unique", side_effect=[False, True]
+        ):
+            generator = sigmaker.UniqueSignatureGenerator(processor)
+            sig = generator.generate(0x1000, cfg, progress_prompt=prompt_stub)
+
+        self.assertIsNotNone(sig)
+        self.assertEqual(len(prompt_stub.reports), 2)
+        self.assertEqual(prompt_stub.reports[-1]["metadata"]["Signature bytes"], 2)
+
+    def test_range_generator_reports_progress(self):
+        prompt_stub = PromptStub()
+        cfg = self._base_config()
+        processor = MagicMock()
+        processor.append_instruction_to_sig.side_effect = self._append_byte
+
+        class WalkerStub:
+            def __init__(self, start_ea, end_ea):
+                self.cursor = start_ea
+                self._items = [
+                    (start_ea, MagicMock(), 1),
+                    (start_ea + 1, MagicMock(), 1),
+                ]
+
+            def __iter__(self):
+                for ea, ins, size in self._items:
+                    self.cursor = ea + size
+                    yield ea, ins, size
+
+        with patch.object(sigmaker, "InstructionWalker", WalkerStub), patch.object(
+            sigmaker, "is_address_marked_as_code", return_value=True
+        ), patch.object(
+            sigmaker.idaapi, "get_bytes", return_value=b"\x90\x90"
+        ):
+            generator = sigmaker.RangeSignatureGenerator(processor)
+            sig = generator.generate(0x2000, 0x2004, cfg, progress_prompt=prompt_stub)
+
+        self.assertIsNotNone(sig)
+        self.assertGreaterEqual(len(prompt_stub.reports), 3)
+        self.assertEqual(prompt_stub.reports[-1]["metadata"]["Processed bytes"], len(sig))
+
+    def test_signature_maker_respects_enable_flag(self):
+        maker = sigmaker.SignatureMaker()
+        maker._unique_generator = MagicMock()
+        maker._unique_generator.generate.return_value = sigmaker.Signature()
+        cfg = self._base_config()
+        cfg.enable_continue_prompt = False
+
+        with patch.object(sigmaker, "CheckContinuePrompt") as mock_prompt:
+            maker.make_signature(0x3000, cfg)
+
+        mock_prompt.assert_not_called()
+        kwargs = maker._unique_generator.generate.call_args.kwargs
+        self.assertIn("progress_prompt", kwargs)
+        self.assertIsNone(kwargs["progress_prompt"])
+
+    def test_signature_maker_passes_prompt_when_enabled(self):
+        maker = sigmaker.SignatureMaker()
+        prompt_stub = PromptStub()
+        maker._unique_generator = MagicMock()
+        maker._unique_generator.generate.return_value = sigmaker.Signature()
+        cfg = self._base_config()
+
+        with patch.object(sigmaker, "CheckContinuePrompt", return_value=prompt_stub) as mock_prompt:
+            maker.make_signature(0x4000, cfg)
+
+        mock_prompt.assert_called_once()
+        kwargs = maker._unique_generator.generate.call_args.kwargs
+        self.assertIs(kwargs["progress_prompt"], prompt_stub)
+
+
+class TestSignatureSearcherPrompt(CoveredUnitTest):
+
+    def test_search_passes_continue_prompt_to_find_all(self):
+        sentinel_callback = lambda: None
+        prompt_instance = MagicMock()
+        prompt_instance.return_value = sentinel_callback
+
+        with patch("sigmaker.CheckContinuePrompt", return_value=prompt_instance), patch.object(
+            sigmaker.SignatureParser, "parse", return_value="AA BB"
+        ), patch.object(
+            sigmaker.SignatureSearcher, "find_all", return_value=[sigmaker.Match(0x401000)]
+        ) as mock_find_all:
+            searcher = sigmaker.SignatureSearcher.from_signature("raw")
+            results = searcher.search()
+
+        prompt_instance.assert_called_once()
+        mock_find_all.assert_called_once_with("AA BB", continue_prompt=sentinel_callback)
+        self.assertEqual(results.matches, [sigmaker.Match(0x401000)])
+
+    def test_search_handles_user_canceled_error(self):
+        sentinel_callback = lambda: None
+        prompt_instance = MagicMock()
+        prompt_instance.return_value = sentinel_callback
+
+        with patch("sigmaker.CheckContinuePrompt", return_value=prompt_instance), patch.object(
+            sigmaker.SignatureParser, "parse", return_value="AA"
+        ), patch.object(
+            sigmaker.SignatureSearcher, "find_all", side_effect=sigmaker.UserCanceledError
+        ), patch.object(sigmaker.idaapi, "msg") as mock_msg:
+            searcher = sigmaker.SignatureSearcher.from_signature("raw")
+            results = searcher.search()
+
+        prompt_instance.assert_called_once()
+        mock_msg.assert_called()
+        self.assertEqual(results.matches, [])
 
 
 if __name__ == "__main__":

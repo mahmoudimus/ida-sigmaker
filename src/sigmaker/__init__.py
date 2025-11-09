@@ -19,6 +19,7 @@ import re
 import string
 import traceback
 import typing
+import time
 
 import idaapi
 import idc
@@ -82,6 +83,10 @@ LOGGER = configure_logging()
 
 class Unexpected(Exception):
     """Exception type used throughout the module to indicate unexpected errors."""
+
+
+class UserCanceledError(Unexpected):
+    """Raised when the user cancels a long-running operation."""
 
 
 @functools.total_ordering
@@ -265,6 +270,138 @@ class SigMakerConfig:
     print_top_x: int = 5
     max_single_signature_length: int = 100
     max_xref_signature_length: int = 250
+    enable_continue_prompt: bool = True
+
+
+_QMessageBoxCls: typing.Optional[typing.Type[typing.Any]] = None
+
+
+def _load_qmessage_box_cls() -> typing.Optional[typing.Type[typing.Any]]:
+    """Return the QMessageBox class for the active Qt binding if available."""
+
+    global _QMessageBoxCls
+    if _QMessageBoxCls is not None:
+        return _QMessageBoxCls
+
+    try:
+        if ida_version() < (9, 2):
+            from PyQt5.QtWidgets import QMessageBox  # type: ignore
+        else:
+            from PySide6.QtWidgets import QMessageBox  # type: ignore
+        _QMessageBoxCls = QMessageBox
+    except Exception:
+        _QMessageBoxCls = None
+    return _QMessageBoxCls
+
+
+@dataclasses.dataclass
+class CheckContinuePrompt:
+    """Decorator that prompts the user to continue when work takes too long."""
+
+    metadata: typing.Optional[dict[str, typing.Any]] = None
+    cancel_func: typing.Optional[typing.Callable[[], typing.Any]] = None
+    enable_prompt: bool = True
+    prompt_interval: int = 120
+    logger: typing.Optional[logging.Logger] = None
+
+    start_time: float = dataclasses.field(init=False)
+    next_prompt_threshold: float = dataclasses.field(init=False)
+    _dynamic_metadata: dict[str, typing.Any] = dataclasses.field(
+        default_factory=dict, init=False, repr=False
+    )
+    _progress_message: typing.Optional[str] = dataclasses.field(
+        default=None, init=False, repr=False
+    )
+
+    def __post_init__(self) -> None:
+        self.start_time = time.time()
+        self.next_prompt_threshold = float(self.prompt_interval)
+
+    @property
+    def elapsed_time(self) -> float:
+        return time.time() - self.start_time
+
+    def __call__(self, func: typing.Callable) -> typing.Callable:
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            if self._should_prompt() and self.elapsed_time >= self.next_prompt_threshold:
+                message = self._format_message(func.__name__)
+                if not self._ask_to_continue(message):
+                    if self.cancel_func:
+                        return self.cancel_func()
+                    raise UserCanceledError("User canceled")
+
+                self.next_prompt_threshold *= 2
+                if self.logger is not None:
+                    self.logger.info(
+                        "Next prompt will be at %d seconds (%.1f minutes)",
+                        int(self.next_prompt_threshold),
+                        self.next_prompt_threshold / 60.0,
+                    )
+
+            call_kwargs = dict(kwargs)
+            call_kwargs.setdefault("prompt", self)
+            return func(*args, **call_kwargs)
+
+        return wrapper
+
+    def _format_message(self, func_name: str) -> str:
+        minutes = int(self.elapsed_time // 60)
+        seconds = int(self.elapsed_time % 60)
+        time_str = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+        message_lines = [f"{func_name} has been running for {time_str}.", ""]
+
+        combined_metadata: dict[str, typing.Any] = {}
+        if self.metadata:
+            combined_metadata.update(self.metadata)
+        if self._dynamic_metadata:
+            combined_metadata.update(self._dynamic_metadata)
+
+        if combined_metadata:
+            for key, value in combined_metadata.items():
+                message_lines.append(f"{key}: {value}")
+            message_lines.append("")
+
+        if self._progress_message:
+            message_lines.append(self._progress_message)
+            message_lines.append("")
+        message_lines.append("Continue?")
+        return "\n".join(message_lines)
+
+    def _ask_to_continue(self, message: str) -> bool:
+        qmessagebox = _load_qmessage_box_cls()
+        if qmessagebox is not None:
+            reply = qmessagebox.question(
+                None,
+                "Continue execution?",
+                message,
+                qmessagebox.Yes | qmessagebox.No,
+                qmessagebox.No,
+            )
+            return reply == qmessagebox.Yes
+
+        reply = idaapi.ask_yn(idaapi.ASKBTN_NO, message)
+        return reply == idaapi.ASKBTN_YES
+
+    def _should_prompt(self) -> bool:
+        return self.enable_prompt and self.prompt_interval > 0
+
+    def report_progress(
+        self,
+        *,
+        message: typing.Optional[str] = None,
+        metadata: typing.Optional[dict[str, typing.Any]] = None,
+        **metadata_kwargs,
+    ) -> None:
+        """Update metadata/message used in the next prompt."""
+
+        combined = metadata.copy() if metadata else {}
+        if metadata_kwargs:
+            combined.update(metadata_kwargs)
+        if combined:
+            self._dynamic_metadata.update(combined)
+        if message is not None:
+            self._progress_message = message
 
 
 @dataclasses.dataclass(slots=True, frozen=True, repr=False)
@@ -946,13 +1083,31 @@ class UniqueSignatureGenerator:
     def __init__(self, processor: InstructionProcessor):
         self.processor = processor
 
-    def generate(self, ea: int, cfg: SigMakerConfig) -> Signature:
+    def generate(
+        self,
+        ea: int,
+        cfg: SigMakerConfig,
+        progress_prompt: typing.Optional[CheckContinuePrompt] = None,
+    ) -> Signature:
         if not is_address_marked_as_code(ea):
             raise Unexpected("Cannot create code signature for data")
 
         sig = Signature()
         start_fn = idaapi.get_func(ea)
         bytes_since_last_check = 0
+
+        progress_callback = None
+        if progress_prompt is not None:
+
+            @progress_prompt
+            def progress_callback(current_ea: int, sig_len: int, prompt=None):
+                prompt.report_progress(
+                    message=f"Scanning instruction @ 0x{current_ea:X}",
+                    metadata={
+                        "Signature bytes": sig_len,
+                        "Start EA": f"0x{ea:X}",
+                    },
+                )
 
         for cur_ea, ins, ins_len in InstructionWalker(ea):
             # Check length constraint
@@ -981,6 +1136,9 @@ class UniqueSignatureGenerator:
             )
             bytes_since_last_check += ins_len
 
+            if progress_callback is not None:
+                progress_callback(cur_ea, len(sig))
+
             if SignatureSearcher.is_unique(f"{sig:ida}"):
                 sig.trim_signature()
                 return sig
@@ -994,12 +1152,34 @@ class RangeSignatureGenerator:
     def __init__(self, processor: InstructionProcessor):
         self.processor = processor
 
-    def generate(self, start_ea: int, end_ea: int, cfg: SigMakerConfig) -> Signature:
+    def generate(
+        self,
+        start_ea: int,
+        end_ea: int,
+        cfg: SigMakerConfig,
+        progress_prompt: typing.Optional[CheckContinuePrompt] = None,
+    ) -> Signature:
         sig = Signature()
+
+        progress_callback = None
+        if progress_prompt is not None:
+
+            @progress_prompt
+            def progress_callback(current_ea: int, processed_len: int, prompt=None):
+                prompt.report_progress(
+                    message=f"Processing range @ 0x{current_ea:X}",
+                    metadata={
+                        "Processed bytes": processed_len,
+                        "Start EA": f"0x{start_ea:X}",
+                        "End EA": f"0x{end_ea:X}",
+                    },
+                )
 
         # Handle pure data ranges
         if not is_address_marked_as_code(start_ea):
             sig.add_bytes_to_signature(start_ea, end_ea - start_ea, is_wildcard=False)
+            if progress_callback is not None:
+                progress_callback(start_ea, len(sig))
             return sig
 
         # Iterate through instructions within the range
@@ -1008,6 +1188,8 @@ class RangeSignatureGenerator:
             self.processor.append_instruction_to_sig(
                 sig, cur_ea, ins, cfg.wildcard_operands, cfg.wildcard_optimized
             )
+            if progress_callback is not None:
+                progress_callback(cur_ea, len(sig))
 
         # Add any remaining bytes if the last instruction was partially in range
         # or if the range ended in a data block.
@@ -1016,6 +1198,8 @@ class RangeSignatureGenerator:
             sig.add_bytes_to_signature(
                 walker.cursor, remaining_bytes, is_wildcard=False
             )
+            if progress_callback is not None:
+                progress_callback(walker.cursor, len(sig))
 
         sig.trim_signature()
         return sig
@@ -1052,16 +1236,30 @@ class SignatureMaker:
         if start_ea == idaapi.BADADDR:
             raise Unexpected("Invalid start address")
 
+        progress_prompt = None
+        if cfg.enable_continue_prompt:
+            metadata = {
+                "Operation": "Range signature" if end is not None else "Unique signature",
+                "Start EA": f"0x{start_ea:X}",
+            }
+            if end is not None:
+                metadata["End EA"] = f"0x{int(end):X}"
+            progress_prompt = CheckContinuePrompt(metadata=metadata, logger=LOGGER)
+
         if end is None:
             # Delegate to the unique signature generation strategy
-            sig = self._unique_generator.generate(start_ea, cfg)
+            sig = self._unique_generator.generate(
+                start_ea, cfg, progress_prompt=progress_prompt
+            )
             return GeneratedSignature(sig, Match(start_ea))
 
         if end <= start_ea:
             raise Unexpected("End address must be after start address")
 
         # Delegate to the range signature generation strategy
-        sig = self._range_generator.generate(start_ea, end, cfg)
+        sig = self._range_generator.generate(
+            start_ea, end, cfg, progress_prompt=progress_prompt
+        )
         return GeneratedSignature(sig)
 
 
@@ -1276,12 +1474,28 @@ class SignatureSearcher:
         if not sig_str:
             idaapi.msg("Unrecognized signature type\n")
             return SearchResults([], "")
-        matches = self.find_all(sig_str)
+
+        metadata = {
+            "Operation": "Signature search",
+            "Signature length": len(sig_str.split()),
+            "Search mode": "SIMD" if SIMD_SPEEDUP_AVAILABLE else "bin_search",
+        }
+        continue_prompt = CheckContinuePrompt(metadata=metadata, logger=LOGGER)
+
+        _check_continue = continue_prompt(lambda prompt=None: None)
+
+        try:
+            matches = self.find_all(sig_str, continue_prompt=_check_continue)
+        except UserCanceledError:
+            idaapi.msg("Signature search canceled by user.\n")
+            return SearchResults([], sig_str)
         return SearchResults(matches, sig_str)
 
     @staticmethod
     def _find_all_simd(
-        ida_signature: str, skip_more_than_one: bool = False
+        ida_signature: str,
+        skip_more_than_one: bool = False,
+        continue_prompt: typing.Optional[typing.Callable[[], typing.Any]] = None,
     ) -> list[Match]:
         simd_signature, _ = SigText.normalize(ida_signature)
         with ProgressDialog("Please stand by, copying segments..."):
@@ -1307,6 +1521,8 @@ class SignatureSearcher:
         n = len(data_mv)
         off = 0
         while off <= n - k:
+            if continue_prompt is not None:
+                continue_prompt()
             idx = _simd_scan_bytes(data_mv[off:], sig)
             if idx < 0:
                 break
@@ -1318,10 +1534,16 @@ class SignatureSearcher:
         return results
 
     @staticmethod
-    def find_all(ida_signature: str) -> list[Match]:
+    def find_all(
+        ida_signature: str,
+        continue_prompt: typing.Optional[typing.Callable[[], typing.Any]] = None,
+    ) -> list[Match]:
         # Use SIMD if available
         if SIMD_SPEEDUP_AVAILABLE:
-            return SignatureSearcher._find_all_simd(ida_signature)
+            return SignatureSearcher._find_all_simd(
+                ida_signature,
+                continue_prompt=continue_prompt,
+            )
         binary = idaapi.compiled_binpat_vec_t()
         idaapi.parse_binpat_str(binary, idaapi.inf_get_min_ea(), ida_signature, 16)
         out: list[Match] = []
@@ -1330,6 +1552,8 @@ class SignatureSearcher:
             idaapi, "bin_search3"
         )
         while True:
+            if continue_prompt is not None:
+                continue_prompt()
             hit, _ = _bin_search(
                 ea,
                 idaapi.inf_get_max_ea(),
@@ -1621,7 +1845,8 @@ Output format:
 Quick Options:
 <#Enable wildcarding for operands, to improve stability of created signatures#Wildcards for operands:{cWildcardOperands}>
 <#Don't stop signature generation when reaching end of function#Continue when leaving function scope:{cContinueOutside}>
-<#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>{cGroupOptions}>
+<#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>
+<#Show periodic continue prompts while generating signatures#Enable continue prompt:{cEnablePrompt}>{cGroupOptions}>
 
 <Operand types...:{bOperandTypes}><Other options...:{bOtherOptions}>
 """
@@ -1636,8 +1861,13 @@ Quick Options:
                 ("rIDASig", "rx64DbgSig", "rByteArrayMaskSig", "rRawBytesBitmaskSig")
             ),
             "cGroupOptions": idaapi.Form.ChkGroupControl(
-                ("cWildcardOperands", "cContinueOutside", "cWildcardOptimized"),
-                value=5,
+                (
+                    "cWildcardOperands",
+                    "cContinueOutside",
+                    "cWildcardOptimized",
+                    "cEnablePrompt",
+                ),
+                value=13,
             ),
             "bOperandTypes": F.ButtonInput(self.ConfigureOperandWildcardBitmask),
             "bOtherOptions": F.ButtonInput(self.ConfigureOptions),
@@ -1776,6 +2006,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             wildcard_operands = bool(form.cGroupOptions.value & 1)  # type: ignore
             continue_outside_of_function = bool(form.cGroupOptions.value & 2)  # type: ignore
             wildcard_optimized = bool(form.cGroupOptions.value & 4)  # type: ignore
+            enable_continue_prompt = bool(form.cGroupOptions.value & 8)  # type: ignore
 
         # Create SigMakerConfig
         config = SigMakerConfig(
@@ -1783,6 +2014,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             wildcard_operands=wildcard_operands,
             continue_outside_of_function=continue_outside_of_function,
             wildcard_optimized=wildcard_optimized,
+            enable_continue_prompt=enable_continue_prompt,
         )
 
         try:

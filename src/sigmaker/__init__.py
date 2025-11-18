@@ -467,6 +467,7 @@ class SigMakerConfig:
     wildcard_operands: bool
     continue_outside_of_function: bool
     wildcard_optimized: bool
+    enable_continue_prompt: bool = True
     ask_longer_signature: bool = True
     print_top_x: int = 5
     max_single_signature_length: int = 100
@@ -1332,7 +1333,8 @@ class SignatureMaker:
             ea: Starting address for signature generation
             cfg: Configuration for signature generation
             end: Optional ending address for range-based signatures
-            progress_reporter: Optional progress reporter for cancellation and updates
+            progress_reporter: Optional progress reporter for cancellation and updates.
+                              If not provided, one will be created based on cfg.enable_continue_prompt.
 
         Returns:
             A GeneratedSignature containing the signature and metadata
@@ -1344,6 +1346,17 @@ class SignatureMaker:
         start_ea = int(ea)
         if start_ea == idaapi.BADADDR:
             raise Unexpected("Invalid start address")
+
+        # Create progress reporter based on config if not provided
+        if progress_reporter is None and cfg.enable_continue_prompt:
+            progress_reporter = CheckContinuePrompt(
+                prompt_interval=120,  # 2 minutes
+                metadata={
+                    "operation": "Signature generation",
+                    "start_address": hex(start_ea),
+                },
+                logger=LOGGER,
+            )
 
         if end is None:
             # Create unique signature generator with progress reporter
@@ -1934,7 +1947,8 @@ Output format:
 Quick Options:
 <#Enable wildcarding for operands, to improve stability of created signatures#Wildcards for operands:{cWildcardOperands}>
 <#Don't stop signature generation when reaching end of function#Continue when leaving function scope:{cContinueOutside}>
-<#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>{cGroupOptions}>
+<#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>
+<#Show periodic continue prompts while generating signatures#Enable continue prompt:{cEnablePrompt}>{cGroupOptions}>
 
 <Operand types...:{bOperandTypes}><Other options...:{bOtherOptions}>
 """
@@ -1949,8 +1963,8 @@ Quick Options:
                 ("rIDASig", "rx64DbgSig", "rByteArrayMaskSig", "rRawBytesBitmaskSig")
             ),
             "cGroupOptions": idaapi.Form.ChkGroupControl(
-                ("cWildcardOperands", "cContinueOutside", "cWildcardOptimized"),
-                value=5,
+                ("cWildcardOperands", "cContinueOutside", "cWildcardOptimized", "cEnablePrompt"),
+                value=13,  # Bits: 1 (wildcards) + 4 (wildcard optimized) + 8 (enable prompt)
             ),
             "bOperandTypes": F.ButtonInput(self.ConfigureOperandWildcardBitmask),
             "bOtherOptions": F.ButtonInput(self.ConfigureOptions),
@@ -2089,6 +2103,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             wildcard_operands = bool(form.cGroupOptions.value & 1)  # type: ignore
             continue_outside_of_function = bool(form.cGroupOptions.value & 2)  # type: ignore
             wildcard_optimized = bool(form.cGroupOptions.value & 4)  # type: ignore
+            enable_continue_prompt = bool(form.cGroupOptions.value & 8)  # type: ignore
 
         # Create SigMakerConfig
         config = SigMakerConfig(
@@ -2096,6 +2111,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             wildcard_operands=wildcard_operands,
             continue_outside_of_function=continue_outside_of_function,
             wildcard_optimized=wildcard_optimized,
+            enable_continue_prompt=enable_continue_prompt,
         )
 
         try:

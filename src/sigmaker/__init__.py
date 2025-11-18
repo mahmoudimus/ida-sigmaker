@@ -80,6 +80,9 @@ def configure_logging(
 
 LOGGER = configure_logging()
 
+# Set to True to enable verbose debug logging for progress reporter initialization
+DEBUGGING_MODE = False
+
 
 def _load_qmessage_box_cls():
     """Load QMessageBox class compatible with IDA's Qt version.
@@ -239,7 +242,7 @@ class CheckContinuePrompt:
     def __post_init__(self) -> None:
         self.start_time = time.time()
         self._timer = ExponentialBackoffTimer(initial_interval=float(self.prompt_interval))
-        if self.logger is not None:
+        if DEBUGGING_MODE and self.logger is not None:
             self.logger.info(
                 "CheckContinuePrompt initialized: enable_prompt=%s, prompt_interval=%d seconds",
                 self.enable_prompt,
@@ -1485,11 +1488,12 @@ class SignatureMaker:
                 logger=LOGGER,
                 enable_prompt=cfg.enable_continue_prompt,
             )
-            LOGGER.info(
-                "Created CheckContinuePrompt: interval=%ds, enabled=%s",
-                cfg.prompt_interval,
-                cfg.enable_continue_prompt,
-            )
+            if DEBUGGING_MODE:
+                LOGGER.info(
+                    "Created CheckContinuePrompt: interval=%ds, enabled=%s",
+                    cfg.prompt_interval,
+                    cfg.enable_continue_prompt,
+                )
 
         if end is None:
             # Create unique signature generator via factory method

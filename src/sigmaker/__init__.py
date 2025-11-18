@@ -1149,22 +1149,20 @@ class InstructionWalker:
 class UniqueSignatureGenerator:
     """Strategy for generating a signature that is guaranteed to be unique."""
 
-    def __init__(self, processor: InstructionProcessor):
-        self.processor = processor
-
-    def generate(
+    def __init__(
         self,
-        ea: int,
-        cfg: SigMakerConfig,
-        *,
+        processor: InstructionProcessor,
         progress_reporter: typing.Optional[ProgressReporter] = None,
-    ) -> Signature:
+    ):
+        self.processor = processor
+        self.progress_reporter = progress_reporter
+
+    def generate(self, ea: int, cfg: SigMakerConfig) -> Signature:
         """Generate a unique signature starting at the given address.
 
         Args:
             ea: Starting address for signature generation
             cfg: Configuration for signature generation
-            progress_reporter: Optional progress reporter for cancellation and updates
 
         Returns:
             A unique signature
@@ -1183,13 +1181,13 @@ class UniqueSignatureGenerator:
 
         for cur_ea, ins, ins_len in InstructionWalker(ea):
             # Check for cancellation via progress reporter
-            if progress_reporter is not None and progress_reporter.should_cancel():
+            if self.progress_reporter is not None and self.progress_reporter.should_cancel():
                 raise UserCanceledError("Signature generation cancelled by user")
 
             # Update progress periodically
             instruction_count += 1
-            if progress_reporter is not None and instruction_count % 100 == 0:
-                progress_reporter.report_progress(
+            if self.progress_reporter is not None and instruction_count % 100 == 0:
+                self.progress_reporter.report_progress(
                     message=f"Generating signature at {hex(cur_ea)}",
                     signature_length=len(sig),
                     instructions_processed=instruction_count,
@@ -1231,16 +1229,19 @@ class UniqueSignatureGenerator:
 class RangeSignatureGenerator:
     """Strategy for generating a signature for a fixed address range."""
 
-    def __init__(self, processor: InstructionProcessor):
+    def __init__(
+        self,
+        processor: InstructionProcessor,
+        progress_reporter: typing.Optional[ProgressReporter] = None,
+    ):
         self.processor = processor
+        self.progress_reporter = progress_reporter
 
     def generate(
         self,
         start_ea: int,
         end_ea: int,
         cfg: SigMakerConfig,
-        *,
-        progress_reporter: typing.Optional[ProgressReporter] = None,
     ) -> Signature:
         """Generate a signature for a specific address range.
 
@@ -1248,7 +1249,6 @@ class RangeSignatureGenerator:
             start_ea: Starting address
             end_ea: Ending address (exclusive)
             cfg: Configuration for signature generation
-            progress_reporter: Optional progress reporter for cancellation and updates
 
         Returns:
             A signature for the specified range
@@ -1269,16 +1269,16 @@ class RangeSignatureGenerator:
 
         for cur_ea, ins, _ in walker:
             # Check for cancellation via progress reporter
-            if progress_reporter is not None and progress_reporter.should_cancel():
+            if self.progress_reporter is not None and self.progress_reporter.should_cancel():
                 raise UserCanceledError("Signature generation cancelled by user")
 
             # Update progress periodically
             instruction_count += 1
-            if progress_reporter is not None and instruction_count % 50 == 0:
+            if self.progress_reporter is not None and instruction_count % 50 == 0:
                 range_size = end_ea - start_ea
                 bytes_processed = cur_ea - start_ea
                 progress_pct = (bytes_processed / range_size * 100) if range_size > 0 else 0
-                progress_reporter.report_progress(
+                self.progress_reporter.report_progress(
                     message=f"Processing range at {hex(cur_ea)}",
                     signature_length=len(sig),
                     instructions_processed=instruction_count,
@@ -1313,14 +1313,10 @@ class SignatureMaker:
 
     # Internal components built from dependencies
     _instruction_processor: InstructionProcessor = dataclasses.field(init=False)
-    _unique_generator: UniqueSignatureGenerator = dataclasses.field(init=False)
-    _range_generator: RangeSignatureGenerator = dataclasses.field(init=False)
 
     def __post_init__(self):
         """Initialize internal components after the main object is created."""
         self._instruction_processor = InstructionProcessor(self._operand_processor)
-        self._unique_generator = UniqueSignatureGenerator(self._instruction_processor)
-        self._range_generator = RangeSignatureGenerator(self._instruction_processor)
 
     def make_signature(
         self,
@@ -1350,19 +1346,21 @@ class SignatureMaker:
             raise Unexpected("Invalid start address")
 
         if end is None:
-            # Delegate to the unique signature generation strategy
-            sig = self._unique_generator.generate(
-                start_ea, cfg, progress_reporter=progress_reporter
+            # Create unique signature generator with progress reporter
+            generator = UniqueSignatureGenerator(
+                self._instruction_processor, progress_reporter
             )
+            sig = generator.generate(start_ea, cfg)
             return GeneratedSignature(sig, Match(start_ea))
 
         if end <= start_ea:
             raise Unexpected("End address must be after start address")
 
-        # Delegate to the range signature generation strategy
-        sig = self._range_generator.generate(
-            start_ea, end, cfg, progress_reporter=progress_reporter
+        # Create range signature generator with progress reporter
+        generator = RangeSignatureGenerator(
+            self._instruction_processor, progress_reporter
         )
+        sig = generator.generate(start_ea, end, cfg)
         return GeneratedSignature(sig)
 
 

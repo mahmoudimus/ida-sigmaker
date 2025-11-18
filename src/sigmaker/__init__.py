@@ -171,6 +171,7 @@ class CheckContinuePrompt:
 
     start_time: float = dataclasses.field(init=False)
     next_prompt_threshold: float = dataclasses.field(init=False)
+    current_interval: float = dataclasses.field(init=False)
     _dynamic_metadata: dict[str, typing.Any] = dataclasses.field(
         default_factory=dict, init=False, repr=False
     )
@@ -181,7 +182,8 @@ class CheckContinuePrompt:
 
     def __post_init__(self) -> None:
         self.start_time = time.time()
-        self.next_prompt_threshold = float(self.prompt_interval)
+        self.current_interval = float(self.prompt_interval)
+        self.next_prompt_threshold = self.current_interval
         if self.logger is not None:
             self.logger.info(
                 "CheckContinuePrompt initialized: enable_prompt=%s, prompt_interval=%d seconds",
@@ -258,11 +260,14 @@ class CheckContinuePrompt:
                 return True
 
             # Update threshold for next prompt (exponential backoff)
-            self.next_prompt_threshold *= 2
+            # Double the interval and set next prompt relative to current time
+            self.current_interval *= 2
+            self.next_prompt_threshold = self.elapsed_time + self.current_interval
             if self.logger is not None:
                 self.logger.info(
-                    "User chose to continue. Next prompt will be at %d seconds (%.1f minutes)",
-                    int(self.next_prompt_threshold),
+                    "User chose to continue. Next prompt in %.1f seconds at %.1f seconds total (%.1f minutes)",
+                    self.current_interval,
+                    self.next_prompt_threshold,
                     self.next_prompt_threshold / 60.0,
                 )
 

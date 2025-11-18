@@ -1322,8 +1322,15 @@ class RangeSignatureGenerator:
 
 @dataclasses.dataclass(slots=True)
 class SignatureMaker:
-    """
-    Generates unique or range-based signatures.
+    """Generates unique or range-based signatures.
+
+    This class uses a factory method pattern to create the appropriate signature
+    generator (UniqueSignatureGenerator or RangeSignatureGenerator) based on the
+    operation being performed.
+
+    Note: SignatureMaker instances are ephemeral - a new instance is created for
+    each user action from the IDA UI. Therefore, caching generators would provide
+    no performance benefit, and we create them on-demand via factory method.
     """
 
     _operand_processor: OperandProcessor = dataclasses.field(
@@ -1336,6 +1343,27 @@ class SignatureMaker:
     def __post_init__(self):
         """Initialize internal components after the main object is created."""
         self._instruction_processor = InstructionProcessor(self._operand_processor)
+
+    def _create_generator(
+        self,
+        for_range: bool,
+        progress_reporter: typing.Optional[ProgressReporter],
+    ) -> UniqueSignatureGenerator | RangeSignatureGenerator:
+        """Factory method to create the appropriate signature generator.
+
+        This method encapsulates the logic for creating signature generators,
+        abstracting away the concrete generator types from make_signature().
+
+        Args:
+            for_range: True to create RangeSignatureGenerator, False for UniqueSignatureGenerator
+            progress_reporter: Progress reporter to pass to the generator
+
+        Returns:
+            The appropriate generator instance configured with the progress reporter
+        """
+        if for_range:
+            return RangeSignatureGenerator(self._instruction_processor, progress_reporter)
+        return UniqueSignatureGenerator(self._instruction_processor, progress_reporter)
 
     def make_signature(
         self,
@@ -1378,20 +1406,16 @@ class SignatureMaker:
             )
 
         if end is None:
-            # Create unique signature generator with progress reporter
-            generator = UniqueSignatureGenerator(
-                self._instruction_processor, progress_reporter
-            )
+            # Create unique signature generator via factory method
+            generator = self._create_generator(for_range=False, progress_reporter=progress_reporter)
             sig = generator.generate(start_ea, cfg)
             return GeneratedSignature(sig, Match(start_ea))
 
         if end <= start_ea:
             raise Unexpected("End address must be after start address")
 
-        # Create range signature generator with progress reporter
-        generator = RangeSignatureGenerator(
-            self._instruction_processor, progress_reporter
-        )
+        # Create range signature generator via factory method
+        generator = self._create_generator(for_range=True, progress_reporter=progress_reporter)
         sig = generator.generate(start_ea, end, cfg)
         return GeneratedSignature(sig)
 

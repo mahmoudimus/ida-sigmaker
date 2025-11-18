@@ -1643,6 +1643,150 @@ class TestSIMDScannerEquivalence(CoveredUnitTest):
             self._assert_match_all_kinds(hay, pat, at)
 
 
+class TestSearchCancellation(CoveredUnitTest):
+    """Test that signature search can be cancelled by the user."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        # Store the original user_cancelled function if it exists
+        self.original_user_cancelled = getattr(
+            sigmaker.idaapi, "user_cancelled", MagicMock(return_value=False)
+        )
+
+    def tearDown(self):
+        """Restore original functions."""
+        sigmaker.idaapi.user_cancelled = self.original_user_cancelled
+
+    def test_find_all_cancellation_basic(self):
+        """Test that find_all respects user cancellation."""
+        # Create a mock that returns False initially, then True after 2 calls
+        call_count = [0]
+
+        def mock_user_cancelled():
+            call_count[0] += 1
+            # Cancel after 2 calls to allow at least one iteration
+            return call_count[0] > 2
+
+        # Setup idaapi mocks
+        sigmaker.idaapi.user_cancelled = mock_user_cancelled
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
+        sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFF)
+        sigmaker.idaapi.compiled_binpat_vec_t = MagicMock
+        sigmaker.idaapi.parse_binpat_str = MagicMock()
+        sigmaker.idaapi.BIN_SEARCH_NOCASE = 0
+        sigmaker.idaapi.BIN_SEARCH_FORWARD = 0
+
+        # Mock bin_search to simulate finding multiple matches
+        mock_bin_search = MagicMock()
+        mock_bin_search.side_effect = [
+            (0x1000, None),  # First match
+            (0x2000, None),  # Second match
+            (0x3000, None),  # Third match (should be cancelled before this)
+            (sigmaker.idaapi.BADADDR, None),  # No more matches
+        ]
+        sigmaker.idaapi.bin_search = mock_bin_search
+
+        # Disable SIMD to test the regular path
+        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+
+        try:
+            results = sigmaker.SignatureSearcher.find_all("48 8B C4")
+
+            # Should have found at least one match before cancellation
+            self.assertGreater(len(results), 0)
+            # Should not have found all matches due to cancellation
+            self.assertLess(len(results), 3)
+            # Verify user_cancelled was called
+            self.assertGreater(call_count[0], 0)
+        finally:
+            # Restore SIMD setting
+            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+
+    def test_find_all_no_cancellation(self):
+        """Test that find_all works normally when not cancelled."""
+        # Setup idaapi mocks
+        sigmaker.idaapi.user_cancelled = MagicMock(return_value=False)
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
+        sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFF)
+        sigmaker.idaapi.compiled_binpat_vec_t = MagicMock
+        sigmaker.idaapi.parse_binpat_str = MagicMock()
+        sigmaker.idaapi.BIN_SEARCH_NOCASE = 0
+        sigmaker.idaapi.BIN_SEARCH_FORWARD = 0
+
+        # Mock bin_search to simulate finding multiple matches
+        mock_bin_search = MagicMock()
+        mock_bin_search.side_effect = [
+            (0x1000, None),
+            (0x2000, None),
+            (0x3000, None),
+            (sigmaker.idaapi.BADADDR, None),
+        ]
+        sigmaker.idaapi.bin_search = mock_bin_search
+
+        # Disable SIMD to test the regular path
+        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+
+        try:
+            results = sigmaker.SignatureSearcher.find_all("48 8B C4")
+
+            # Should have found all 3 matches
+            self.assertEqual(len(results), 3)
+            self.assertEqual(int(results[0]), 0x1000)
+            self.assertEqual(int(results[1]), 0x2000)
+            self.assertEqual(int(results[2]), 0x3000)
+        finally:
+            # Restore SIMD setting
+            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+
+    def test_cancellation_returns_partial_results(self):
+        """Test that cancellation returns partial results found so far."""
+        # Mock user_cancelled to cancel after finding 2 matches
+        call_count = [0]
+
+        def mock_user_cancelled():
+            call_count[0] += 1
+            return call_count[0] > 3
+
+        # Setup idaapi mocks
+        sigmaker.idaapi.user_cancelled = mock_user_cancelled
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
+        sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFF)
+        sigmaker.idaapi.compiled_binpat_vec_t = MagicMock
+        sigmaker.idaapi.parse_binpat_str = MagicMock()
+        sigmaker.idaapi.BIN_SEARCH_NOCASE = 0
+        sigmaker.idaapi.BIN_SEARCH_FORWARD = 0
+
+        # Mock bin_search to return multiple matches
+        mock_bin_search = MagicMock()
+        mock_bin_search.side_effect = [
+            (0x1000, None),
+            (0x2000, None),
+            (0x3000, None),
+            (0x4000, None),
+            (sigmaker.idaapi.BADADDR, None),
+        ]
+        sigmaker.idaapi.bin_search = mock_bin_search
+
+        # Disable SIMD to test the regular path
+        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+
+        try:
+            results = sigmaker.SignatureSearcher.find_all("48 8B C4")
+
+            # Should return partial results (at least 1, but not all 4)
+            self.assertGreater(len(results), 0)
+            self.assertLess(len(results), 4)
+        finally:
+            # Restore SIMD setting
+            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

@@ -1276,7 +1276,11 @@ class SignatureSearcher:
         if not sig_str:
             idaapi.msg("Unrecognized signature type\n")
             return SearchResults([], "")
-        matches = self.find_all(sig_str)
+
+        # Wrap the search in a ProgressDialog to allow cancellation
+        with ProgressDialog("Searching for signature...\n\nPress Cancel to stop"):
+            matches = self.find_all(sig_str)
+
         return SearchResults(matches, sig_str)
 
     @staticmethod
@@ -1307,6 +1311,11 @@ class SignatureSearcher:
         n = len(data_mv)
         off = 0
         while off <= n - k:
+            # Check for user cancellation
+            if idaapi.user_cancelled():
+                LOGGER.info("Search cancelled by user")
+                break
+
             idx = _simd_scan_bytes(data_mv[off:], sig)
             if idx < 0:
                 break
@@ -1330,6 +1339,11 @@ class SignatureSearcher:
             idaapi, "bin_search3"
         )
         while True:
+            # Check for user cancellation
+            if idaapi.user_cancelled():
+                LOGGER.info("Search cancelled by user")
+                break
+
             hit, _ = _bin_search(
                 ea,
                 idaapi.inf_get_max_ea(),

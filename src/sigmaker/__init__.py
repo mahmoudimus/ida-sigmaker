@@ -182,6 +182,12 @@ class CheckContinuePrompt:
     def __post_init__(self) -> None:
         self.start_time = time.time()
         self.next_prompt_threshold = float(self.prompt_interval)
+        if self.logger is not None:
+            self.logger.info(
+                "CheckContinuePrompt initialized: enable_prompt=%s, prompt_interval=%d seconds",
+                self.enable_prompt,
+                self.prompt_interval,
+            )
 
     @property
     def elapsed_time(self) -> float:
@@ -210,6 +216,14 @@ class CheckContinuePrompt:
         if message is not None:
             self._progress_message = message
 
+        if self.logger is not None and self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "Progress reported (%.1fs elapsed): message=%s, metadata=%s",
+                self.elapsed_time,
+                message,
+                combined or None,
+            )
+
     def should_cancel(self) -> bool:
         """Check if the operation should be cancelled.
 
@@ -228,9 +242,17 @@ class CheckContinuePrompt:
 
         # Check if it's time to prompt
         if self._should_prompt() and self.elapsed_time >= self.next_prompt_threshold:
+            if self.logger is not None:
+                self.logger.info(
+                    "Showing continue prompt at %.1f seconds (threshold: %.1f)",
+                    self.elapsed_time,
+                    self.next_prompt_threshold,
+                )
             message = self._format_message()
             if not self._ask_to_continue(message):
                 self._user_cancelled = True
+                if self.logger is not None:
+                    self.logger.info("User cancelled operation")
                 if self.cancel_func is None:
                     raise UserCanceledError("User canceled")
                 return True
@@ -239,7 +261,7 @@ class CheckContinuePrompt:
             self.next_prompt_threshold *= 2
             if self.logger is not None:
                 self.logger.info(
-                    "Next prompt will be at %d seconds (%.1f minutes)",
+                    "User chose to continue. Next prompt will be at %d seconds (%.1f minutes)",
                     int(self.next_prompt_threshold),
                     self.next_prompt_threshold / 60.0,
                 )
@@ -488,6 +510,7 @@ class SigMakerConfig:
     print_top_x: int = 5
     max_single_signature_length: int = 100
     max_xref_signature_length: int = 250
+    prompt_interval: int = 10  # Seconds before first prompt (default: 10 for testing)
 
 
 @dataclasses.dataclass(slots=True, frozen=True, repr=False)
@@ -1396,13 +1419,18 @@ class SignatureMaker:
         # Create progress reporter based on config if not provided
         if not progress_reporter:
             progress_reporter = CheckContinuePrompt(
-                prompt_interval=120,  # 2 minutes
+                prompt_interval=cfg.prompt_interval,
                 metadata={
                     "operation": "Signature generation",
                     "start_address": hex(start_ea),
                 },
                 logger=LOGGER,
                 enable_prompt=cfg.enable_continue_prompt,
+            )
+            LOGGER.info(
+                "Created CheckContinuePrompt: interval=%ds, enabled=%s",
+                cfg.prompt_interval,
+                cfg.enable_continue_prompt,
             )
 
         if end is None:

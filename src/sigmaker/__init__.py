@@ -148,6 +148,63 @@ class ProgressReporter(typing.Protocol):
 
 
 @dataclasses.dataclass
+class ExponentialBackoffTimer:
+    """Manages exponential backoff timing for periodic prompts.
+
+    This timer works with elapsed time (seconds since start) rather than
+    absolute timestamps, making it easy to test without mocking time functions.
+
+    The timer implements exponential backoff: after each prompt is acknowledged,
+    the interval doubles. For example, with initial_interval=10:
+    - First prompt at 10 seconds
+    - User responds at 13 seconds → next prompt at 13 + 20 = 33 seconds
+    - User responds at 36 seconds → next prompt at 36 + 40 = 76 seconds
+
+    Attributes:
+        initial_interval: Initial interval in seconds before first prompt
+    """
+
+    initial_interval: float
+    _current_interval: float = dataclasses.field(init=False)
+    _next_prompt_at: float = dataclasses.field(init=False)  # Elapsed time when next prompt should show
+
+    def __post_init__(self):
+        """Initialize timer with first prompt scheduled at initial_interval."""
+        self._current_interval = self.initial_interval
+        self._next_prompt_at = self.initial_interval
+
+    def should_prompt(self, elapsed_time: float) -> bool:
+        """Check if it's time to show a prompt given elapsed time since start.
+
+        Args:
+            elapsed_time: Seconds elapsed since the operation started
+
+        Returns:
+            True if elapsed_time >= next scheduled prompt time
+        """
+        return elapsed_time >= self._next_prompt_at
+
+    def acknowledge_prompt(self, current_elapsed_time: float) -> None:
+        """User responded to prompt. Schedule next one with doubled interval.
+
+        Args:
+            current_elapsed_time: Current elapsed time when user responded
+        """
+        self._current_interval *= 2
+        self._next_prompt_at = current_elapsed_time + self._current_interval
+
+    @property
+    def current_interval(self) -> float:
+        """Get the current backoff interval in seconds."""
+        return self._current_interval
+
+    @property
+    def next_prompt_at(self) -> float:
+        """Get when (in elapsed seconds) the next prompt should occur."""
+        return self._next_prompt_at
+
+
+@dataclasses.dataclass
 class CheckContinuePrompt:
     """Progress reporter that prompts the user to continue when work takes too long.
 
@@ -170,8 +227,7 @@ class CheckContinuePrompt:
     logger: typing.Optional[logging.Logger] = None
 
     start_time: float = dataclasses.field(init=False)
-    next_prompt_threshold: float = dataclasses.field(init=False)
-    current_interval: float = dataclasses.field(init=False)
+    _timer: ExponentialBackoffTimer = dataclasses.field(init=False)
     _dynamic_metadata: dict[str, typing.Any] = dataclasses.field(
         default_factory=dict, init=False, repr=False
     )
@@ -182,8 +238,7 @@ class CheckContinuePrompt:
 
     def __post_init__(self) -> None:
         self.start_time = time.time()
-        self.current_interval = float(self.prompt_interval)
-        self.next_prompt_threshold = self.current_interval
+        self._timer = ExponentialBackoffTimer(initial_interval=float(self.prompt_interval))
         if self.logger is not None:
             self.logger.info(
                 "CheckContinuePrompt initialized: enable_prompt=%s, prompt_interval=%d seconds",
@@ -243,12 +298,12 @@ class CheckContinuePrompt:
             return True
 
         # Check if it's time to prompt
-        if self._should_prompt() and self.elapsed_time >= self.next_prompt_threshold:
+        if self._should_prompt() and self._timer.should_prompt(self.elapsed_time):
             if self.logger is not None:
                 self.logger.info(
                     "Showing continue prompt at %.1f seconds (threshold: %.1f)",
                     self.elapsed_time,
-                    self.next_prompt_threshold,
+                    self._timer.next_prompt_at,
                 )
             message = self._format_message()
             if not self._ask_to_continue(message):
@@ -259,16 +314,14 @@ class CheckContinuePrompt:
                     raise UserCanceledError("User canceled")
                 return True
 
-            # Update threshold for next prompt (exponential backoff)
-            # Double the interval and set next prompt relative to current time
-            self.current_interval *= 2
-            self.next_prompt_threshold = self.elapsed_time + self.current_interval
+            # User chose to continue - update timer for next prompt with exponential backoff
+            self._timer.acknowledge_prompt(self.elapsed_time)
             if self.logger is not None:
                 self.logger.info(
                     "User chose to continue. Next prompt in %.1f seconds at %.1f seconds total (%.1f minutes)",
-                    self.current_interval,
-                    self.next_prompt_threshold,
-                    self.next_prompt_threshold / 60.0,
+                    self._timer.current_interval,
+                    self._timer.next_prompt_at,
+                    self._timer.next_prompt_at / 60.0,
                 )
 
         return False

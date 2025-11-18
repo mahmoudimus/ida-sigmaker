@@ -1643,6 +1643,145 @@ class TestSIMDScannerEquivalence(CoveredUnitTest):
             self._assert_match_all_kinds(hay, pat, at)
 
 
+class TestExponentialBackoffTimer(CoveredUnitTest):
+    """Test the ExponentialBackoffTimer class."""
+
+    def test_initial_state(self):
+        """Test timer is initialized correctly."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=10.0)
+
+        # Should be scheduled to prompt at 10 seconds
+        self.assertEqual(timer.next_prompt_at, 10.0)
+        self.assertEqual(timer.current_interval, 10.0)
+
+        # Should not prompt before interval
+        self.assertFalse(timer.should_prompt(0.0))
+        self.assertFalse(timer.should_prompt(5.0))
+        self.assertFalse(timer.should_prompt(9.9))
+
+        # Should prompt at or after interval
+        self.assertTrue(timer.should_prompt(10.0))
+        self.assertTrue(timer.should_prompt(10.1))
+        self.assertTrue(timer.should_prompt(15.0))
+
+    def test_exponential_backoff_scenario(self):
+        """Test the full exponential backoff scenario from the docstring."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=10.0)
+
+        # First prompt at 10 seconds
+        self.assertFalse(timer.should_prompt(9.9))
+        self.assertTrue(timer.should_prompt(10.0))
+        self.assertTrue(timer.should_prompt(10.1))
+
+        # User responds at 13 seconds
+        timer.acknowledge_prompt(13.0)
+
+        # Next prompt should be at 13 + 20 = 33 seconds
+        self.assertEqual(timer.current_interval, 20.0)
+        self.assertEqual(timer.next_prompt_at, 33.0)
+        self.assertFalse(timer.should_prompt(13.0))
+        self.assertFalse(timer.should_prompt(20.0))
+        self.assertFalse(timer.should_prompt(32.9))
+        self.assertTrue(timer.should_prompt(33.0))
+        self.assertTrue(timer.should_prompt(33.1))
+
+        # User responds at 36 seconds
+        timer.acknowledge_prompt(36.0)
+
+        # Next prompt should be at 36 + 40 = 76 seconds
+        self.assertEqual(timer.current_interval, 40.0)
+        self.assertEqual(timer.next_prompt_at, 76.0)
+        self.assertFalse(timer.should_prompt(36.0))
+        self.assertFalse(timer.should_prompt(50.0))
+        self.assertFalse(timer.should_prompt(75.9))
+        self.assertTrue(timer.should_prompt(76.0))
+        self.assertTrue(timer.should_prompt(76.1))
+
+    def test_immediate_response(self):
+        """Test when user responds immediately at the prompt time."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=10.0)
+
+        # User responds exactly at 10 seconds
+        timer.acknowledge_prompt(10.0)
+
+        # Next prompt at 10 + 20 = 30 seconds
+        self.assertEqual(timer.current_interval, 20.0)
+        self.assertEqual(timer.next_prompt_at, 30.0)
+        self.assertFalse(timer.should_prompt(29.9))
+        self.assertTrue(timer.should_prompt(30.0))
+
+    def test_delayed_response(self):
+        """Test when user takes a long time to respond."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=10.0)
+
+        # Prompt should show at 10, but user doesn't respond until 25 seconds
+        self.assertTrue(timer.should_prompt(10.0))
+        self.assertTrue(timer.should_prompt(20.0))
+        self.assertTrue(timer.should_prompt(25.0))
+
+        # User finally responds at 25 seconds
+        timer.acknowledge_prompt(25.0)
+
+        # Next prompt at 25 + 20 = 45 seconds
+        self.assertEqual(timer.current_interval, 20.0)
+        self.assertEqual(timer.next_prompt_at, 45.0)
+        self.assertFalse(timer.should_prompt(44.9))
+        self.assertTrue(timer.should_prompt(45.0))
+
+    def test_multiple_doublings(self):
+        """Test that interval keeps doubling correctly over many prompts."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=5.0)
+
+        expected_intervals = [5.0, 10.0, 20.0, 40.0, 80.0, 160.0]
+        expected_prompts = [5.0, 15.0, 35.0, 75.0, 155.0, 315.0]
+
+        for i, (expected_interval, expected_prompt) in enumerate(zip(expected_intervals, expected_prompts)):
+            # Check current state
+            self.assertEqual(timer.current_interval, expected_interval, f"Iteration {i}")
+            self.assertEqual(timer.next_prompt_at, expected_prompt, f"Iteration {i}")
+
+            # Verify should_prompt behavior
+            self.assertFalse(timer.should_prompt(expected_prompt - 0.1))
+            self.assertTrue(timer.should_prompt(expected_prompt))
+
+            # Acknowledge at exactly the prompt time
+            timer.acknowledge_prompt(expected_prompt)
+
+    def test_fractional_intervals(self):
+        """Test with fractional second intervals."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=1.5)
+
+        # First prompt at 1.5 seconds
+        self.assertEqual(timer.next_prompt_at, 1.5)
+        self.assertFalse(timer.should_prompt(1.4))
+        self.assertTrue(timer.should_prompt(1.5))
+
+        # User responds at 2.0 seconds
+        timer.acknowledge_prompt(2.0)
+
+        # Next prompt at 2.0 + 3.0 = 5.0 seconds
+        self.assertEqual(timer.current_interval, 3.0)
+        self.assertEqual(timer.next_prompt_at, 5.0)
+
+    def test_properties_are_readonly(self):
+        """Test that properties return correct values and reflect state."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=10.0)
+
+        # Initial state
+        self.assertEqual(timer.current_interval, 10.0)
+        self.assertEqual(timer.next_prompt_at, 10.0)
+
+        # After first acknowledgment
+        timer.acknowledge_prompt(12.0)
+        self.assertEqual(timer.current_interval, 20.0)
+        self.assertEqual(timer.next_prompt_at, 32.0)
+
+        # After second acknowledgment
+        timer.acknowledge_prompt(35.0)
+        self.assertEqual(timer.current_interval, 40.0)
+        self.assertEqual(timer.next_prompt_at, 75.0)
+
+
 class TestProgressReporter(CoveredUnitTest):
     """Test the ProgressReporter protocol and CheckContinuePrompt implementation."""
 

@@ -1816,6 +1816,88 @@ class TestExponentialBackoffTimer(CoveredUnitTest):
         self.assertTrue(timer.should_prompt(40.0), "Should prompt after threshold")
 
 
+class TestCheckContinuePromptIntegration(CoveredUnitTest):
+    """Test CheckContinuePrompt integration with ExponentialBackoffTimer."""
+
+    def test_elapsed_time_property_recalculates(self):
+        """Test that elapsed_time property recalculates after dialog blocks.
+
+        This verifies that when we pass self.elapsed_time to acknowledge_prompt(),
+        we're passing the UPDATED time (including time spent in the dialog), not
+        the time from before the dialog was shown.
+        """
+        import time
+
+        prompt = sigmaker.CheckContinuePrompt(
+            prompt_interval=0.1,  # 100ms for fast test
+            enable_prompt=False,  # Don't actually show dialogs
+        )
+
+        start = time.time()
+
+        # First check - elapsed_time should be very small
+        elapsed1 = prompt.elapsed_time
+        self.assertLess(elapsed1, 0.01, "Initial elapsed time should be near zero")
+
+        # Wait 50ms
+        time.sleep(0.05)
+
+        # Second check - elapsed_time should have increased
+        elapsed2 = prompt.elapsed_time
+        self.assertGreater(elapsed2, elapsed1, "elapsed_time should increase")
+        self.assertGreater(elapsed2, 0.04, "Should be at least 40ms")
+
+        # Wait another 50ms
+        time.sleep(0.05)
+
+        # Third check - elapsed_time should have increased again
+        elapsed3 = prompt.elapsed_time
+        self.assertGreater(elapsed3, elapsed2, "elapsed_time should increase again")
+        self.assertGreater(elapsed3, 0.09, "Should be at least 90ms")
+
+        # Verify the property keeps recalculating, not caching
+        self.assertNotEqual(elapsed1, elapsed2)
+        self.assertNotEqual(elapsed2, elapsed3)
+
+    def test_timer_gets_updated_time_after_simulated_dialog_delay(self):
+        """Test that timer receives updated elapsed_time after a simulated dialog delay.
+
+        This simulates what happens when a blocking dialog is shown:
+        1. Check if should prompt (at t=10)
+        2. Show dialog (blocks for 5 seconds)
+        3. Call acknowledge_prompt with updated elapsed_time (at t=15)
+        """
+        import time
+
+        # Use very short interval for fast test
+        prompt = sigmaker.CheckContinuePrompt(
+            prompt_interval=0.05,  # 50ms
+            enable_prompt=False,  # Don't show actual dialogs
+        )
+
+        # Wait for first prompt threshold
+        time.sleep(0.06)  # Just over 50ms
+
+        # At this point, elapsed_time is ~60ms
+        elapsed_before = prompt.elapsed_time
+        self.assertGreater(elapsed_before, 0.05)
+
+        # Simulate user taking time to respond (like dialog blocking)
+        time.sleep(0.05)  # User "thinks" for 50ms
+
+        # Now acknowledge with CURRENT elapsed_time (should be ~110ms)
+        elapsed_after = prompt.elapsed_time
+        self.assertGreater(elapsed_after, elapsed_before)
+
+        # When we call acknowledge_prompt, timer should get the UPDATED time
+        prompt._timer.acknowledge_prompt(elapsed_after)
+
+        # Next prompt should be based on when user clicked, not when prompt appeared
+        # next_prompt_at should be elapsed_after + (interval * 2)
+        expected_next = elapsed_after + (0.05 * 2)
+        self.assertAlmostEqual(prompt._timer.next_prompt_at, expected_next, places=2)
+
+
 class TestProgressReporter(CoveredUnitTest):
     """Test the ProgressReporter protocol and CheckContinuePrompt implementation."""
 

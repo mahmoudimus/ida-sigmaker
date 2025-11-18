@@ -83,6 +83,10 @@ LOGGER = configure_logging()
 # Set to True to enable verbose debug logging for progress reporter initialization
 DEBUGGING_MODE = False
 
+# Wrapper for IDA's British English spelling
+# IDA uses 'cancelled' but we use American English 'canceled' throughout our code
+idaapi_user_canceled = idaapi.user_cancelled
+
 
 def _load_qmessage_box_cls():
     """Load QMessageBox class compatible with IDA's Qt version.
@@ -134,10 +138,10 @@ class ProgressReporter(typing.Protocol):
         ...
 
     def should_cancel(self) -> bool:
-        """Check if the operation should be cancelled.
+        """Check if the operation should be canceled.
 
         Returns:
-            True if the operation should be cancelled, False otherwise
+            True if the operation should be canceled, False otherwise
         """
         ...
 
@@ -237,7 +241,7 @@ class CheckContinuePrompt:
     _progress_message: typing.Optional[str] = dataclasses.field(
         default=None, init=False, repr=False
     )
-    _user_cancelled: bool = dataclasses.field(default=False, init=False, repr=False)
+    _user_canceled: bool = dataclasses.field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         self.start_time = time.time()
@@ -285,19 +289,19 @@ class CheckContinuePrompt:
             )
 
     def should_cancel(self) -> bool:
-        """Check if the operation should be cancelled.
+        """Check if the operation should be canceled.
 
-        This method checks both if the user has already cancelled and if
+        This method checks both if the user has already canceled and if
         it's time to prompt the user again based on elapsed time.
 
         Returns:
-            True if the operation should be cancelled, False otherwise
+            True if the operation should be canceled, False otherwise
 
         Raises:
             UserCanceledError: If user cancels and no cancel_func is provided
         """
-        # Already cancelled
-        if self._user_cancelled:
+        # Already canceled
+        if self._user_canceled:
             return True
 
         # Check if it's time to prompt
@@ -310,9 +314,9 @@ class CheckContinuePrompt:
                 )
             message = self._format_message()
             if not self._ask_to_continue(message):
-                self._user_cancelled = True
+                self._user_canceled = True
                 if self.logger is not None:
-                    self.logger.info("User cancelled operation")
+                    self.logger.info("User canceled operation")
                 if self.cancel_func is None:
                     raise UserCanceledError("User canceled")
                 return True
@@ -1233,7 +1237,7 @@ class InstructionWalker:
         if self.end_ea != idaapi.BADADDR and self.cursor >= self.end_ea:
             raise StopIteration
 
-        if idaapi.user_cancelled():
+        if idaapi_user_canceled():
             raise StopIteration("Aborted by user")
 
         current_instruction_ea = self.cursor
@@ -1283,7 +1287,7 @@ class UniqueSignatureGenerator:
         for cur_ea, ins, ins_len in InstructionWalker(ea):
             # Check for cancellation via progress reporter
             if self.progress_reporter is not None and self.progress_reporter.should_cancel():
-                raise UserCanceledError("Signature generation cancelled by user")
+                raise UserCanceledError("Signature generation canceled by user")
 
             # Update progress periodically
             instruction_count += 1
@@ -1372,7 +1376,7 @@ class RangeSignatureGenerator:
         for cur_ea, ins, _ in walker:
             # Check for cancellation via progress reporter
             if self.progress_reporter is not None and self.progress_reporter.should_cancel():
-                raise UserCanceledError("Signature generation cancelled by user")
+                raise UserCanceledError("Signature generation canceled by user")
 
             # Update progress periodically
             instruction_count += 1
@@ -1757,8 +1761,8 @@ class SignatureSearcher:
         off = 0
         while off <= n - k:
             # Check for user cancellation
-            if idaapi.user_cancelled():
-                LOGGER.info("Search cancelled by user")
+            if idaapi_user_canceled():
+                LOGGER.info("Search canceled by user")
                 break
 
             idx = _simd_scan_bytes(data_mv[off:], sig)
@@ -1785,8 +1789,8 @@ class SignatureSearcher:
         )
         while True:
             # Check for user cancellation
-            if idaapi.user_cancelled():
-                LOGGER.info("Search cancelled by user")
+            if idaapi_user_canceled():
+                LOGGER.info("Search canceled by user")
                 break
 
             hit, _ = _bin_search(
@@ -1816,8 +1820,8 @@ class ProgressDialog:
     on entry and hide it on exit.
 
     The message may be updated via `replace_message()` and cancelation can be
-    tested with `user_canceled()` from this class or `idaapi.user_cancelled()`
-    from IDA API.
+    tested with `user_canceled()` from this class or `idaapi_user_canceled()`
+    from this module.
     """
 
     def __init__(self, message: str = "Please wait...", hide_cancel: bool = False):
@@ -1859,7 +1863,7 @@ class ProgressDialog:
 
     def user_canceled(self) -> bool:
         """Return True if the user has canceled the wait box."""
-        return idaapi.user_cancelled()
+        return idaapi_user_canceled()
 
     # Provide alias with alternative spelling for backwards compatibility.
     user_cancelled = user_canceled

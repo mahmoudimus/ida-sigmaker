@@ -1957,31 +1957,31 @@ class TestProgressReporter(CoveredUnitTest):
 
 
 class TestSearchCancellation(CoveredUnitTest):
-    """Test that signature search can be cancelled by the user."""
+    """Test that signature search can be canceled by the user."""
 
     def setUp(self):
         """Set up test fixtures."""
-        # Store the original user_cancelled function if it exists
-        self.original_user_cancelled = getattr(
-            sigmaker.idaapi, "user_cancelled", MagicMock(return_value=False)
+        # Store the original idaapi_user_canceled function if it exists
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
         )
 
     def tearDown(self):
         """Restore original functions."""
-        sigmaker.idaapi.user_cancelled = self.original_user_cancelled
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
 
     def test_find_all_cancellation_basic(self):
         """Test that find_all respects user cancellation."""
         # Create a mock that returns False initially, then True after 2 calls
         call_count = [0]
 
-        def mock_user_cancelled():
+        def mock_user_canceled():
             call_count[0] += 1
             # Cancel after 2 calls to allow at least one iteration
             return call_count[0] > 2
 
         # Setup idaapi mocks
-        sigmaker.idaapi.user_cancelled = mock_user_cancelled
+        sigmaker.idaapi_user_canceled = mock_user_canceled
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
         sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
         sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFF)
@@ -1995,7 +1995,7 @@ class TestSearchCancellation(CoveredUnitTest):
         mock_bin_search.side_effect = [
             (0x1000, None),  # First match
             (0x2000, None),  # Second match
-            (0x3000, None),  # Third match (should be cancelled before this)
+            (0x3000, None),  # Third match (should be canceled before this)
             (sigmaker.idaapi.BADADDR, None),  # No more matches
         ]
         sigmaker.idaapi.bin_search = mock_bin_search
@@ -2011,16 +2011,16 @@ class TestSearchCancellation(CoveredUnitTest):
             self.assertGreater(len(results), 0)
             # Should not have found all matches due to cancellation
             self.assertLess(len(results), 3)
-            # Verify user_cancelled was called
+            # Verify user_canceled was called
             self.assertGreater(call_count[0], 0)
         finally:
             # Restore SIMD setting
             sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
 
     def test_find_all_no_cancellation(self):
-        """Test that find_all works normally when not cancelled."""
+        """Test that find_all works normally when not canceled."""
         # Setup idaapi mocks
-        sigmaker.idaapi.user_cancelled = MagicMock(return_value=False)
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
         sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
         sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFF)
@@ -2057,15 +2057,15 @@ class TestSearchCancellation(CoveredUnitTest):
 
     def test_cancellation_returns_partial_results(self):
         """Test that cancellation returns partial results found so far."""
-        # Mock user_cancelled to cancel after finding 2 matches
+        # Mock user_canceled to cancel after finding 2 matches
         call_count = [0]
 
-        def mock_user_cancelled():
+        def mock_user_canceled():
             call_count[0] += 1
             return call_count[0] > 3
 
         # Setup idaapi mocks
-        sigmaker.idaapi.user_cancelled = mock_user_cancelled
+        sigmaker.idaapi_user_canceled = mock_user_canceled
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
         sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
         sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFF)

@@ -138,6 +138,14 @@ class ProgressReporter(typing.Protocol):
         """
         ...
 
+    def enabled(self) -> bool:
+        """Check if progress reporting is enabled.
+
+        Returns:
+            True if progress reporting is enabled, False otherwise
+        """
+        ...
+
 
 @dataclasses.dataclass
 class CheckContinuePrompt:
@@ -284,6 +292,14 @@ class CheckContinuePrompt:
     def _should_prompt(self) -> bool:
         """Check if prompting is enabled and configured."""
         return self.enable_prompt and self.prompt_interval > 0
+
+    def enabled(self) -> bool:
+        """Check if progress reporting is enabled.
+
+        Returns:
+            True if progress reporting is enabled, False otherwise
+        """
+        return self.enable_prompt
 
 
 class Unexpected(Exception):
@@ -1187,7 +1203,8 @@ class UniqueSignatureGenerator:
 
             # Update progress periodically
             instruction_count += 1
-            if self.progress_reporter is not None and instruction_count % 100 == 0:
+            progress_reporting = self.progress_reporter is not None and self.progress_reporter.enabled()
+            if progress_reporting and instruction_count % 100 == 0:
                 self.progress_reporter.report_progress(
                     message=f"Generating signature at {hex(cur_ea)}",
                     signature_length=len(sig),
@@ -1275,7 +1292,8 @@ class RangeSignatureGenerator:
 
             # Update progress periodically
             instruction_count += 1
-            if self.progress_reporter is not None and instruction_count % 50 == 0:
+            progress_reporting = self.progress_reporter is not None and self.progress_reporter.enabled()
+            if progress_reporting and instruction_count % 50 == 0:
                 range_size = end_ea - start_ea
                 bytes_processed = cur_ea - start_ea
                 progress_pct = (bytes_processed / range_size * 100) if range_size > 0 else 0

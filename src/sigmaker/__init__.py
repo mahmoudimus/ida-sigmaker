@@ -2215,8 +2215,11 @@ class SigMakerPlugin(idaapi.plugin_t):
                 idaapi.msg("Invalid action!\n")
         except Unexpected as e:
             idaapi.msg(f"Error: {str(e)}\n")
+        except UserCanceledError:
+            # User cancellation is expected, not an error
+            idaapi.msg("Operation cancelled by user\n")
         except Exception as e:
-            LOGGER.error(e, os.linesep, traceback.format_exc())
+            LOGGER.error("Exception occurred: %s%s%s", e, os.linesep, traceback.format_exc())
             return
 
     def term(self) -> None:

@@ -1781,6 +1781,40 @@ class TestExponentialBackoffTimer(CoveredUnitTest):
         self.assertEqual(timer.current_interval, 40.0)
         self.assertEqual(timer.next_prompt_at, 75.0)
 
+    def test_user_takes_5_seconds_to_respond(self):
+        """Test when user takes 5 seconds to click the Continue button.
+
+        Scenario:
+        - Prompt appears at t=10
+        - User stares at it for 5 seconds
+        - User clicks Continue at t=15
+        - Next prompt should be 20 seconds after the click (at t=35, not t=30)
+        """
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=10.0)
+
+        # At t=10, prompt should appear
+        self.assertTrue(timer.should_prompt(10.0))
+
+        # Prompt is showing, user is thinking...
+        # At t=11, t=12, t=13, t=14 - prompt still showing, user hasn't clicked
+        # (in real code, should_prompt() wouldn't be called again until after acknowledge)
+
+        # At t=15, user finally clicks "Continue"
+        timer.acknowledge_prompt(15.0)
+
+        # Next prompt should be at t=15 + 20 = 35 seconds
+        # (20 seconds after user clicked, NOT 20 seconds after prompt appeared)
+        self.assertEqual(timer.current_interval, 20.0)
+        self.assertEqual(timer.next_prompt_at, 35.0)
+
+        # Verify the timing
+        self.assertFalse(timer.should_prompt(15.0), "Should not prompt immediately after acknowledge")
+        self.assertFalse(timer.should_prompt(20.0), "Should not prompt at t=20")
+        self.assertFalse(timer.should_prompt(30.0), "Should not prompt at t=30 (10 + 20)")
+        self.assertFalse(timer.should_prompt(34.9), "Should not prompt just before threshold")
+        self.assertTrue(timer.should_prompt(35.0), "Should prompt at t=35 (15 + 20)")
+        self.assertTrue(timer.should_prompt(40.0), "Should prompt after threshold")
+
 
 class TestProgressReporter(CoveredUnitTest):
     """Test the ProgressReporter protocol and CheckContinuePrompt implementation."""

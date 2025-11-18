@@ -1348,7 +1348,7 @@ class SignatureMaker:
             raise Unexpected("Invalid start address")
 
         # Create progress reporter based on config if not provided
-        if progress_reporter is None and cfg.enable_continue_prompt:
+        if not progress_reporter:
             progress_reporter = CheckContinuePrompt(
                 prompt_interval=120,  # 2 minutes
                 metadata={
@@ -1356,6 +1356,7 @@ class SignatureMaker:
                     "start_address": hex(start_ea),
                 },
                 logger=LOGGER,
+                enable_prompt=cfg.enable_continue_prompt,
             )
 
         if end is None:

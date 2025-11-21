@@ -24,6 +24,7 @@ jobs:
         strategy:
             matrix:
                 python-version: ["3.10"]
+                service: ["idapro-tests", "idapro-tests-9.2"]
         env:
             PYTHONPATH: ${{ github.workspace }}
         steps:
@@ -61,20 +62,20 @@ jobs:
               uses: actions/cache@v4
               with:
                   path: /tmp/docker-cache
-                  key: docker-image-${{ runner.os }}-idapro-baked-${{ hashFiles('docker-compose.yml') }}
+                  key: docker-image-${{ runner.os }}-${{ matrix.service }}-${{ hashFiles('docker-compose.yml') }}
                   restore-keys: |
-                      docker-image-${{ runner.os }}-idapro-baked-${{ hashFiles('docker-compose.yml') }}
+                      docker-image-${{ runner.os }}-${{ matrix.service }}-${{ hashFiles('docker-compose.yml') }}
 
             - name: Load cached Docker image if cache exists
               if: steps.docker-cache.outputs.cache-hit == 'true'
               run: |
                   echo "Loading Docker image from cache..."
-                  docker load -i /tmp/docker-cache/idapro-baked.tar || echo "No cached image to load."
+                  docker load -i /tmp/docker-cache/${{ matrix.service }}.tar || echo "No cached image to load."
 
             - name: Run tests
               run: |
                   set -e
-                  docker compose run --rm --entrypoint bash idapro-tests -c "
+                  docker compose run --rm --entrypoint bash ${{ matrix.service }} -c "
                       set -e
                       pip install -e .[ci]
                       python -m unittest discover . -p '*_test_*.py' -v
@@ -90,13 +91,14 @@ jobs:
                   echo "Caching docker image for next run..."
                   mkdir -p /tmp/docker-cache
                   docker image ls
+                  TAG="${{ matrix.service }}"
                   SHA_NAME=$(curl -s -u ${{ secrets.GHCR_TOKEN }} \
                     -H "Accept: application/vnd.github+json" \
                     -H "X-GitHub-Api-Version: 2022-11-28" \
                     https://api.github.com/users/mahmoudimus/packages/container/idapro-linux/versions | \
-                    jq -r '.[]|select(.metadata.container.tags[]=="baked")|.name')
+                    jq -r ".[]|select(.metadata.container.tags[]==\"${TAG}\")|.name")
                   echo "SHA_NAME: ${SHA_NAME}"
-                  docker save $(docker images --format '{{.Repository}}')@${SHA_NAME} -o /tmp/docker-cache/idapro-baked.tar || echo "Failed to save image."
+                  docker save $(docker images --format '{{.Repository}}')@${SHA_NAME} -o /tmp/docker-cache/${{ matrix.service }}.tar || echo "Failed to save image."
                   # Only save the image if it was not restored from cache
                   # The cache will be updated for future runs
                   # Note: actions/cache@v4 will automatically upload the cache at the end of the job

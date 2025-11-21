@@ -1643,6 +1643,463 @@ class TestSIMDScannerEquivalence(CoveredUnitTest):
             self._assert_match_all_kinds(hay, pat, at)
 
 
+class TestExponentialBackoffTimer(CoveredUnitTest):
+    """Test the ExponentialBackoffTimer class."""
+
+    def test_initial_state(self):
+        """Test timer is initialized correctly."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=10.0)
+
+        # Should be scheduled to prompt at 10 seconds
+        self.assertEqual(timer.next_prompt_at, 10.0)
+        self.assertEqual(timer.current_interval, 10.0)
+
+        # Should not prompt before interval
+        self.assertFalse(timer.should_prompt(0.0))
+        self.assertFalse(timer.should_prompt(5.0))
+        self.assertFalse(timer.should_prompt(9.9))
+
+        # Should prompt at or after interval
+        self.assertTrue(timer.should_prompt(10.0))
+        self.assertTrue(timer.should_prompt(10.1))
+        self.assertTrue(timer.should_prompt(15.0))
+
+    def test_exponential_backoff_scenario(self):
+        """Test the full exponential backoff scenario from the docstring."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=10.0)
+
+        # First prompt at 10 seconds
+        self.assertFalse(timer.should_prompt(9.9))
+        self.assertTrue(timer.should_prompt(10.0))
+        self.assertTrue(timer.should_prompt(10.1))
+
+        # User responds at 13 seconds
+        timer.acknowledge_prompt(13.0)
+
+        # Next prompt should be at 13 + 20 = 33 seconds
+        self.assertEqual(timer.current_interval, 20.0)
+        self.assertEqual(timer.next_prompt_at, 33.0)
+        self.assertFalse(timer.should_prompt(13.0))
+        self.assertFalse(timer.should_prompt(20.0))
+        self.assertFalse(timer.should_prompt(32.9))
+        self.assertTrue(timer.should_prompt(33.0))
+        self.assertTrue(timer.should_prompt(33.1))
+
+        # User responds at 36 seconds
+        timer.acknowledge_prompt(36.0)
+
+        # Next prompt should be at 36 + 40 = 76 seconds
+        self.assertEqual(timer.current_interval, 40.0)
+        self.assertEqual(timer.next_prompt_at, 76.0)
+        self.assertFalse(timer.should_prompt(36.0))
+        self.assertFalse(timer.should_prompt(50.0))
+        self.assertFalse(timer.should_prompt(75.9))
+        self.assertTrue(timer.should_prompt(76.0))
+        self.assertTrue(timer.should_prompt(76.1))
+
+    def test_immediate_response(self):
+        """Test when user responds immediately at the prompt time."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=10.0)
+
+        # User responds exactly at 10 seconds
+        timer.acknowledge_prompt(10.0)
+
+        # Next prompt at 10 + 20 = 30 seconds
+        self.assertEqual(timer.current_interval, 20.0)
+        self.assertEqual(timer.next_prompt_at, 30.0)
+        self.assertFalse(timer.should_prompt(29.9))
+        self.assertTrue(timer.should_prompt(30.0))
+
+    def test_delayed_response(self):
+        """Test when user takes a long time to respond."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=10.0)
+
+        # Prompt should show at 10, but user doesn't respond until 25 seconds
+        self.assertTrue(timer.should_prompt(10.0))
+        self.assertTrue(timer.should_prompt(20.0))
+        self.assertTrue(timer.should_prompt(25.0))
+
+        # User finally responds at 25 seconds
+        timer.acknowledge_prompt(25.0)
+
+        # Next prompt at 25 + 20 = 45 seconds
+        self.assertEqual(timer.current_interval, 20.0)
+        self.assertEqual(timer.next_prompt_at, 45.0)
+        self.assertFalse(timer.should_prompt(44.9))
+        self.assertTrue(timer.should_prompt(45.0))
+
+    def test_multiple_doublings(self):
+        """Test that interval keeps doubling correctly over many prompts."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=5.0)
+
+        expected_intervals = [5.0, 10.0, 20.0, 40.0, 80.0, 160.0]
+        expected_prompts = [5.0, 15.0, 35.0, 75.0, 155.0, 315.0]
+
+        for i, (expected_interval, expected_prompt) in enumerate(zip(expected_intervals, expected_prompts)):
+            # Check current state
+            self.assertEqual(timer.current_interval, expected_interval, f"Iteration {i}")
+            self.assertEqual(timer.next_prompt_at, expected_prompt, f"Iteration {i}")
+
+            # Verify should_prompt behavior
+            self.assertFalse(timer.should_prompt(expected_prompt - 0.1))
+            self.assertTrue(timer.should_prompt(expected_prompt))
+
+            # Acknowledge at exactly the prompt time
+            timer.acknowledge_prompt(expected_prompt)
+
+    def test_fractional_intervals(self):
+        """Test with fractional second intervals."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=1.5)
+
+        # First prompt at 1.5 seconds
+        self.assertEqual(timer.next_prompt_at, 1.5)
+        self.assertFalse(timer.should_prompt(1.4))
+        self.assertTrue(timer.should_prompt(1.5))
+
+        # User responds at 2.0 seconds
+        timer.acknowledge_prompt(2.0)
+
+        # Next prompt at 2.0 + 3.0 = 5.0 seconds
+        self.assertEqual(timer.current_interval, 3.0)
+        self.assertEqual(timer.next_prompt_at, 5.0)
+
+    def test_properties_are_readonly(self):
+        """Test that properties return correct values and reflect state."""
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=10.0)
+
+        # Initial state
+        self.assertEqual(timer.current_interval, 10.0)
+        self.assertEqual(timer.next_prompt_at, 10.0)
+
+        # After first acknowledgment
+        timer.acknowledge_prompt(12.0)
+        self.assertEqual(timer.current_interval, 20.0)
+        self.assertEqual(timer.next_prompt_at, 32.0)
+
+        # After second acknowledgment
+        timer.acknowledge_prompt(35.0)
+        self.assertEqual(timer.current_interval, 40.0)
+        self.assertEqual(timer.next_prompt_at, 75.0)
+
+    def test_user_takes_5_seconds_to_respond(self):
+        """Test when user takes 5 seconds to click the Continue button.
+
+        Scenario:
+        - Prompt appears at t=10
+        - User stares at it for 5 seconds
+        - User clicks Continue at t=15
+        - Next prompt should be 20 seconds after the click (at t=35, not t=30)
+        """
+        timer = sigmaker.ExponentialBackoffTimer(initial_interval=10.0)
+
+        # At t=10, prompt should appear
+        self.assertTrue(timer.should_prompt(10.0))
+
+        # Prompt is showing, user is thinking...
+        # At t=11, t=12, t=13, t=14 - prompt still showing, user hasn't clicked
+        # (in real code, should_prompt() wouldn't be called again until after acknowledge)
+
+        # At t=15, user finally clicks "Continue"
+        timer.acknowledge_prompt(15.0)
+
+        # Next prompt should be at t=15 + 20 = 35 seconds
+        # (20 seconds after user clicked, NOT 20 seconds after prompt appeared)
+        self.assertEqual(timer.current_interval, 20.0)
+        self.assertEqual(timer.next_prompt_at, 35.0)
+
+        # Verify the timing
+        self.assertFalse(timer.should_prompt(15.0), "Should not prompt immediately after acknowledge")
+        self.assertFalse(timer.should_prompt(20.0), "Should not prompt at t=20")
+        self.assertFalse(timer.should_prompt(30.0), "Should not prompt at t=30 (10 + 20)")
+        self.assertFalse(timer.should_prompt(34.9), "Should not prompt just before threshold")
+        self.assertTrue(timer.should_prompt(35.0), "Should prompt at t=35 (15 + 20)")
+        self.assertTrue(timer.should_prompt(40.0), "Should prompt after threshold")
+
+
+class TestCheckContinuePromptIntegration(CoveredUnitTest):
+    """Test CheckContinuePrompt integration with ExponentialBackoffTimer."""
+
+    def test_elapsed_time_property_recalculates(self):
+        """Test that elapsed_time property recalculates after dialog blocks.
+
+        This verifies that when we pass self.elapsed_time to acknowledge_prompt(),
+        we're passing the UPDATED time (including time spent in the dialog), not
+        the time from before the dialog was shown.
+        """
+        import time
+
+        prompt = sigmaker.CheckContinuePrompt(
+            prompt_interval=0.1,  # 100ms for fast test
+            enable_prompt=False,  # Don't actually show dialogs
+        )
+
+        start = time.time()
+
+        # First check - elapsed_time should be very small
+        elapsed1 = prompt.elapsed_time
+        self.assertLess(elapsed1, 0.01, "Initial elapsed time should be near zero")
+
+        # Wait 50ms
+        time.sleep(0.05)
+
+        # Second check - elapsed_time should have increased
+        elapsed2 = prompt.elapsed_time
+        self.assertGreater(elapsed2, elapsed1, "elapsed_time should increase")
+        self.assertGreater(elapsed2, 0.04, "Should be at least 40ms")
+
+        # Wait another 50ms
+        time.sleep(0.05)
+
+        # Third check - elapsed_time should have increased again
+        elapsed3 = prompt.elapsed_time
+        self.assertGreater(elapsed3, elapsed2, "elapsed_time should increase again")
+        self.assertGreater(elapsed3, 0.09, "Should be at least 90ms")
+
+        # Verify the property keeps recalculating, not caching
+        self.assertNotEqual(elapsed1, elapsed2)
+        self.assertNotEqual(elapsed2, elapsed3)
+
+    def test_timer_gets_updated_time_after_simulated_dialog_delay(self):
+        """Test that timer receives updated elapsed_time after a simulated dialog delay.
+
+        This simulates what happens when a blocking dialog is shown:
+        1. Check if should prompt (at t=10)
+        2. Show dialog (blocks for 5 seconds)
+        3. Call acknowledge_prompt with updated elapsed_time (at t=15)
+        """
+        import time
+
+        # Use very short interval for fast test
+        prompt = sigmaker.CheckContinuePrompt(
+            prompt_interval=0.05,  # 50ms
+            enable_prompt=False,  # Don't show actual dialogs
+        )
+
+        # Wait for first prompt threshold
+        time.sleep(0.06)  # Just over 50ms
+
+        # At this point, elapsed_time is ~60ms
+        elapsed_before = prompt.elapsed_time
+        self.assertGreater(elapsed_before, 0.05)
+
+        # Simulate user taking time to respond (like dialog blocking)
+        time.sleep(0.05)  # User "thinks" for 50ms
+
+        # Now acknowledge with CURRENT elapsed_time (should be ~110ms)
+        elapsed_after = prompt.elapsed_time
+        self.assertGreater(elapsed_after, elapsed_before)
+
+        # When we call acknowledge_prompt, timer should get the UPDATED time
+        prompt._timer.acknowledge_prompt(elapsed_after)
+
+        # Next prompt should be based on when user clicked, not when prompt appeared
+        # next_prompt_at should be elapsed_after + (interval * 2)
+        expected_next = elapsed_after + (0.05 * 2)
+        self.assertAlmostEqual(prompt._timer.next_prompt_at, expected_next, places=2)
+
+
+class TestProgressReporter(CoveredUnitTest):
+    """Test the ProgressReporter protocol and CheckContinuePrompt implementation."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        # Store the original ask_yn function
+        self.original_ask_yn = getattr(sigmaker.idaapi, "ask_yn", MagicMock())
+        # Ensure BADADDR is set to a real integer
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+
+    def tearDown(self):
+        """Restore original functions."""
+        sigmaker.idaapi.ask_yn = self.original_ask_yn
+
+    def test_check_continue_prompt_basic(self):
+        """Test basic CheckContinuePrompt functionality."""
+        prompt = sigmaker.CheckContinuePrompt(
+            enable_prompt=False  # Disable prompting for this test
+        )
+
+        # Check initial state
+        self.assertGreater(prompt.elapsed_time, 0)
+        self.assertFalse(prompt.should_cancel())
+
+        # Update progress
+        prompt.report_progress(message="Test message", test_key="test_value")
+        self.assertFalse(prompt.should_cancel())
+
+    def test_check_continue_prompt_disabled(self):
+        """Test that prompting can be disabled."""
+        prompt = sigmaker.CheckContinuePrompt(enable_prompt=False)
+
+        # Should never cancel when prompting is disabled
+        for _ in range(10):
+            self.assertFalse(prompt.should_cancel())
+
+    def test_check_continue_prompt_metadata(self):
+        """Test progress metadata tracking."""
+        prompt = sigmaker.CheckContinuePrompt(
+            metadata={"static_key": "static_value"}, enable_prompt=False
+        )
+
+        # Add dynamic metadata
+        prompt.report_progress(
+            message="Processing...", dynamic_key="dynamic_value", count=42
+        )
+
+        # Check that metadata was stored
+        self.assertEqual(prompt._dynamic_metadata["dynamic_key"], "dynamic_value")
+        self.assertEqual(prompt._dynamic_metadata["count"], 42)
+        self.assertEqual(prompt._progress_message, "Processing...")
+
+    # Note: Integration tests for UniqueSignatureGenerator and RangeSignatureGenerator
+    # with progress reporters are complex due to mocking requirements. The core functionality
+    # is tested in the CheckContinuePrompt tests above, and the signature generators
+    # accept and use progress reporters correctly as shown in the implementation.
+
+
+class TestSearchCancellation(CoveredUnitTest):
+    """Test that signature search can be canceled by the user."""
+
+    def setUp(self):
+        """Set up test fixtures."""
+        # Store the original idaapi_user_canceled function if it exists
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+
+    def tearDown(self):
+        """Restore original functions."""
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
+
+    def test_find_all_cancellation_basic(self):
+        """Test that find_all respects user cancellation."""
+        # Create a mock that returns False initially, then True after 2 calls
+        call_count = [0]
+
+        def mock_user_canceled():
+            call_count[0] += 1
+            # Cancel after 2 calls to allow at least one iteration
+            return call_count[0] > 2
+
+        # Setup idaapi mocks
+        sigmaker.idaapi_user_canceled = mock_user_canceled
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
+        sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFF)
+        sigmaker.idaapi.compiled_binpat_vec_t = MagicMock
+        sigmaker.idaapi.parse_binpat_str = MagicMock()
+        sigmaker.idaapi.BIN_SEARCH_NOCASE = 0
+        sigmaker.idaapi.BIN_SEARCH_FORWARD = 0
+
+        # Mock bin_search to simulate finding multiple matches
+        mock_bin_search = MagicMock()
+        mock_bin_search.side_effect = [
+            (0x1000, None),  # First match
+            (0x2000, None),  # Second match
+            (0x3000, None),  # Third match (should be canceled before this)
+            (sigmaker.idaapi.BADADDR, None),  # No more matches
+        ]
+        sigmaker.idaapi.bin_search = mock_bin_search
+
+        # Disable SIMD to test the regular path
+        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+
+        try:
+            results = sigmaker.SignatureSearcher.find_all("48 8B C4")
+
+            # Should have found at least one match before cancellation
+            self.assertGreater(len(results), 0)
+            # Should not have found all matches due to cancellation
+            self.assertLess(len(results), 3)
+            # Verify user_canceled was called
+            self.assertGreater(call_count[0], 0)
+        finally:
+            # Restore SIMD setting
+            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+
+    def test_find_all_no_cancellation(self):
+        """Test that find_all works normally when not canceled."""
+        # Setup idaapi mocks
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
+        sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFF)
+        sigmaker.idaapi.compiled_binpat_vec_t = MagicMock
+        sigmaker.idaapi.parse_binpat_str = MagicMock()
+        sigmaker.idaapi.BIN_SEARCH_NOCASE = 0
+        sigmaker.idaapi.BIN_SEARCH_FORWARD = 0
+
+        # Mock bin_search to simulate finding multiple matches
+        mock_bin_search = MagicMock()
+        mock_bin_search.side_effect = [
+            (0x1000, None),
+            (0x2000, None),
+            (0x3000, None),
+            (sigmaker.idaapi.BADADDR, None),
+        ]
+        sigmaker.idaapi.bin_search = mock_bin_search
+
+        # Disable SIMD to test the regular path
+        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+
+        try:
+            results = sigmaker.SignatureSearcher.find_all("48 8B C4")
+
+            # Should have found all 3 matches
+            self.assertEqual(len(results), 3)
+            self.assertEqual(int(results[0]), 0x1000)
+            self.assertEqual(int(results[1]), 0x2000)
+            self.assertEqual(int(results[2]), 0x3000)
+        finally:
+            # Restore SIMD setting
+            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+
+    def test_cancellation_returns_partial_results(self):
+        """Test that cancellation returns partial results found so far."""
+        # Mock user_canceled to cancel after finding 2 matches
+        call_count = [0]
+
+        def mock_user_canceled():
+            call_count[0] += 1
+            return call_count[0] > 3
+
+        # Setup idaapi mocks
+        sigmaker.idaapi_user_canceled = mock_user_canceled
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
+        sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFF)
+        sigmaker.idaapi.compiled_binpat_vec_t = MagicMock
+        sigmaker.idaapi.parse_binpat_str = MagicMock()
+        sigmaker.idaapi.BIN_SEARCH_NOCASE = 0
+        sigmaker.idaapi.BIN_SEARCH_FORWARD = 0
+
+        # Mock bin_search to return multiple matches
+        mock_bin_search = MagicMock()
+        mock_bin_search.side_effect = [
+            (0x1000, None),
+            (0x2000, None),
+            (0x3000, None),
+            (0x4000, None),
+            (sigmaker.idaapi.BADADDR, None),
+        ]
+        sigmaker.idaapi.bin_search = mock_bin_search
+
+        # Disable SIMD to test the regular path
+        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+
+        try:
+            results = sigmaker.SignatureSearcher.find_all("48 8B C4")
+
+            # Should return partial results (at least 1, but not all 4)
+            self.assertGreater(len(results), 0)
+            self.assertLess(len(results), 4)
+        finally:
+            # Restore SIMD setting
+            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

@@ -17,6 +17,7 @@ import os
 import pathlib
 import re
 import string
+import time
 import traceback
 import typing
 
@@ -78,6 +79,314 @@ def configure_logging(
 
 
 LOGGER = configure_logging()
+
+# Set to True to enable verbose debug logging for progress reporter initialization
+DEBUGGING_MODE = False
+
+# Wrapper for IDA's British English spelling
+# IDA uses 'cancelled' but we use American English 'canceled' throughout our code
+idaapi_user_canceled = idaapi.user_cancelled
+
+
+def _load_qmessage_box_cls():
+    """Load QMessageBox class compatible with IDA's Qt version.
+
+    Returns the QMessageBox class for the Qt version in use, or None if unavailable.
+    """
+    try:
+        if ida_version() < (9, 2):
+            from PyQt5.QtWidgets import QMessageBox  # type: ignore
+            return QMessageBox
+        else:
+            from PySide6.QtWidgets import QMessageBox  # type: ignore
+            return QMessageBox
+    except ImportError:
+        return None
+
+
+class UserCanceledError(Exception):
+    """Exception raised when user cancels a long-running operation."""
+
+
+class ProgressReporter(typing.Protocol):
+    """Protocol for objects that can report progress and allow cancellation.
+
+    This protocol defines the interface for progress reporting during long-running
+    operations. Implementations can provide UI feedback, check for cancellation,
+    and track progress metadata.
+    """
+
+    @property
+    def elapsed_time(self) -> float:
+        """Return the elapsed time since the operation started."""
+        ...
+
+    def report_progress(
+        self,
+        *,
+        message: typing.Optional[str] = None,
+        metadata: typing.Optional[dict[str, typing.Any]] = None,
+        **metadata_kwargs,
+    ) -> None:
+        """Update progress information.
+
+        Args:
+            message: Optional progress message to display
+            metadata: Optional dictionary of metadata to report
+            **metadata_kwargs: Additional metadata as keyword arguments
+        """
+        ...
+
+    def should_cancel(self) -> bool:
+        """Check if the operation should be canceled.
+
+        Returns:
+            True if the operation should be canceled, False otherwise
+        """
+        ...
+
+    def enabled(self) -> bool:
+        """Check if progress reporting is enabled.
+
+        Returns:
+            True if progress reporting is enabled, False otherwise
+        """
+        ...
+
+
+@dataclasses.dataclass
+class ExponentialBackoffTimer:
+    """Manages exponential backoff timing for periodic prompts.
+
+    This timer works with elapsed time (seconds since start) rather than
+    absolute timestamps, making it easy to test without mocking time functions.
+
+    The timer implements exponential backoff: after each prompt is acknowledged,
+    the interval doubles. For example, with initial_interval=10:
+    - First prompt at 10 seconds
+    - User responds at 13 seconds → next prompt at 13 + 20 = 33 seconds
+    - User responds at 36 seconds → next prompt at 36 + 40 = 76 seconds
+
+    Attributes:
+        initial_interval: Initial interval in seconds before first prompt
+    """
+
+    initial_interval: float
+    _current_interval: float = dataclasses.field(init=False)
+    _next_prompt_at: float = dataclasses.field(init=False)  # Elapsed time when next prompt should show
+
+    def __post_init__(self):
+        """Initialize timer with first prompt scheduled at initial_interval."""
+        self._current_interval = self.initial_interval
+        self._next_prompt_at = self.initial_interval
+
+    def should_prompt(self, elapsed_time: float) -> bool:
+        """Check if it's time to show a prompt given elapsed time since start.
+
+        Args:
+            elapsed_time: Seconds elapsed since the operation started
+
+        Returns:
+            True if elapsed_time >= next scheduled prompt time
+        """
+        return elapsed_time >= self._next_prompt_at
+
+    def acknowledge_prompt(self, current_elapsed_time: float) -> None:
+        """User responded to prompt. Schedule next one with doubled interval.
+
+        Args:
+            current_elapsed_time: Current elapsed time when user responded
+        """
+        self._current_interval *= 2
+        self._next_prompt_at = current_elapsed_time + self._current_interval
+
+    @property
+    def current_interval(self) -> float:
+        """Get the current backoff interval in seconds."""
+        return self._current_interval
+
+    @property
+    def next_prompt_at(self) -> float:
+        """Get when (in elapsed seconds) the next prompt should occur."""
+        return self._next_prompt_at
+
+
+@dataclasses.dataclass
+class CheckContinuePrompt:
+    """Progress reporter that prompts the user to continue when work takes too long.
+
+    This class implements the ProgressReporter protocol and provides exponential
+    backoff prompting. It can be used to wrap long-running operations and give
+    users the ability to cancel if the operation takes too long.
+
+    Attributes:
+        metadata: Static metadata to display in prompts
+        cancel_func: Function to call when user cancels (returns its value)
+        enable_prompt: Whether to enable prompting (default: True)
+        prompt_interval: Initial interval in seconds before first prompt (default: 120)
+        logger: Optional logger for debug messages
+    """
+
+    metadata: typing.Optional[dict[str, typing.Any]] = None
+    cancel_func: typing.Optional[typing.Callable[[], typing.Any]] = None
+    enable_prompt: bool = True
+    prompt_interval: int = 120
+    logger: typing.Optional[logging.Logger] = None
+
+    start_time: float = dataclasses.field(init=False)
+    _timer: ExponentialBackoffTimer = dataclasses.field(init=False)
+    _dynamic_metadata: dict[str, typing.Any] = dataclasses.field(
+        default_factory=dict, init=False, repr=False
+    )
+    _progress_message: typing.Optional[str] = dataclasses.field(
+        default=None, init=False, repr=False
+    )
+    _user_canceled: bool = dataclasses.field(default=False, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        self.start_time = time.time()
+        self._timer = ExponentialBackoffTimer(initial_interval=float(self.prompt_interval))
+        if DEBUGGING_MODE and self.logger is not None:
+            self.logger.info(
+                "CheckContinuePrompt initialized: enable_prompt=%s, prompt_interval=%d seconds",
+                self.enable_prompt,
+                self.prompt_interval,
+            )
+
+    @property
+    def elapsed_time(self) -> float:
+        """Return the elapsed time since the operation started."""
+        return time.time() - self.start_time
+
+    def report_progress(
+        self,
+        *,
+        message: typing.Optional[str] = None,
+        metadata: typing.Optional[dict[str, typing.Any]] = None,
+        **metadata_kwargs,
+    ) -> None:
+        """Update metadata/message used in the next prompt.
+
+        Args:
+            message: Optional progress message to display
+            metadata: Optional dictionary of metadata to report
+            **metadata_kwargs: Additional metadata as keyword arguments
+        """
+        combined = metadata.copy() if metadata else {}
+        if metadata_kwargs:
+            combined.update(metadata_kwargs)
+        if combined:
+            self._dynamic_metadata.update(combined)
+        if message is not None:
+            self._progress_message = message
+
+        if self.logger is not None and self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug(
+                "Progress reported (%.1fs elapsed): message=%s, metadata=%s",
+                self.elapsed_time,
+                message,
+                combined or None,
+            )
+
+    def should_cancel(self) -> bool:
+        """Check if the operation should be canceled.
+
+        This method checks both if the user has already canceled and if
+        it's time to prompt the user again based on elapsed time.
+
+        Returns:
+            True if the operation should be canceled, False otherwise
+
+        Raises:
+            UserCanceledError: If user cancels and no cancel_func is provided
+        """
+        # Already canceled
+        if self._user_canceled:
+            return True
+
+        # Check if it's time to prompt
+        if self._should_prompt() and self._timer.should_prompt(self.elapsed_time):
+            if self.logger is not None:
+                self.logger.info(
+                    "Showing continue prompt at %.1f seconds (threshold: %.1f)",
+                    self.elapsed_time,
+                    self._timer.next_prompt_at,
+                )
+            message = self._format_message()
+            if not self._ask_to_continue(message):
+                self._user_canceled = True
+                if self.logger is not None:
+                    self.logger.info("User canceled operation")
+                if self.cancel_func is None:
+                    raise UserCanceledError("User canceled")
+                return True
+
+            # User chose to continue - update timer for next prompt with exponential backoff
+            self._timer.acknowledge_prompt(self.elapsed_time)
+            if self.logger is not None:
+                self.logger.info(
+                    "User chose to continue. Next prompt in %.1f seconds at %.1f seconds total (%.1f minutes)",
+                    self._timer.current_interval,
+                    self._timer.next_prompt_at,
+                    self._timer.next_prompt_at / 60.0,
+                )
+
+        return False
+
+    def _format_message(self, func_name: str = "Operation") -> str:
+        """Format the prompt message with current progress information."""
+        minutes = int(self.elapsed_time // 60)
+        seconds = int(self.elapsed_time % 60)
+        time_str = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+        message_lines = [f"{func_name} has been running for {time_str}.", ""]
+
+        # Combine static and dynamic metadata
+        combined_metadata: dict[str, typing.Any] = {}
+        if self.metadata:
+            combined_metadata.update(self.metadata)
+        if self._dynamic_metadata:
+            combined_metadata.update(self._dynamic_metadata)
+
+        if combined_metadata:
+            for key, value in combined_metadata.items():
+                message_lines.append(f"{key}: {value}")
+            message_lines.append("")
+
+        if self._progress_message:
+            message_lines.append(self._progress_message)
+            message_lines.append("")
+
+        message_lines.append("Continue?")
+        return "\n".join(message_lines)
+
+    def _ask_to_continue(self, message: str) -> bool:
+        """Prompt the user to continue with Qt dialog or IDA fallback."""
+        qmessagebox = _load_qmessage_box_cls()
+        if qmessagebox is not None:
+            reply = qmessagebox.question(
+                None,
+                "Continue execution?",
+                message,
+                qmessagebox.Yes | qmessagebox.No,
+                qmessagebox.No,
+            )
+            return reply == qmessagebox.Yes
+
+        # Fallback to IDA's built-in dialog
+        reply = idaapi.ask_yn(idaapi.ASKBTN_NO, message)
+        return reply == idaapi.ASKBTN_YES
+
+    def _should_prompt(self) -> bool:
+        """Check if prompting is enabled and configured."""
+        return self.enable_prompt and self.prompt_interval > 0
+
+    def enabled(self) -> bool:
+        """Check if progress reporting is enabled.
+
+        Returns:
+            True if progress reporting is enabled, False otherwise
+        """
+        return self.enable_prompt
 
 
 class Unexpected(Exception):
@@ -261,10 +570,12 @@ class SigMakerConfig:
     wildcard_operands: bool
     continue_outside_of_function: bool
     wildcard_optimized: bool
+    enable_continue_prompt: bool = True
     ask_longer_signature: bool = True
     print_top_x: int = 5
     max_single_signature_length: int = 100
     max_xref_signature_length: int = 250
+    prompt_interval: int = 10  # Seconds before first prompt (default: 10 for testing)
 
 
 @dataclasses.dataclass(slots=True, frozen=True, repr=False)
@@ -926,7 +1237,7 @@ class InstructionWalker:
         if self.end_ea != idaapi.BADADDR and self.cursor >= self.end_ea:
             raise StopIteration
 
-        if idaapi.user_cancelled():
+        if idaapi_user_canceled():
             raise StopIteration("Aborted by user")
 
         current_instruction_ea = self.cursor
@@ -943,18 +1254,51 @@ class InstructionWalker:
 class UniqueSignatureGenerator:
     """Strategy for generating a signature that is guaranteed to be unique."""
 
-    def __init__(self, processor: InstructionProcessor):
+    def __init__(
+        self,
+        processor: InstructionProcessor,
+        progress_reporter: typing.Optional[ProgressReporter] = None,
+    ):
         self.processor = processor
+        self.progress_reporter = progress_reporter
 
     def generate(self, ea: int, cfg: SigMakerConfig) -> Signature:
+        """Generate a unique signature starting at the given address.
+
+        Args:
+            ea: Starting address for signature generation
+            cfg: Configuration for signature generation
+
+        Returns:
+            A unique signature
+
+        Raises:
+            Unexpected: If signature cannot be made unique
+            UserCanceledError: If user cancels via progress reporter
+        """
         if not is_address_marked_as_code(ea):
             raise Unexpected("Cannot create code signature for data")
 
         sig = Signature()
         start_fn = idaapi.get_func(ea)
         bytes_since_last_check = 0
+        instruction_count = 0
 
         for cur_ea, ins, ins_len in InstructionWalker(ea):
+            # Check for cancellation via progress reporter
+            if self.progress_reporter is not None and self.progress_reporter.should_cancel():
+                raise UserCanceledError("Signature generation canceled by user")
+
+            # Update progress periodically
+            instruction_count += 1
+            progress_reporting = self.progress_reporter is not None and self.progress_reporter.enabled()
+            if progress_reporting and instruction_count % 100 == 0:
+                self.progress_reporter.report_progress(
+                    message=f"Generating signature at {hex(cur_ea)}",
+                    signature_length=len(sig),
+                    instructions_processed=instruction_count,
+                )
+
             # Check length constraint
             if bytes_since_last_check > cfg.max_single_signature_length:
                 if (
@@ -991,10 +1335,33 @@ class UniqueSignatureGenerator:
 class RangeSignatureGenerator:
     """Strategy for generating a signature for a fixed address range."""
 
-    def __init__(self, processor: InstructionProcessor):
+    def __init__(
+        self,
+        processor: InstructionProcessor,
+        progress_reporter: typing.Optional[ProgressReporter] = None,
+    ):
         self.processor = processor
+        self.progress_reporter = progress_reporter
 
-    def generate(self, start_ea: int, end_ea: int, cfg: SigMakerConfig) -> Signature:
+    def generate(
+        self,
+        start_ea: int,
+        end_ea: int,
+        cfg: SigMakerConfig,
+    ) -> Signature:
+        """Generate a signature for a specific address range.
+
+        Args:
+            start_ea: Starting address
+            end_ea: Ending address (exclusive)
+            cfg: Configuration for signature generation
+
+        Returns:
+            A signature for the specified range
+
+        Raises:
+            UserCanceledError: If user cancels via progress reporter
+        """
         sig = Signature()
 
         # Handle pure data ranges
@@ -1004,7 +1371,27 @@ class RangeSignatureGenerator:
 
         # Iterate through instructions within the range
         walker = InstructionWalker(start_ea, end_ea)
+        instruction_count = 0
+
         for cur_ea, ins, _ in walker:
+            # Check for cancellation via progress reporter
+            if self.progress_reporter is not None and self.progress_reporter.should_cancel():
+                raise UserCanceledError("Signature generation canceled by user")
+
+            # Update progress periodically
+            instruction_count += 1
+            progress_reporting = self.progress_reporter is not None and self.progress_reporter.enabled()
+            if progress_reporting and instruction_count % 50 == 0:
+                range_size = end_ea - start_ea
+                bytes_processed = cur_ea - start_ea
+                progress_pct = (bytes_processed / range_size * 100) if range_size > 0 else 0
+                self.progress_reporter.report_progress(
+                    message=f"Processing range at {hex(cur_ea)}",
+                    signature_length=len(sig),
+                    instructions_processed=instruction_count,
+                    progress_percent=f"{progress_pct:.1f}%",
+                )
+
             self.processor.append_instruction_to_sig(
                 sig, cur_ea, ins, cfg.wildcard_operands, cfg.wildcard_optimized
             )
@@ -1023,8 +1410,15 @@ class RangeSignatureGenerator:
 
 @dataclasses.dataclass(slots=True)
 class SignatureMaker:
-    """
-    Generates unique or range-based signatures.
+    """Generates unique or range-based signatures.
+
+    This class uses a factory method pattern to create the appropriate signature
+    generator (UniqueSignatureGenerator or RangeSignatureGenerator) based on the
+    operation being performed.
+
+    Note: SignatureMaker instances are ephemeral - a new instance is created for
+    each user action from the IDA UI. Therefore, caching generators would provide
+    no performance benefit, and we create them on-demand via factory method.
     """
 
     _operand_processor: OperandProcessor = dataclasses.field(
@@ -1033,35 +1427,90 @@ class SignatureMaker:
 
     # Internal components built from dependencies
     _instruction_processor: InstructionProcessor = dataclasses.field(init=False)
-    _unique_generator: UniqueSignatureGenerator = dataclasses.field(init=False)
-    _range_generator: RangeSignatureGenerator = dataclasses.field(init=False)
 
     def __post_init__(self):
         """Initialize internal components after the main object is created."""
         self._instruction_processor = InstructionProcessor(self._operand_processor)
-        self._unique_generator = UniqueSignatureGenerator(self._instruction_processor)
-        self._range_generator = RangeSignatureGenerator(self._instruction_processor)
+
+    def _create_generator(
+        self,
+        for_range: bool,
+        progress_reporter: typing.Optional[ProgressReporter],
+    ) -> UniqueSignatureGenerator | RangeSignatureGenerator:
+        """Factory method to create the appropriate signature generator.
+
+        This method encapsulates the logic for creating signature generators,
+        abstracting away the concrete generator types from make_signature().
+
+        Args:
+            for_range: True to create RangeSignatureGenerator, False for UniqueSignatureGenerator
+            progress_reporter: Progress reporter to pass to the generator
+
+        Returns:
+            The appropriate generator instance configured with the progress reporter
+        """
+        if for_range:
+            return RangeSignatureGenerator(self._instruction_processor, progress_reporter)
+        return UniqueSignatureGenerator(self._instruction_processor, progress_reporter)
 
     def make_signature(
-        self, ea: int | Match, cfg: SigMakerConfig, end: int | None = None
+        self,
+        ea: int | Match,
+        cfg: SigMakerConfig,
+        end: int | None = None,
+        *,
+        progress_reporter: typing.Optional[ProgressReporter] = None,
     ) -> GeneratedSignature:
-        """
-        Creates a signature for a single address (unique) or an address range.
+        """Creates a signature for a single address (unique) or an address range.
+
+        Args:
+            ea: Starting address for signature generation
+            cfg: Configuration for signature generation
+            end: Optional ending address for range-based signatures
+            progress_reporter: Optional progress reporter for cancellation and updates.
+                              If not provided, one will be created based on cfg.enable_continue_prompt.
+
+        Returns:
+            A GeneratedSignature containing the signature and metadata
+
+        Raises:
+            Unexpected: If address is invalid or end address is before start
+            UserCanceledError: If user cancels via progress reporter
         """
         start_ea = int(ea)
         if start_ea == idaapi.BADADDR:
             raise Unexpected("Invalid start address")
 
+        # Create progress reporter based on config if not provided
+        if not progress_reporter:
+            progress_reporter = CheckContinuePrompt(
+                prompt_interval=cfg.prompt_interval,
+                metadata={
+                    "operation": "Signature generation",
+                    "start_address": hex(start_ea),
+                },
+                logger=LOGGER,
+                enable_prompt=cfg.enable_continue_prompt,
+            )
+            if DEBUGGING_MODE:
+                LOGGER.info(
+                    "Created CheckContinuePrompt: interval=%ds, enabled=%s",
+                    cfg.prompt_interval,
+                    cfg.enable_continue_prompt,
+                )
+
         if end is None:
-            # Delegate to the unique signature generation strategy
-            sig = self._unique_generator.generate(start_ea, cfg)
+            # Create unique signature generator via factory method
+            generator = self._create_generator(for_range=False, progress_reporter=progress_reporter)
+            sig = generator.generate(start_ea, cfg)
             return GeneratedSignature(sig, Match(start_ea))
 
         if end <= start_ea:
             raise Unexpected("End address must be after start address")
 
-        # Delegate to the range signature generation strategy
-        sig = self._range_generator.generate(start_ea, end, cfg)
+        # Create range signature generator via factory method
+        generator = self._create_generator(for_range=True, progress_reporter=progress_reporter)
+        sig = generator.generate(start_ea, end, cfg)
         return GeneratedSignature(sig)
 
 
@@ -1276,7 +1725,11 @@ class SignatureSearcher:
         if not sig_str:
             idaapi.msg("Unrecognized signature type\n")
             return SearchResults([], "")
-        matches = self.find_all(sig_str)
+
+        # Wrap the search in a ProgressDialog to allow cancellation
+        with ProgressDialog("Searching for signature...\n\nPress Cancel to stop"):
+            matches = self.find_all(sig_str)
+
         return SearchResults(matches, sig_str)
 
     @staticmethod
@@ -1307,6 +1760,11 @@ class SignatureSearcher:
         n = len(data_mv)
         off = 0
         while off <= n - k:
+            # Check for user cancellation
+            if idaapi_user_canceled():
+                LOGGER.info("Search canceled by user")
+                break
+
             idx = _simd_scan_bytes(data_mv[off:], sig)
             if idx < 0:
                 break
@@ -1330,6 +1788,11 @@ class SignatureSearcher:
             idaapi, "bin_search3"
         )
         while True:
+            # Check for user cancellation
+            if idaapi_user_canceled():
+                LOGGER.info("Search canceled by user")
+                break
+
             hit, _ = _bin_search(
                 ea,
                 idaapi.inf_get_max_ea(),
@@ -1357,8 +1820,8 @@ class ProgressDialog:
     on entry and hide it on exit.
 
     The message may be updated via `replace_message()` and cancelation can be
-    tested with `user_canceled()` from this class or `idaapi.user_cancelled()`
-    from IDA API.
+    tested with `user_canceled()` from this class or `idaapi_user_canceled()`
+    from this module.
     """
 
     def __init__(self, message: str = "Please wait...", hide_cancel: bool = False):
@@ -1400,7 +1863,7 @@ class ProgressDialog:
 
     def user_canceled(self) -> bool:
         """Return True if the user has canceled the wait box."""
-        return idaapi.user_cancelled()
+        return idaapi_user_canceled()
 
     # Provide alias with alternative spelling for backwards compatibility.
     user_cancelled = user_canceled
@@ -1621,7 +2084,8 @@ Output format:
 Quick Options:
 <#Enable wildcarding for operands, to improve stability of created signatures#Wildcards for operands:{cWildcardOperands}>
 <#Don't stop signature generation when reaching end of function#Continue when leaving function scope:{cContinueOutside}>
-<#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>{cGroupOptions}>
+<#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>
+<#Show periodic continue prompts while generating signatures#Enable continue prompt:{cEnablePrompt}>{cGroupOptions}>
 
 <Operand types...:{bOperandTypes}><Other options...:{bOtherOptions}>
 """
@@ -1636,8 +2100,8 @@ Quick Options:
                 ("rIDASig", "rx64DbgSig", "rByteArrayMaskSig", "rRawBytesBitmaskSig")
             ),
             "cGroupOptions": idaapi.Form.ChkGroupControl(
-                ("cWildcardOperands", "cContinueOutside", "cWildcardOptimized"),
-                value=5,
+                ("cWildcardOperands", "cContinueOutside", "cWildcardOptimized", "cEnablePrompt"),
+                value=13,  # Bits: 1 (wildcards) + 4 (wildcard optimized) + 8 (enable prompt)
             ),
             "bOperandTypes": F.ButtonInput(self.ConfigureOperandWildcardBitmask),
             "bOtherOptions": F.ButtonInput(self.ConfigureOptions),
@@ -1776,6 +2240,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             wildcard_operands = bool(form.cGroupOptions.value & 1)  # type: ignore
             continue_outside_of_function = bool(form.cGroupOptions.value & 2)  # type: ignore
             wildcard_optimized = bool(form.cGroupOptions.value & 4)  # type: ignore
+            enable_continue_prompt = bool(form.cGroupOptions.value & 8)  # type: ignore
 
         # Create SigMakerConfig
         config = SigMakerConfig(
@@ -1783,6 +2248,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             wildcard_operands=wildcard_operands,
             continue_outside_of_function=continue_outside_of_function,
             wildcard_optimized=wildcard_optimized,
+            enable_continue_prompt=enable_continue_prompt,
         )
 
         try:
@@ -1815,8 +2281,11 @@ class SigMakerPlugin(idaapi.plugin_t):
                 idaapi.msg("Invalid action!\n")
         except Unexpected as e:
             idaapi.msg(f"Error: {str(e)}\n")
+        except UserCanceledError:
+            # User cancellation is expected, not an error
+            idaapi.msg("Operation cancelled by user\n")
         except Exception as e:
-            LOGGER.error(e, os.linesep, traceback.format_exc())
+            LOGGER.error("Exception occurred: %s%s%s", e, os.linesep, traceback.format_exc())
             return
 
     def term(self) -> None:

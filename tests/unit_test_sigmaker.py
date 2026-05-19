@@ -2213,6 +2213,7 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
         # firing the walker's cancel branch on every iteration. Reset.
         sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.decode_insn = MagicMock(return_value=1)
         sigmaker.idaapi.get_byte = MagicMock(return_value=0x90)
         sigmaker.idaapi.get_bytes = MagicMock(return_value=b"\x90")
         sigmaker.idaapi.get_func = MagicMock(return_value=None)
@@ -2221,25 +2222,7 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
         )
         self._is_code_patcher.start()
 
-        # InstructionWalker's dataclass default `end_ea = idaapi.BADADDR` was
-        # evaluated at import time when idaapi was a MagicMock, so the default
-        # is a MagicMock attribute, not an int. Patching the live attribute
-        # doesn't fix the frozen default. Replace the class with a tiny generator
-        # for these tests -- they only care about the generator's policy
-        # handling, not walker iteration mechanics.
-        def _fake_walker(start_ea, *args, **kwargs):
-            cur = start_ea
-            while True:
-                ins = MagicMock()
-                ins.size = 1
-                yield cur, ins, 1
-                cur += 1
-
-        self._walker_patcher = patch.object(sigmaker, "InstructionWalker", _fake_walker)
-        self._walker_patcher.start()
-
     def tearDown(self):
-        self._walker_patcher.stop()
         self._is_code_patcher.stop()
         sigmaker.idaapi_user_canceled = self.original_user_canceled
 

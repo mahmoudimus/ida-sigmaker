@@ -1292,7 +1292,11 @@ class InstructionWalker:
     """
 
     start_ea: int
-    end_ea: int = idaapi.BADADDR
+    # Resolve BADADDR lazily so tests that patch `idaapi.BADADDR` at runtime
+    # actually take effect. With `default=idaapi.BADADDR`, the value was
+    # evaluated at class-definition (module import) time, which under the
+    # unit-test mock of `idaapi` froze it as a MagicMock attribute.
+    end_ea: int = dataclasses.field(default_factory=lambda: idaapi.BADADDR)
 
     # Internal state fields
     cursor: int = dataclasses.field(init=False)

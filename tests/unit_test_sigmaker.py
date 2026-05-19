@@ -2192,6 +2192,135 @@ class TestActionEnum(CoveredUnitTest):
         self.assertTrue(issubclass(sigmaker.Action, _enum.IntEnum))
 
 
+class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
+    """Iterates every instruction in a function and returns the shortest unique signature."""
+
+    def setUp(self):
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.decode_insn = MagicMock(return_value=1)
+        sigmaker.idaapi.get_byte = MagicMock(return_value=0x90)
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=b"\x90")
+
+    def tearDown(self):
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
+
+    def _make_pfn(self, start_ea: int, end_ea: int):
+        pfn = MagicMock()
+        pfn.start_ea = start_ea
+        pfn.end_ea = end_ea
+        return pfn
+
+    def _make_generator(self):
+        processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        return sigmaker.MinimalFunctionSignatureGenerator(processor)
+
+    def _make_cfg(self, max_len: int = 50) -> sigmaker.SigMakerConfig:
+        return sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+            ask_longer_signature=False,
+            max_single_signature_length=max_len,
+        )
+
+    def test_returns_shortest_unique_candidate(self):
+        gen = self._make_generator()
+        # 32-byte function so the inner search has room for 10-byte and
+        # 6-byte sigs without running off the end of the walker.
+        pfn = self._make_pfn(0x1000, 0x1020)
+
+        calls = {"n": 0}
+
+        def fake_is_unique(_ida_sig_str):
+            calls["n"] += 1
+            n = calls["n"]
+            if n <= 10:
+                return n == 10
+            if n <= 16:
+                return n == 16
+            return False
+
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+        ):
+            result = gen.generate(pfn, self._make_cfg(max_len=50))
+
+        self.assertIsInstance(result, sigmaker.GeneratedSignature)
+        self.assertEqual(result.address, sigmaker.Match(0x1001))
+        self.assertEqual(len(result.signature), 6)
+
+    def test_prune_caps_inner_search_by_best_so_far(self):
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x1014)
+
+        calls = {"n": 0}
+
+        def fake_is_unique(_):
+            calls["n"] += 1
+            return calls["n"] == 7
+
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+        ):
+            result = gen.generate(pfn, self._make_cfg(max_len=50))
+
+        self.assertLess(calls["n"], 300)
+        self.assertEqual(len(result.signature), 7)
+
+    def test_ideal_candidate_early_exit(self):
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x1010)
+
+        calls = {"n": 0}
+
+        def fake_is_unique(_):
+            calls["n"] += 1
+            return calls["n"] == 5
+
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+        ):
+            result = gen.generate(pfn, self._make_cfg(max_len=50))
+
+        self.assertEqual(len(result.signature), 5)
+        self.assertEqual(calls["n"], 5)
+
+    def test_raises_when_no_candidate(self):
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x1003)
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", return_value=False
+        ):
+            with self.assertRaises(sigmaker.Unexpected):
+                gen.generate(pfn, self._make_cfg(max_len=10))
+
+    def test_rejects_degenerate_short_sigs(self):
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x1005)
+
+        calls = {"n": 0}
+
+        def fake_is_unique(_):
+            calls["n"] += 1
+            return calls["n"] % 3 == 0
+
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+        ):
+            with self.assertRaises(sigmaker.Unexpected):
+                gen.generate(pfn, self._make_cfg(max_len=50))
+
+    def test_min_useful_sig_bytes_constant(self):
+        self.assertEqual(
+            sigmaker.MinimalFunctionSignatureGenerator.MIN_USEFUL_SIG_BYTES, 5
+        )
+
+
 class TestActionEnumAddsFunctionSig(CoveredUnitTest):
     """The Action IntEnum gains FIND_FUNCTION_SIG=4 for issue #17."""
 

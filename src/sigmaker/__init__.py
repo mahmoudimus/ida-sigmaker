@@ -1366,6 +1366,122 @@ class UniqueSignatureGenerator:
         raise Unexpected("Signature not unique (reached end of analysis)")
 
 
+class MinimalFunctionSignatureGenerator:
+    """Find the shortest unique signature anywhere within a function body.
+
+    Iterates every instruction in the function as a possible start point,
+    growing a signature from each until unique (bounded by function end and
+    by the size of the best candidate found so far). Returns the smallest
+    unique signature with the fewest wildcards. Raises Unexpected if no
+    unique signature exists within the function.
+    """
+
+    MIN_USEFUL_SIG_BYTES = 5
+
+    def __init__(
+        self,
+        processor: InstructionProcessor,
+        progress_reporter: typing.Optional[ProgressReporter] = None,
+    ):
+        self.processor = processor
+        self.progress_reporter = progress_reporter
+
+    def generate(
+        self, pfn: "idaapi.func_t", cfg: SigMakerConfig
+    ) -> GeneratedSignature:
+        """Search the function body for the shortest unique signature.
+
+        Args:
+            pfn: The function to search (idaapi.func_t).
+            cfg: Configuration. Uses max_single_signature_length as the
+                initial budget; the budget shrinks monotonically as
+                better candidates are found.
+
+        Returns:
+            The best unique GeneratedSignature found.
+
+        Raises:
+            Unexpected: If no start point produces a unique signature within
+                the length budget, or all candidates are degenerate
+                (< MIN_USEFUL_SIG_BYTES bytes).
+            UserCanceledError: If the progress reporter signals cancel.
+        """
+        candidates: list[GeneratedSignature] = []
+        best_size = cfg.max_single_signature_length
+
+        # Materialize start EAs upfront so we can iterate independently of
+        # the inner growth loop's walker state.
+        start_eas = [
+            cur_ea for cur_ea, _, _ in InstructionWalker(pfn.start_ea, pfn.end_ea)
+        ]
+
+        for start_ea in start_eas:
+            if (
+                self.progress_reporter is not None
+                and self.progress_reporter.should_cancel()
+            ):
+                raise UserCanceledError(
+                    "Function signature search canceled by user"
+                )
+
+            sig = self._grow_unique_from(start_ea, pfn.end_ea, best_size, cfg)
+            if sig is None:
+                continue
+            if len(sig) < self.MIN_USEFUL_SIG_BYTES:
+                continue
+
+            candidate = GeneratedSignature(sig, Match(start_ea))
+            candidates.append(candidate)
+            best_size = min(best_size, len(sig))
+
+            # Ideal candidate: small enough and no wildcards. Stop scanning.
+            wildcard_count = sum(1 for b in sig if b.is_wildcard)
+            if len(sig) <= self.MIN_USEFUL_SIG_BYTES and wildcard_count == 0:
+                break
+
+        if not candidates:
+            raise Unexpected("No unique signature within function")
+
+        candidates.sort()  # (size, wildcards) ascending via __lt__
+        return candidates[0]
+
+    def _grow_unique_from(
+        self, start: int, end_ea: int, max_len: int, cfg: SigMakerConfig
+    ) -> typing.Optional[Signature]:
+        """Grow a signature from ``start`` until unique, bounded by
+        ``end_ea`` and ``max_len`` bytes.
+
+        Returns the trimmed Signature on uniqueness, or None if the search
+        exhausts the budget without becoming unique.
+        """
+        sig = Signature()
+        for cur_ea, ins, _ins_len in InstructionWalker(start, end_ea):
+            if (
+                self.progress_reporter is not None
+                and self.progress_reporter.should_cancel()
+            ):
+                raise UserCanceledError(
+                    "Function signature search canceled by user"
+                )
+
+            self.processor.append_instruction_to_sig(
+                sig,
+                cur_ea,
+                ins,
+                cfg.wildcard_operands,
+                cfg.wildcard_optimized,
+            )
+
+            if len(sig) > max_len:
+                return None
+
+            if SignatureSearcher.is_unique(f"{sig:ida}"):
+                sig.trim_signature()
+                return sig
+
+        return None
+
+
 class RangeSignatureGenerator:
     """Strategy for generating a signature for a fixed address range."""
 

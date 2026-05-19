@@ -2192,6 +2192,48 @@ class TestActionEnum(CoveredUnitTest):
         self.assertTrue(issubclass(sigmaker.Action, _enum.IntEnum))
 
 
+class TestGeneratedSignatureOrdering(CoveredUnitTest):
+    """GeneratedSignature.__lt__ ranks by (size, wildcards) ascending."""
+
+    def _make(self, byte_specs: list[tuple[int, bool]]) -> sigmaker.GeneratedSignature:
+        sig = sigmaker.Signature()
+        for value, is_wildcard in byte_specs:
+            sig.append(sigmaker.SignatureByte(value, is_wildcard))
+        return sigmaker.GeneratedSignature(sig, sigmaker.Match(0x1000))
+
+    def test_smaller_size_beats_larger(self):
+        smaller = self._make([(0xE8, False)] * 4)
+        larger = self._make([(0xE8, False)] * 6)
+        self.assertLess(smaller, larger)
+        self.assertFalse(larger < smaller)
+
+    def test_equal_size_fewer_wildcards_beats_more(self):
+        fewer = self._make(
+            [(0xE8, False), (0x00, True), (0x45, False), (0x33, False)]
+        )
+        more = self._make(
+            [(0xE8, False), (0x00, True), (0x00, True), (0x33, False)]
+        )
+        self.assertLess(fewer, more)
+        self.assertFalse(more < fewer)
+
+    def test_equal_size_equal_wildcards_neither_less(self):
+        a = self._make(
+            [(0xE8, False), (0x00, True), (0x45, False), (0x33, False)]
+        )
+        b = self._make(
+            [(0xC3, False), (0x90, True), (0x48, False), (0x89, False)]
+        )
+        self.assertFalse(a < b)
+        self.assertFalse(b < a)
+
+    def test_wildcard_count_helper(self):
+        sig = self._make(
+            [(0xE8, False), (0x00, True), (0x00, True), (0x33, False)]
+        )
+        self.assertEqual(sig._wildcard_count(), 2)
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

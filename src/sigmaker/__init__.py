@@ -991,10 +991,17 @@ class GeneratedSignature:
         if not Clipboard.set_text(fmted):
             idaapi.msg("Failed to copy to clipboard!")
 
+    def _wildcard_count(self) -> int:
+        """Number of wildcard bytes in this signature."""
+        return sum(1 for b in self.signature if b.is_wildcard)
+
     def __lt__(self, other) -> bool:
         if not isinstance(other, GeneratedSignature):
             return NotImplemented
-        return len(self.signature) < len(other.signature)
+        return (len(self.signature), self._wildcard_count()) < (
+            len(other.signature),
+            other._wildcard_count(),
+        )
 
 
 @dataclasses.dataclass(slots=True)

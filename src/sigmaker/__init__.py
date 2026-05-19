@@ -2110,7 +2110,7 @@ Quick Options:
 <#Enable wildcarding for operands, to improve stability of created signatures#Wildcards for operands:{cWildcardOperands}>
 <#Don't stop signature generation when reaching end of function#Continue when leaving function scope:{cContinueOutside}>
 <#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>
-<#Show periodic continue prompts while generating signatures#Enable continue prompt:{cEnablePrompt}>{cGroupOptions}>
+<#Opt-in: show periodic 'Continue?' prompts while generating. Default is a wait-box with a Cancel button.#Enable continue prompt (opt-in):{cEnablePrompt}>{cGroupOptions}>
 
 <Operand types...:{bOperandTypes}><Other options...:{bOtherOptions}>
 """
@@ -2126,7 +2126,9 @@ Quick Options:
             ),
             "cGroupOptions": idaapi.Form.ChkGroupControl(
                 ("cWildcardOperands", "cContinueOutside", "cWildcardOptimized", "cEnablePrompt"),
-                value=13,  # Bits: 1 (wildcards) + 4 (wildcard optimized) + 8 (enable prompt)
+                # Bits: 1 (wildcards) + 4 (wildcard optimized). Bit 8 (enable
+                # prompt) defaults OFF; the wait-box Cancel handles long runs.
+                value=5,
             ),
             "bOperandTypes": F.ButtonInput(self.ConfigureOperandWildcardBitmask),
             "bOtherOptions": F.ButtonInput(self.ConfigureOptions),

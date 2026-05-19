@@ -2285,7 +2285,10 @@ class SigMakerPlugin(idaapi.plugin_t):
         try:
             if action == Action.CREATE_UNIQUE:
                 ea = idaapi.get_screen_ea()
-                signature = SignatureMaker().make_signature(ea, config)
+                with ProgressDialog(
+                    "Generating signature...\n\nPress Cancel to stop"
+                ):
+                    signature = SignatureMaker().make_signature(ea, config)
                 signature.display(config)
             elif action == Action.FIND_XREF:
                 ea = idaapi.get_screen_ea()
@@ -2294,7 +2297,12 @@ class SigMakerPlugin(idaapi.plugin_t):
             elif action == Action.COPY_RANGE:
                 start, end = self.get_selected_addresses(idaapi.get_current_viewer())
                 if start and end:
-                    signature = SignatureMaker().make_signature(start, config, end=end)
+                    with ProgressDialog(
+                        "Generating range signature...\n\nPress Cancel to stop"
+                    ):
+                        signature = SignatureMaker().make_signature(
+                            start, config, end=end
+                        )
                     signature.display(config)
                 else:
                     idaapi.msg("Select a range to copy the code!\n")

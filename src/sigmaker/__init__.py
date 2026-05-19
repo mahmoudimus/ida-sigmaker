@@ -1338,19 +1338,33 @@ class UniqueSignatureGenerator:
         self.processor = processor
         self.progress_reporter = progress_reporter
 
-    def generate(self, ea: int, cfg: SigMakerConfig) -> Signature:
+    def generate(
+        self,
+        ea: int,
+        cfg: SigMakerConfig,
+        *,
+        policy: GenerationPolicy = GenerationPolicy.strict(),
+    ) -> GeneratedSignature:
         """Generate a unique signature starting at the given address.
 
         Args:
             ea: Starting address for signature generation
             cfg: Configuration for signature generation
+            policy: Controls cancel-time behavior. Default strict() raises
+                UserCanceledError on cancel (legacy contract). permissive()
+                returns a partial GeneratedSignature with the most recently
+                observed match count.
 
         Returns:
-            A unique signature
+            A GeneratedSignature. status=UNIQUE on success;
+            status=PARTIAL_ON_CANCEL when policy.return_partial_on_cancel
+            is True and the user cancels after at least one byte has been
+            appended.
 
         Raises:
             Unexpected: If signature cannot be made unique
-            UserCanceledError: If user cancels via progress reporter
+            UserCanceledError: If user cancels and policy.return_partial_on_cancel
+                is False, or if cancel happens before any byte is appended.
         """
         if not is_address_marked_as_code(ea):
             raise Unexpected("Cannot create code signature for data")
@@ -1359,51 +1373,75 @@ class UniqueSignatureGenerator:
         start_fn = idaapi.get_func(ea)
         bytes_since_last_check = 0
         instruction_count = 0
+        last_match_count: int | None = None
 
-        for cur_ea, ins, ins_len in InstructionWalker(ea):
-            # Check for cancellation via progress reporter
-            if self.progress_reporter is not None and self.progress_reporter.should_cancel():
+        def _build_partial() -> GeneratedSignature:
+            # Trim trailing wildcards, mirror the success path.
+            sig.trim_signature()
+            if len(sig) == 0:
                 raise UserCanceledError("Signature generation canceled by user")
-
-            # Update progress periodically
-            instruction_count += 1
-            progress_reporting = self.progress_reporter is not None and self.progress_reporter.enabled()
-            if progress_reporting and instruction_count % 100 == 0:
-                self.progress_reporter.report_progress(
-                    message=f"Generating signature at {hex(cur_ea)}",
-                    signature_length=len(sig),
-                    instructions_processed=instruction_count,
-                )
-
-            # Check length constraint
-            if bytes_since_last_check > cfg.max_single_signature_length:
-                if (
-                    not cfg.ask_longer_signature
-                    or idaapi.ask_yn(
-                        idaapi.ASKBTN_NO,
-                        f"Signature is already {len(sig)} bytes. Continue?",
-                    )
-                    != idaapi.ASKBTN_YES
-                ):
-                    raise Unexpected("Signature not unique within length constraints")
-                bytes_since_last_check = 0  # Reset counter after user confirmation
-
-            # Check function boundary constraint
-            if (
-                not cfg.continue_outside_of_function
-                and start_fn
-                and cur_ea >= start_fn.end_ea
-            ):
-                raise Unexpected("Signature left function scope without being unique")
-
-            self.processor.append_instruction_to_sig(
-                sig, cur_ea, ins, cfg.wildcard_operands, cfg.wildcard_optimized
+            return GeneratedSignature(
+                sig,
+                Match(ea),
+                status=GenerationStatus.PARTIAL_ON_CANCEL,
+                match_count=last_match_count,
             )
-            bytes_since_last_check += ins_len
 
-            if SignatureSearcher.is_unique(f"{sig:ida}"):
-                sig.trim_signature()
-                return sig
+        try:
+            for cur_ea, ins, ins_len in InstructionWalker(ea):
+                # Check for cancellation via progress reporter
+                if self.progress_reporter is not None and self.progress_reporter.should_cancel():
+                    if policy.return_partial_on_cancel:
+                        return _build_partial()
+                    raise UserCanceledError("Signature generation canceled by user")
+
+                # Update progress periodically
+                instruction_count += 1
+                progress_reporting = self.progress_reporter is not None and self.progress_reporter.enabled()
+                if progress_reporting and instruction_count % 100 == 0:
+                    self.progress_reporter.report_progress(
+                        message=f"Generating signature at {hex(cur_ea)}",
+                        signature_length=len(sig),
+                        instructions_processed=instruction_count,
+                    )
+
+                # Check length constraint
+                if bytes_since_last_check > cfg.max_single_signature_length:
+                    if (
+                        not cfg.ask_longer_signature
+                        or idaapi.ask_yn(
+                            idaapi.ASKBTN_NO,
+                            f"Signature is already {len(sig)} bytes. Continue?",
+                        )
+                        != idaapi.ASKBTN_YES
+                    ):
+                        raise Unexpected("Signature not unique within length constraints")
+                    bytes_since_last_check = 0  # Reset counter after user confirmation
+
+                # Check function boundary constraint
+                if (
+                    not cfg.continue_outside_of_function
+                    and start_fn
+                    and cur_ea >= start_fn.end_ea
+                ):
+                    raise Unexpected("Signature left function scope without being unique")
+
+                self.processor.append_instruction_to_sig(
+                    sig, cur_ea, ins, cfg.wildcard_operands, cfg.wildcard_optimized
+                )
+                bytes_since_last_check += ins_len
+
+                count = SignatureSearcher.count_matches(f"{sig:ida}")
+                last_match_count = count
+                if count == 1:
+                    sig.trim_signature()
+                    return GeneratedSignature(sig, Match(ea))
+        except UserCanceledError:
+            # InstructionWalker raises UserCanceledError on cancel too (issue #18).
+            # Honor the policy here as well.
+            if policy.return_partial_on_cancel:
+                return _build_partial()
+            raise
 
         raise Unexpected("Signature not unique (reached end of analysis)")
 
@@ -1536,6 +1574,7 @@ class SignatureMaker:
         end: int | None = None,
         *,
         progress_reporter: typing.Optional[ProgressReporter] = None,
+        policy: GenerationPolicy = GenerationPolicy.strict(),
     ) -> GeneratedSignature:
         """Creates a signature for a single address (unique) or an address range.
 
@@ -1578,13 +1617,15 @@ class SignatureMaker:
         if end is None:
             # Create unique signature generator via factory method
             generator = self._create_generator(for_range=False, progress_reporter=progress_reporter)
-            sig = generator.generate(start_ea, cfg)
-            return GeneratedSignature(sig, Match(start_ea))
+            # UniqueSignatureGenerator.generate returns a GeneratedSignature
+            # directly so it can carry status + match_count on cancel.
+            return generator.generate(start_ea, cfg, policy=policy)
 
         if end <= start_ea:
             raise Unexpected("End address must be after start address")
 
-        # Create range signature generator via factory method
+        # Create range signature generator via factory method.
+        # Range generator returns a bare Signature; policy is not applicable.
         generator = self._create_generator(for_range=True, progress_reporter=progress_reporter)
         sig = generator.generate(start_ea, end, cfg)
         return GeneratedSignature(sig)

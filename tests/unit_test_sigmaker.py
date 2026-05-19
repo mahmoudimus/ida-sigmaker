@@ -2192,6 +2192,113 @@ class TestActionEnum(CoveredUnitTest):
         self.assertTrue(issubclass(sigmaker.Action, _enum.IntEnum))
 
 
+class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
+    """policy=permissive returns a partial GeneratedSignature on cancel."""
+
+    def setUp(self):
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        # idaapi is module-level MagicMock; idaapi_user_canceled is bound from
+        # it at import time and would return a truthy MagicMock by default,
+        # firing the walker's cancel branch on every iteration. Reset.
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.get_byte = MagicMock(return_value=0x90)
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=b"\x90")
+        sigmaker.idaapi.get_func = MagicMock(return_value=None)
+        self._is_code_patcher = patch.object(
+            sigmaker, "is_address_marked_as_code", return_value=True
+        )
+        self._is_code_patcher.start()
+
+        # InstructionWalker's dataclass default `end_ea = idaapi.BADADDR` was
+        # evaluated at import time when idaapi was a MagicMock, so the default
+        # is a MagicMock attribute, not an int. Patching the live attribute
+        # doesn't fix the frozen default. Replace the class with a tiny generator
+        # for these tests -- they only care about the generator's policy
+        # handling, not walker iteration mechanics.
+        def _fake_walker(start_ea, *args, **kwargs):
+            cur = start_ea
+            while True:
+                ins = MagicMock()
+                ins.size = 1
+                yield cur, ins, 1
+                cur += 1
+
+        self._walker_patcher = patch.object(sigmaker, "InstructionWalker", _fake_walker)
+        self._walker_patcher.start()
+
+    def tearDown(self):
+        self._walker_patcher.stop()
+        self._is_code_patcher.stop()
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
+
+    def _make_generator(self, cancel_after_iterations: int):
+        """Construct a UniqueSignatureGenerator whose progress_reporter cancels
+        on the Nth should_cancel() call."""
+        calls = {"n": 0}
+
+        def should_cancel():
+            calls["n"] += 1
+            return calls["n"] > cancel_after_iterations
+
+        reporter = MagicMock()
+        reporter.should_cancel.side_effect = should_cancel
+        reporter.enabled.return_value = False
+        processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        return sigmaker.UniqueSignatureGenerator(processor, reporter)
+
+    def _make_cfg(self) -> sigmaker.SigMakerConfig:
+        return sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=True,
+            wildcard_optimized=False,
+            ask_longer_signature=False,
+        )
+
+    def test_strict_policy_cancel_raises(self):
+        gen = self._make_generator(cancel_after_iterations=3)
+        with patch.object(sigmaker.SignatureSearcher, "count_matches", return_value=2):
+            with self.assertRaises(sigmaker.UserCanceledError):
+                gen.generate(0x1000, self._make_cfg(), policy=sigmaker.GenerationPolicy.strict())
+
+    def test_permissive_policy_cancel_returns_partial(self):
+        gen = self._make_generator(cancel_after_iterations=3)
+        with patch.object(sigmaker.SignatureSearcher, "count_matches", return_value=2):
+            result = gen.generate(
+                0x1000, self._make_cfg(), policy=sigmaker.GenerationPolicy.permissive()
+            )
+        self.assertIsInstance(result, sigmaker.GeneratedSignature)
+        self.assertEqual(result.status, sigmaker.GenerationStatus.PARTIAL_ON_CANCEL)
+        self.assertEqual(result.match_count, 2)
+        self.assertGreater(len(result.signature), 0)
+        self.assertEqual(result.address, sigmaker.Match(0x1000))
+
+    def test_permissive_policy_unique_returns_unique(self):
+        gen = self._make_generator(cancel_after_iterations=99)
+        counts = iter([2, 2, 1])
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "count_matches",
+            side_effect=lambda *_: next(counts),
+        ):
+            result = gen.generate(
+                0x1000, self._make_cfg(), policy=sigmaker.GenerationPolicy.permissive()
+            )
+        self.assertEqual(result.status, sigmaker.GenerationStatus.UNIQUE)
+        self.assertIsInstance(result, sigmaker.GeneratedSignature)
+
+    def test_permissive_policy_cancel_before_any_byte_raises(self):
+        gen = self._make_generator(cancel_after_iterations=0)
+        with patch.object(sigmaker.SignatureSearcher, "count_matches", return_value=2):
+            with self.assertRaises(sigmaker.UserCanceledError):
+                gen.generate(
+                    0x1000, self._make_cfg(), policy=sigmaker.GenerationPolicy.permissive()
+                )
+
+
 class TestGeneratedSignatureDisplay(CoveredUnitTest):
     """display() branches on status and respects the no-clipboard rule for partials."""
 

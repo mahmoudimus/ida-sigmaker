@@ -613,6 +613,20 @@ class SignatureType(enum.Enum):
         return list(cls.__members__.values())[index]
 
 
+class Action(enum.IntEnum):
+    """User-selectable action in SignatureMakerForm.
+
+    Values are bound to the rAction radio-group order:
+    ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature").
+    Changing values requires updating the radio group too.
+    """
+
+    CREATE_UNIQUE = 0
+    FIND_XREF = 1
+    COPY_RANGE = 2
+    SEARCH = 3
+
+
 class SignatureByte(typing.NamedTuple):
     """Container representing a single byte in a signature.
 
@@ -2235,7 +2249,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             if not ok:
                 return
 
-            action = form.rAction.value  # type: ignore
+            action = Action(int(form.rAction.value))  # type: ignore
             output_format = form.rOutputFormat.value  # type: ignore
             wildcard_operands = bool(form.cGroupOptions.value & 1)  # type: ignore
             continue_outside_of_function = bool(form.cGroupOptions.value & 2)  # type: ignore
@@ -2252,22 +2266,22 @@ class SigMakerPlugin(idaapi.plugin_t):
         )
 
         try:
-            if action == 0:
+            if action == Action.CREATE_UNIQUE:
                 ea = idaapi.get_screen_ea()
                 signature = SignatureMaker().make_signature(ea, config)
                 signature.display(config)
-            elif action == 1:
+            elif action == Action.FIND_XREF:
                 ea = idaapi.get_screen_ea()
                 signatures = XrefFinder().find_xrefs(ea, config)
                 signatures.display(cfg=config)
-            elif action == 2:
+            elif action == Action.COPY_RANGE:
                 start, end = self.get_selected_addresses(idaapi.get_current_viewer())
                 if start and end:
                     signature = SignatureMaker().make_signature(start, config, end=end)
                     signature.display(config)
                 else:
                     idaapi.msg("Select a range to copy the code!\n")
-            elif action == 3:
+            elif action == Action.SEARCH:
                 input_signature = idaapi.ask_str(
                     "", idaapi.HIST_SRCH, "Enter a signature"
                 )

@@ -2100,6 +2100,23 @@ class TestSearchCancellation(CoveredUnitTest):
             sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
 
 
+class TestActionEnum(CoveredUnitTest):
+    """The Action IntEnum must mirror the SignatureMakerForm.rAction radio order."""
+
+    def test_action_values_match_form_order(self):
+        # Order is locked by SignatureMakerForm.rAction:
+        #   ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature")
+        self.assertEqual(int(sigmaker.Action.CREATE_UNIQUE), 0)
+        self.assertEqual(int(sigmaker.Action.FIND_XREF), 1)
+        self.assertEqual(int(sigmaker.Action.COPY_RANGE), 2)
+        self.assertEqual(int(sigmaker.Action.SEARCH), 3)
+
+    def test_action_is_intenum(self):
+        import enum as _enum
+
+        self.assertTrue(issubclass(sigmaker.Action, _enum.IntEnum))
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

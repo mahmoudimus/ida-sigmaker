@@ -2214,7 +2214,8 @@ Quick Options:
 <#Enable wildcarding for operands, to improve stability of created signatures#Wildcards for operands:{cWildcardOperands}>
 <#Don't stop signature generation when reaching end of function#Continue when leaving function scope:{cContinueOutside}>
 <#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>
-<#Opt-in -- show periodic 'Continue?' prompts while generating. Default is a wait-box with a Cancel button.#Enable continue prompt (opt-in):{cEnablePrompt}>{cGroupOptions}>
+<#Opt-in -- show periodic 'Continue?' prompts while generating. Default is a wait-box with a Cancel button.#Enable continue prompt (opt-in):{cEnablePrompt}>
+<#Opt-in -- when you cancel a unique-signature search, output the partial signature (with match count) instead of nothing. Default off. (Issue #22)#Output partial signature on cancel (opt-in):{cOutputPartialOnCancel}>{cGroupOptions}>
 
 <Operand types...:{bOperandTypes}><Other options...:{bOtherOptions}>
 """
@@ -2229,9 +2230,15 @@ Quick Options:
                 ("rIDASig", "rx64DbgSig", "rByteArrayMaskSig", "rRawBytesBitmaskSig")
             ),
             "cGroupOptions": idaapi.Form.ChkGroupControl(
-                ("cWildcardOperands", "cContinueOutside", "cWildcardOptimized", "cEnablePrompt"),
+                (
+                    "cWildcardOperands",
+                    "cContinueOutside",
+                    "cWildcardOptimized",
+                    "cEnablePrompt",
+                    "cOutputPartialOnCancel",
+                ),
                 # Bits: 1 (wildcards) + 4 (wildcard optimized). Bit 8 (enable
-                # prompt) defaults OFF; the wait-box Cancel handles long runs.
+                # prompt) and bit 16 (output partial on cancel) default OFF.
                 value=5,
             ),
             "bOperandTypes": F.ButtonInput(self.ConfigureOperandWildcardBitmask),
@@ -2372,6 +2379,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             continue_outside_of_function = bool(form.cGroupOptions.value & 2)  # type: ignore
             wildcard_optimized = bool(form.cGroupOptions.value & 4)  # type: ignore
             enable_continue_prompt = bool(form.cGroupOptions.value & 8)  # type: ignore
+            output_partial_on_cancel = bool(form.cGroupOptions.value & 16)  # type: ignore
 
         # Create SigMakerConfig
         config = SigMakerConfig(
@@ -2380,15 +2388,23 @@ class SigMakerPlugin(idaapi.plugin_t):
             continue_outside_of_function=continue_outside_of_function,
             wildcard_optimized=wildcard_optimized,
             enable_continue_prompt=enable_continue_prompt,
+            output_partial_on_cancel=output_partial_on_cancel,
         )
 
         try:
             if action == Action.CREATE_UNIQUE:
                 ea = idaapi.get_screen_ea()
+                policy = (
+                    GenerationPolicy.permissive()
+                    if config.output_partial_on_cancel
+                    else GenerationPolicy.strict()
+                )
                 with ProgressDialog(
                     "Generating signature...\n\nPress Cancel to stop"
                 ):
-                    signature = SignatureMaker().make_signature(ea, config)
+                    signature = SignatureMaker().make_signature(
+                        ea, config, policy=policy
+                    )
                 signature.display(config)
             elif action == Action.FIND_XREF:
                 ea = idaapi.get_screen_ea()

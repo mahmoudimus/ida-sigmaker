@@ -638,6 +638,34 @@ class Action(enum.IntEnum):
     SEARCH = 3
 
 
+class GenerationStatus(enum.Enum):
+    """How a GeneratedSignature should be interpreted."""
+
+    UNIQUE = "unique"
+    PARTIAL_ON_CANCEL = "partial_on_cancel"
+
+
+@dataclasses.dataclass(frozen=True)
+class GenerationPolicy:
+    """Behavioral knobs passed into generator strategies.
+
+    Callers pick the policy that matches their tolerance for non-unique
+    signatures. The default is strict (legacy behavior: cancel raises).
+    """
+
+    return_partial_on_cancel: bool = False
+
+    @classmethod
+    def strict(cls) -> "GenerationPolicy":
+        """Cancel raises UserCanceledError (legacy behavior)."""
+        return cls(return_partial_on_cancel=False)
+
+    @classmethod
+    def permissive(cls) -> "GenerationPolicy":
+        """Cancel returns a partial GeneratedSignature instead of raising."""
+        return cls(return_partial_on_cancel=True)
+
+
 class SignatureByte(typing.NamedTuple):
     """Container representing a single byte in a signature.
 

@@ -2192,6 +2192,33 @@ class TestActionEnum(CoveredUnitTest):
         self.assertTrue(issubclass(sigmaker.Action, _enum.IntEnum))
 
 
+class TestGenerationStatusAndPolicy(CoveredUnitTest):
+    """GenerationStatus and GenerationPolicy classmethods give callers a clean opt-in switch."""
+
+    def test_generation_status_members(self):
+        import enum as _enum
+
+        self.assertTrue(issubclass(sigmaker.GenerationStatus, _enum.Enum))
+        self.assertEqual(sigmaker.GenerationStatus.UNIQUE.value, "unique")
+        self.assertEqual(sigmaker.GenerationStatus.PARTIAL_ON_CANCEL.value, "partial_on_cancel")
+
+    def test_generation_policy_strict_default(self):
+        policy = sigmaker.GenerationPolicy.strict()
+        self.assertFalse(policy.return_partial_on_cancel)
+
+    def test_generation_policy_permissive(self):
+        policy = sigmaker.GenerationPolicy.permissive()
+        self.assertTrue(policy.return_partial_on_cancel)
+
+    def test_generation_policy_default_constructor_matches_strict(self):
+        # A bare GenerationPolicy() must equal GenerationPolicy.strict() so the
+        # default kwarg in generate() preserves the existing contract.
+        self.assertEqual(
+            sigmaker.GenerationPolicy(),
+            sigmaker.GenerationPolicy.strict(),
+        )
+
+
 class TestSignatureSearcherCountMatches(CoveredUnitTest):
     """count_matches returns the cardinality of find_all; is_unique stays True only at 1."""
 

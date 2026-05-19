@@ -1831,8 +1831,13 @@ class SignatureSearcher:
         return out
 
     @classmethod
+    def count_matches(cls, ida_signature: str) -> int:
+        """Return the number of matches for the given IDA-format signature."""
+        return len(cls.find_all(ida_signature))
+
+    @classmethod
     def is_unique(cls, ida_signature: str) -> bool:
-        return len(cls.find_all(ida_signature)) == 1
+        return cls.count_matches(ida_signature) == 1
 
 
 # no cover: start

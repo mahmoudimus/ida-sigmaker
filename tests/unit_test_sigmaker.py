@@ -2192,6 +2192,29 @@ class TestActionEnum(CoveredUnitTest):
         self.assertTrue(issubclass(sigmaker.Action, _enum.IntEnum))
 
 
+class TestSignatureSearcherCountMatches(CoveredUnitTest):
+    """count_matches returns the cardinality of find_all; is_unique stays True only at 1."""
+
+    def test_count_matches_returns_len_of_find_all(self):
+        fake_matches = [sigmaker.Match(0x1000), sigmaker.Match(0x2000), sigmaker.Match(0x3000)]
+        with patch.object(sigmaker.SignatureSearcher, "find_all", return_value=fake_matches):
+            count = sigmaker.SignatureSearcher.count_matches("E8 ?? ?? ?? ??")
+        self.assertEqual(count, 3)
+
+    def test_count_matches_zero_when_no_hits(self):
+        with patch.object(sigmaker.SignatureSearcher, "find_all", return_value=[]):
+            count = sigmaker.SignatureSearcher.count_matches("DE AD BE EF")
+        self.assertEqual(count, 0)
+
+    def test_is_unique_true_only_at_one(self):
+        with patch.object(sigmaker.SignatureSearcher, "find_all", return_value=[sigmaker.Match(0x1000)]):
+            self.assertTrue(sigmaker.SignatureSearcher.is_unique("xx"))
+        with patch.object(sigmaker.SignatureSearcher, "find_all", return_value=[]):
+            self.assertFalse(sigmaker.SignatureSearcher.is_unique("xx"))
+        with patch.object(sigmaker.SignatureSearcher, "find_all", return_value=[sigmaker.Match(1), sigmaker.Match(2)]):
+            self.assertFalse(sigmaker.SignatureSearcher.is_unique("xx"))
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

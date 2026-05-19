@@ -1905,12 +1905,20 @@ class TestProgressReporter(CoveredUnitTest):
         """Set up test fixtures."""
         # Store the original ask_yn function
         self.original_ask_yn = getattr(sigmaker.idaapi, "ask_yn", MagicMock())
+        # Without this, sigmaker.idaapi_user_canceled (bound from a MagicMock
+        # at import time) returns a truthy MagicMock instance and the new
+        # wait-box-cancel poll inside should_cancel() fires on every call.
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
         # Ensure BADADDR is set to a real integer
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
 
     def tearDown(self):
         """Restore original functions."""
         sigmaker.idaapi.ask_yn = self.original_ask_yn
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
 
     def test_check_continue_prompt_basic(self):
         """Test basic CheckContinuePrompt functionality."""
@@ -1949,6 +1957,32 @@ class TestProgressReporter(CoveredUnitTest):
         self.assertEqual(prompt._dynamic_metadata["dynamic_key"], "dynamic_value")
         self.assertEqual(prompt._dynamic_metadata["count"], 42)
         self.assertEqual(prompt._progress_message, "Processing...")
+
+    def test_should_cancel_polls_idaapi_user_canceled(self):
+        """Even with prompts disabled, the wait-box Cancel must propagate."""
+        original = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        try:
+            sigmaker.idaapi_user_canceled = MagicMock(return_value=True)
+            prompt = sigmaker.CheckContinuePrompt(enable_prompt=False)
+            self.assertTrue(prompt.should_cancel())
+            # And once flagged, it stays canceled even if the wait-box flag clears.
+            sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+            self.assertTrue(prompt.should_cancel())
+        finally:
+            sigmaker.idaapi_user_canceled = original
+
+    def test_should_cancel_returns_false_when_no_cancel(self):
+        original = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        try:
+            sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+            prompt = sigmaker.CheckContinuePrompt(enable_prompt=False)
+            self.assertFalse(prompt.should_cancel())
+        finally:
+            sigmaker.idaapi_user_canceled = original
 
     # Note: Integration tests for UniqueSignatureGenerator and RangeSignatureGenerator
     # with progress reporters are complex due to mocking requirements. The core functionality
@@ -2098,6 +2132,64 @@ class TestSearchCancellation(CoveredUnitTest):
         finally:
             # Restore SIMD setting
             sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+
+
+class TestSigMakerConfigDefaults(CoveredUnitTest):
+    """Defaults must give the wait-box-cancel UX out of the box (issue #18)."""
+
+    def test_default_disables_continue_prompt(self):
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+        self.assertFalse(cfg.enable_continue_prompt)
+        self.assertEqual(cfg.prompt_interval, -1)
+
+
+class TestInstructionWalkerCancellation(CoveredUnitTest):
+    """User-cancellation inside InstructionWalker must raise UserCanceledError, not StopIteration."""
+
+    def setUp(self):
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.decode_insn = MagicMock(return_value=1)
+
+    def tearDown(self):
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
+
+    def test_walker_raises_user_canceled_error_on_cancel(self):
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=True)
+        walker = sigmaker.InstructionWalker(start_ea=0x1000, end_ea=0x2000)
+        with self.assertRaises(sigmaker.UserCanceledError):
+            next(iter(walker))
+
+    def test_walker_does_not_raise_when_not_canceled(self):
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        walker = sigmaker.InstructionWalker(start_ea=0x1000, end_ea=0x2000)
+        ea, ins, ins_len = next(iter(walker))
+        self.assertEqual(ea, 0x1000)
+        self.assertEqual(ins_len, 1)
+
+
+class TestActionEnum(CoveredUnitTest):
+    """The Action IntEnum must mirror the SignatureMakerForm.rAction radio order."""
+
+    def test_action_values_match_form_order(self):
+        # Order is locked by SignatureMakerForm.rAction:
+        #   ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature")
+        self.assertEqual(int(sigmaker.Action.CREATE_UNIQUE), 0)
+        self.assertEqual(int(sigmaker.Action.FIND_XREF), 1)
+        self.assertEqual(int(sigmaker.Action.COPY_RANGE), 2)
+        self.assertEqual(int(sigmaker.Action.SEARCH), 3)
+
+    def test_action_is_intenum(self):
+        import enum as _enum
+
+        self.assertTrue(issubclass(sigmaker.Action, _enum.IntEnum))
 
 
 if __name__ == "__main__":

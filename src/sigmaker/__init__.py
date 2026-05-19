@@ -304,6 +304,15 @@ class CheckContinuePrompt:
         if self._user_canceled:
             return True
 
+        # Wait-box cancel: propagate regardless of whether prompts are enabled.
+        if idaapi_user_canceled():
+            self._user_canceled = True
+            if self.logger is not None:
+                self.logger.info(
+                    "Wait-box cancel detected at %.1fs", self.elapsed_time
+                )
+            return True
+
         # Check if it's time to prompt
         if self._should_prompt() and self._timer.should_prompt(self.elapsed_time):
             if self.logger is not None:
@@ -570,12 +579,14 @@ class SigMakerConfig:
     wildcard_operands: bool
     continue_outside_of_function: bool
     wildcard_optimized: bool
-    enable_continue_prompt: bool = True
+    enable_continue_prompt: bool = False
     ask_longer_signature: bool = True
     print_top_x: int = 5
     max_single_signature_length: int = 100
     max_xref_signature_length: int = 250
-    prompt_interval: int = 10  # Seconds before first prompt (default: 10 for testing)
+    # Seconds before first prompt. -1 (or 0) disables the periodic
+    # "Continue?" popup -- the wait-box Cancel button still works.
+    prompt_interval: int = -1
 
 
 @dataclasses.dataclass(slots=True, frozen=True, repr=False)
@@ -611,6 +622,20 @@ class SignatureType(enum.Enum):
     def at(cls, index: int) -> "SignatureType":
         """Return the enum member at a given index (definition order)."""
         return list(cls.__members__.values())[index]
+
+
+class Action(enum.IntEnum):
+    """User-selectable action in SignatureMakerForm.
+
+    Values are bound to the rAction radio-group order:
+    ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature").
+    Changing values requires updating the radio group too.
+    """
+
+    CREATE_UNIQUE = 0
+    FIND_XREF = 1
+    COPY_RANGE = 2
+    SEARCH = 3
 
 
 class SignatureByte(typing.NamedTuple):
@@ -1238,7 +1263,7 @@ class InstructionWalker:
             raise StopIteration
 
         if idaapi_user_canceled():
-            raise StopIteration("Aborted by user")
+            raise UserCanceledError("Aborted by user during instruction walk")
 
         current_instruction_ea = self.cursor
         ins_len = idaapi.decode_insn(self._instruction, current_instruction_ea)
@@ -2028,12 +2053,14 @@ Options
 <#Print top X shortest signatures when generating xref signatures#Print top X XREF signatures     :{opt1}>
 <#Stop after reaching X bytes when generating a single signature#Maximum single signature length :{opt2}>
 <#Stop after reaching X bytes when generating xref signatures#Maximum xref signature length   :{opt3}>
+<#Seconds before the first 'Continue?' prompt fires. -1 disables the prompt entirely (default).#Prompt interval (seconds, -1 disables):{opt4}>
 """
 
         self.controls = {
             "opt1": F.NumericInput(tp=F.FT_DEC),
             "opt2": F.NumericInput(tp=F.FT_DEC),
             "opt3": F.NumericInput(tp=F.FT_DEC),
+            "opt4": F.NumericInput(tp=F.FT_DEC),
         }
         super().__init__(form_text, self.controls)
 
@@ -2044,6 +2071,7 @@ Options
         self.controls["opt1"].value = SigMakerConfig.print_top_x
         self.controls["opt2"].value = SigMakerConfig.max_single_signature_length
         self.controls["opt3"].value = SigMakerConfig.max_xref_signature_length
+        self.controls["opt4"].value = SigMakerConfig.prompt_interval
 
         result = self.Execute()
         if result != 1:
@@ -2053,6 +2081,7 @@ Options
         SigMakerConfig.print_top_x = self.controls["opt1"].value
         SigMakerConfig.max_single_signature_length = self.controls["opt2"].value
         SigMakerConfig.max_xref_signature_length = self.controls["opt3"].value
+        SigMakerConfig.prompt_interval = self.controls["opt4"].value
         self.Free()
         return result
 
@@ -2085,7 +2114,7 @@ Quick Options:
 <#Enable wildcarding for operands, to improve stability of created signatures#Wildcards for operands:{cWildcardOperands}>
 <#Don't stop signature generation when reaching end of function#Continue when leaving function scope:{cContinueOutside}>
 <#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>
-<#Show periodic continue prompts while generating signatures#Enable continue prompt:{cEnablePrompt}>{cGroupOptions}>
+<#Opt-in -- show periodic 'Continue?' prompts while generating. Default is a wait-box with a Cancel button.#Enable continue prompt (opt-in):{cEnablePrompt}>{cGroupOptions}>
 
 <Operand types...:{bOperandTypes}><Other options...:{bOtherOptions}>
 """
@@ -2101,7 +2130,9 @@ Quick Options:
             ),
             "cGroupOptions": idaapi.Form.ChkGroupControl(
                 ("cWildcardOperands", "cContinueOutside", "cWildcardOptimized", "cEnablePrompt"),
-                value=13,  # Bits: 1 (wildcards) + 4 (wildcard optimized) + 8 (enable prompt)
+                # Bits: 1 (wildcards) + 4 (wildcard optimized). Bit 8 (enable
+                # prompt) defaults OFF; the wait-box Cancel handles long runs.
+                value=5,
             ),
             "bOperandTypes": F.ButtonInput(self.ConfigureOperandWildcardBitmask),
             "bOtherOptions": F.ButtonInput(self.ConfigureOptions),
@@ -2235,7 +2266,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             if not ok:
                 return
 
-            action = form.rAction.value  # type: ignore
+            action = Action(int(form.rAction.value))  # type: ignore
             output_format = form.rOutputFormat.value  # type: ignore
             wildcard_operands = bool(form.cGroupOptions.value & 1)  # type: ignore
             continue_outside_of_function = bool(form.cGroupOptions.value & 2)  # type: ignore
@@ -2252,22 +2283,30 @@ class SigMakerPlugin(idaapi.plugin_t):
         )
 
         try:
-            if action == 0:
+            if action == Action.CREATE_UNIQUE:
                 ea = idaapi.get_screen_ea()
-                signature = SignatureMaker().make_signature(ea, config)
+                with ProgressDialog(
+                    "Generating signature...\n\nPress Cancel to stop"
+                ):
+                    signature = SignatureMaker().make_signature(ea, config)
                 signature.display(config)
-            elif action == 1:
+            elif action == Action.FIND_XREF:
                 ea = idaapi.get_screen_ea()
                 signatures = XrefFinder().find_xrefs(ea, config)
                 signatures.display(cfg=config)
-            elif action == 2:
+            elif action == Action.COPY_RANGE:
                 start, end = self.get_selected_addresses(idaapi.get_current_viewer())
                 if start and end:
-                    signature = SignatureMaker().make_signature(start, config, end=end)
+                    with ProgressDialog(
+                        "Generating range signature...\n\nPress Cancel to stop"
+                    ):
+                        signature = SignatureMaker().make_signature(
+                            start, config, end=end
+                        )
                     signature.display(config)
                 else:
                     idaapi.msg("Select a range to copy the code!\n")
-            elif action == 3:
+            elif action == Action.SEARCH:
                 input_signature = idaapi.ask_str(
                     "", idaapi.HIST_SRCH, "Enter a signature"
                 )

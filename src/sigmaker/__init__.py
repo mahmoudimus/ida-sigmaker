@@ -579,12 +579,14 @@ class SigMakerConfig:
     wildcard_operands: bool
     continue_outside_of_function: bool
     wildcard_optimized: bool
-    enable_continue_prompt: bool = True
+    enable_continue_prompt: bool = False
     ask_longer_signature: bool = True
     print_top_x: int = 5
     max_single_signature_length: int = 100
     max_xref_signature_length: int = 250
-    prompt_interval: int = 10  # Seconds before first prompt (default: 10 for testing)
+    # Seconds before first prompt. -1 (or 0) disables the periodic
+    # "Continue?" popup -- the wait-box Cancel button still works.
+    prompt_interval: int = -1
 
 
 @dataclasses.dataclass(slots=True, frozen=True, repr=False)

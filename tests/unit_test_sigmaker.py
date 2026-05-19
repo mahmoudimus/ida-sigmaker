@@ -2134,6 +2134,20 @@ class TestSearchCancellation(CoveredUnitTest):
             sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
 
 
+class TestSigMakerConfigDefaults(CoveredUnitTest):
+    """Defaults must give the wait-box-cancel UX out of the box (issue #18)."""
+
+    def test_default_disables_continue_prompt(self):
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+        self.assertFalse(cfg.enable_continue_prompt)
+        self.assertEqual(cfg.prompt_interval, -1)
+
+
 class TestInstructionWalkerCancellation(CoveredUnitTest):
     """User-cancellation inside InstructionWalker must raise UserCanceledError, not StopIteration."""
 

@@ -1905,12 +1905,20 @@ class TestProgressReporter(CoveredUnitTest):
         """Set up test fixtures."""
         # Store the original ask_yn function
         self.original_ask_yn = getattr(sigmaker.idaapi, "ask_yn", MagicMock())
+        # Without this, sigmaker.idaapi_user_canceled (bound from a MagicMock
+        # at import time) returns a truthy MagicMock instance and the new
+        # wait-box-cancel poll inside should_cancel() fires on every call.
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
         # Ensure BADADDR is set to a real integer
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
 
     def tearDown(self):
         """Restore original functions."""
         sigmaker.idaapi.ask_yn = self.original_ask_yn
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
 
     def test_check_continue_prompt_basic(self):
         """Test basic CheckContinuePrompt functionality."""
@@ -1949,6 +1957,32 @@ class TestProgressReporter(CoveredUnitTest):
         self.assertEqual(prompt._dynamic_metadata["dynamic_key"], "dynamic_value")
         self.assertEqual(prompt._dynamic_metadata["count"], 42)
         self.assertEqual(prompt._progress_message, "Processing...")
+
+    def test_should_cancel_polls_idaapi_user_canceled(self):
+        """Even with prompts disabled, the wait-box Cancel must propagate."""
+        original = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        try:
+            sigmaker.idaapi_user_canceled = MagicMock(return_value=True)
+            prompt = sigmaker.CheckContinuePrompt(enable_prompt=False)
+            self.assertTrue(prompt.should_cancel())
+            # And once flagged, it stays canceled even if the wait-box flag clears.
+            sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+            self.assertTrue(prompt.should_cancel())
+        finally:
+            sigmaker.idaapi_user_canceled = original
+
+    def test_should_cancel_returns_false_when_no_cancel(self):
+        original = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        try:
+            sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+            prompt = sigmaker.CheckContinuePrompt(enable_prompt=False)
+            self.assertFalse(prompt.should_cancel())
+        finally:
+            sigmaker.idaapi_user_canceled = original
 
     # Note: Integration tests for UniqueSignatureGenerator and RangeSignatureGenerator
     # with progress reporters are complex due to mocking requirements. The core functionality

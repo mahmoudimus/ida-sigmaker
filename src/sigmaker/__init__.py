@@ -304,6 +304,15 @@ class CheckContinuePrompt:
         if self._user_canceled:
             return True
 
+        # Wait-box cancel: propagate regardless of whether prompts are enabled.
+        if idaapi_user_canceled():
+            self._user_canceled = True
+            if self.logger is not None:
+                self.logger.info(
+                    "Wait-box cancel detected at %.1fs", self.elapsed_time
+                )
+            return True
+
         # Check if it's time to prompt
         if self._should_prompt() and self._timer.should_prompt(self.elapsed_time):
             if self.logger is not None:

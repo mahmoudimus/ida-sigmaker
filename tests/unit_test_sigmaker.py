@@ -2147,6 +2147,15 @@ class TestSigMakerConfigDefaults(CoveredUnitTest):
         self.assertFalse(cfg.enable_continue_prompt)
         self.assertEqual(cfg.prompt_interval, -1)
 
+    def test_default_output_partial_on_cancel_is_false(self):
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+        self.assertFalse(cfg.output_partial_on_cancel)
+
 
 class TestInstructionWalkerCancellation(CoveredUnitTest):
     """User-cancellation inside InstructionWalker must raise UserCanceledError, not StopIteration."""

@@ -587,6 +587,9 @@ class SigMakerConfig:
     # Seconds before first prompt. -1 (or 0) disables the periodic
     # "Continue?" popup -- the wait-box Cancel button still works.
     prompt_interval: int = -1
+    # Issue #22: when True, cancelling a unique-signature search emits the
+    # partial signature with its match count instead of nothing. Default off.
+    output_partial_on_cancel: bool = False
 
 
 @dataclasses.dataclass(slots=True, frozen=True, repr=False)

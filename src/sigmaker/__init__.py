@@ -1252,7 +1252,7 @@ class InstructionWalker:
             raise StopIteration
 
         if idaapi_user_canceled():
-            raise StopIteration("Aborted by user")
+            raise UserCanceledError("Aborted by user during instruction walk")
 
         current_instruction_ea = self.cursor
         ins_len = idaapi.decode_insn(self._instruction, current_instruction_ea)

@@ -2100,6 +2100,33 @@ class TestSearchCancellation(CoveredUnitTest):
             sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
 
 
+class TestInstructionWalkerCancellation(CoveredUnitTest):
+    """User-cancellation inside InstructionWalker must raise UserCanceledError, not StopIteration."""
+
+    def setUp(self):
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.decode_insn = MagicMock(return_value=1)
+
+    def tearDown(self):
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
+
+    def test_walker_raises_user_canceled_error_on_cancel(self):
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=True)
+        walker = sigmaker.InstructionWalker(start_ea=0x1000, end_ea=0x2000)
+        with self.assertRaises(sigmaker.UserCanceledError):
+            next(iter(walker))
+
+    def test_walker_does_not_raise_when_not_canceled(self):
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        walker = sigmaker.InstructionWalker(start_ea=0x1000, end_ea=0x2000)
+        ea, ins, ins_len = next(iter(walker))
+        self.assertEqual(ea, 0x1000)
+        self.assertEqual(ins_len, 1)
+
+
 class TestActionEnum(CoveredUnitTest):
     """The Action IntEnum must mirror the SignatureMakerForm.rAction radio order."""
 

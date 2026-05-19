@@ -897,7 +897,14 @@ class WildcardPolicy:
     # construction helpers
     @classmethod
     def for_x86(cls) -> "WildcardPolicy":
-        return cls(frozenset(cls.BaseKind) | frozenset(cls.X86Kind))
+        # Exclude BaseKind.IMM. An immediate like the 0x13371338 in
+        # `mov rcx, 0x13371338` is a literal value baked into the
+        # instruction encoding; it does not shift between binary builds,
+        # so wildcarding it only removes bytes that would have made the
+        # signature unique. MEM/FAR/NEAR still get wildcarded because
+        # those operands DO encode addresses that move between builds.
+        x86_base = frozenset(cls.BaseKind) - {cls.BaseKind.IMM}
+        return cls(x86_base | frozenset(cls.X86Kind))
 
     @classmethod
     def for_arm(cls) -> "WildcardPolicy":

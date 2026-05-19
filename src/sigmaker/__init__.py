@@ -2227,7 +2227,8 @@ Select action:
 <#Select an address, and create a code signature for it#Create unique signature for current code address:{rCreateUniqueSig}>
 <#Select an address or variable, and create code signatures for its references. Will output the shortest 5 signatures#Find shortest XREF signature for current data or code address:{rFindXRefSig}>
 <#Select 1+ instructions, and copy the bytes using the specified output format#Copy selected code:{rCopyCode}>
-<#Paste any string containing your signature/mask and find matches#Search for a signature:{rSearchSignature}>{rAction}>
+<#Paste any string containing your signature/mask and find matches#Search for a signature:{rSearchSignature}>
+<#Find the shortest unique signature anywhere inside the current function, with automatic xref fallback if the function body is not unique#Find shortest unique signature for current function:{rFindFunctionSig}>{rAction}>
 
 Output format:
 <#Example - E8 ? ? ? ? 45 33 F6 66 44 89 34 33#IDA Signature:{rIDASig}>
@@ -2248,7 +2249,13 @@ Quick Options:
             "cVersion": F.StringLabel(PLUGIN_VERSION),
             "FormChangeCb": F.FormChangeCb(self.OnFormChange),
             "rAction": F.RadGroupControl(
-                ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature")
+                (
+                    "rCreateUniqueSig",
+                    "rFindXRefSig",
+                    "rCopyCode",
+                    "rSearchSignature",
+                    "rFindFunctionSig",
+                )
             ),
             "rOutputFormat": F.RadGroupControl(
                 ("rIDASig", "rx64DbgSig", "rByteArrayMaskSig", "rRawBytesBitmaskSig")
@@ -2441,6 +2448,8 @@ class SigMakerPlugin(idaapi.plugin_t):
                     results.display()
                 else:
                     idaapi.msg("No signature entered!\n")
+            elif action == Action.FIND_FUNCTION_SIG:
+                self._run_find_function_sig(config)
             else:
                 idaapi.msg("Invalid action!\n")
         except Unexpected as e:
@@ -2451,6 +2460,53 @@ class SigMakerPlugin(idaapi.plugin_t):
         except Exception as e:
             LOGGER.error("Exception occurred: %s%s%s", e, os.linesep, traceback.format_exc())
             return
+
+    def _run_find_function_sig(self, config: SigMakerConfig) -> None:
+        """Action.FIND_FUNCTION_SIG: shortest unique sig within the function,
+        falling back to xref signatures if the function body is not unique."""
+        ea = idaapi.get_screen_ea()
+        pfn = idaapi.get_func(ea)
+        if pfn is None:
+            idaapi.msg("Place cursor inside a function first.\n")
+            return
+
+        try:
+            with ProgressDialog(
+                "Finding shortest function signature...\n\nPress Cancel to stop"
+            ):
+                generator = MinimalFunctionSignatureGenerator(
+                    InstructionProcessor(OperandProcessor())
+                )
+                result = generator.generate(pfn, config)
+            offset = int(result.address) - int(pfn.start_ea)
+            idaapi.msg(
+                f"Function signature (offset +{hex(offset)} into function "
+                f"{hex(pfn.start_ea)}):\n"
+            )
+            result.display(config)
+            return
+        except Unexpected:
+            idaapi.msg(
+                f"No unique signature inside function "
+                f"{hex(pfn.start_ea)}; trying xref signatures...\n"
+            )
+
+        with ProgressDialog(
+            "Falling back to xref signatures...\n\nPress Cancel to stop"
+        ):
+            xref_result = XrefFinder().find_xrefs(pfn.start_ea, config)
+
+        if xref_result.signatures:
+            best = xref_result.signatures[0]
+            idaapi.msg(
+                f"Xref signature into {hex(pfn.start_ea)} (from {best.address}):\n"
+            )
+            best.display(config)
+        else:
+            idaapi.msg(
+                f"No unique signature found for function {hex(pfn.start_ea)} "
+                f"(no unique sig within body and no usable xrefs)\n"
+            )
 
     def term(self) -> None:
         self._deregister_actions()

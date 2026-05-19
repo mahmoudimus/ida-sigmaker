@@ -2114,7 +2114,7 @@ Quick Options:
 <#Enable wildcarding for operands, to improve stability of created signatures#Wildcards for operands:{cWildcardOperands}>
 <#Don't stop signature generation when reaching end of function#Continue when leaving function scope:{cContinueOutside}>
 <#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>
-<#Opt-in: show periodic 'Continue?' prompts while generating. Default is a wait-box with a Cancel button.#Enable continue prompt (opt-in):{cEnablePrompt}>{cGroupOptions}>
+<#Opt-in -- show periodic 'Continue?' prompts while generating. Default is a wait-box with a Cancel button.#Enable continue prompt (opt-in):{cEnablePrompt}>{cGroupOptions}>
 
 <Operand types...:{bOperandTypes}><Other options...:{bOtherOptions}>
 """

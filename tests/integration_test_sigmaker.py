@@ -423,6 +423,55 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
         except sigmaker.Unexpected as e:
             self.skipTest(f"Could not generate range signature: {e}")
 
+    def test_wildcard_operands_preserves_x86_immediates(self):
+        """An immediate like the 0xB883480000001528 in `mov rax, ...` must
+        survive the wildcard_operands=True path. Before the
+        WildcardPolicy.for_x86 fix, the 8 immediate bytes were blanked to
+        ``?? ?? ?? ?? ?? ?? ?? ??``; after the fix, they stay concrete and
+        make the signature unique.
+        """
+        # `mov rax, 0xB883480000001528` encodes as
+        # `48 B8 28 15 00 00 00 48 83 B8` (REX.W + B8 opcode + 8-byte LE imm).
+        mov_rax_bytes = "48 B8 28 15 00 00 00 48 83 B8"
+        exact_hits = sigmaker.SignatureSearcher.from_signature(mov_rax_bytes).search()
+        self.assertEqual(
+            len(exact_hits.matches),
+            1,
+            f"Test binary should have exactly one match for {mov_rax_bytes!r}, "
+            f"got {len(exact_hits.matches)}",
+        )
+        anchor_ea = exact_hits.matches[0]
+
+        gen_ctx = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=True,
+            continue_outside_of_function=False,
+            wildcard_optimized=True,
+            max_single_signature_length=64,
+            ask_longer_signature=False,
+        )
+        result = sigmaker.SignatureMaker().make_signature(anchor_ea, gen_ctx)
+        self.assertIsInstance(result.signature, sigmaker.Signature)
+
+        # The signature SHOULD include the literal immediate bytes 0x28 and
+        # 0x15 (the low two bytes of the 64-bit immediate). Before the fix
+        # they would have been wildcards.
+        non_wildcard_values = [
+            b.value for b in result.signature if not b.is_wildcard
+        ]
+        self.assertIn(
+            0x28,
+            non_wildcard_values,
+            "Low byte of the immediate (0x28) should survive as a concrete "
+            "byte, not be wildcarded.",
+        )
+        self.assertIn(
+            0x15,
+            non_wildcard_values,
+            "Second byte of the immediate (0x15) should survive as a "
+            "concrete byte, not be wildcarded.",
+        )
+
     def test_minimal_function_signature_against_real_function(self):
         """MinimalFunctionSignatureGenerator returns a unique signature
         inside the chosen function in the test binary."""

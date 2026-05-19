@@ -1003,14 +1003,37 @@ class GeneratedSignature:
 
     signature: Signature
     address: Match | None = None
+    status: GenerationStatus = GenerationStatus.UNIQUE
+    match_count: int | None = None
 
     def display(self, cfg: SigMakerConfig) -> None:
-        """Display the signature result to the user."""
+        """Display the signature result to the user.
+
+        UNIQUE: prints the formatted signature and copies to the clipboard.
+        PARTIAL_ON_CANCEL: prints the partial with its match count; does NOT
+        touch the clipboard so an accidental cancel cannot clobber the
+        user's clipboard contents.
+        """
         if not self.signature:
             idaapi.msg("Error: Empty signature\n")
             return
         t = cfg.output_format.value
         fmted = format(self.signature, t)
+
+        if self.status == GenerationStatus.PARTIAL_ON_CANCEL:
+            count_str = (
+                f"{self.match_count} matches"
+                if self.match_count is not None
+                else "match count unavailable"
+            )
+            prefix = (
+                f"Partial signature (NOT unique, {count_str}) for {self.address}"
+                if self.address is not None
+                else f"Partial signature (NOT unique, {count_str})"
+            )
+            idaapi.msg(f"{prefix}: {fmted}\n")
+            return
+
         if self.address is not None:
             idaapi.msg(f"Signature for {self.address}: {fmted}\n")
         else:

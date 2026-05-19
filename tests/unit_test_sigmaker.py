@@ -2192,6 +2192,78 @@ class TestActionEnum(CoveredUnitTest):
         self.assertTrue(issubclass(sigmaker.Action, _enum.IntEnum))
 
 
+class TestGeneratedSignatureDisplay(CoveredUnitTest):
+    """display() branches on status and respects the no-clipboard rule for partials."""
+
+    def setUp(self):
+        self.cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+        self.original_msg = sigmaker.idaapi.msg
+        self.msg_calls: list[str] = []
+        sigmaker.idaapi.msg = lambda s: self.msg_calls.append(s)
+
+    def tearDown(self):
+        sigmaker.idaapi.msg = self.original_msg
+
+    def _make_sig(self, n_bytes: int = 4) -> sigmaker.Signature:
+        sig = sigmaker.Signature()
+        for i in range(n_bytes):
+            sig.append(sigmaker.SignatureByte(0xE8 + i, False))
+        return sig
+
+    def test_unique_display_writes_clipboard(self):
+        sig = self._make_sig()
+        result = sigmaker.GeneratedSignature(sig, sigmaker.Match(0x1000))
+        with patch.object(sigmaker.Clipboard, "set_text", return_value=True) as set_text:
+            result.display(self.cfg)
+        set_text.assert_called_once()
+        self.assertTrue(any("Signature for" in m for m in self.msg_calls))
+
+    def test_partial_display_does_not_write_clipboard(self):
+        sig = self._make_sig()
+        result = sigmaker.GeneratedSignature(
+            sig,
+            sigmaker.Match(0x1000),
+            status=sigmaker.GenerationStatus.PARTIAL_ON_CANCEL,
+            match_count=47,
+        )
+        with patch.object(sigmaker.Clipboard, "set_text", return_value=True) as set_text:
+            result.display(self.cfg)
+        set_text.assert_not_called()
+
+    def test_partial_display_includes_match_count_in_message(self):
+        sig = self._make_sig()
+        result = sigmaker.GeneratedSignature(
+            sig,
+            sigmaker.Match(0x140001234),
+            status=sigmaker.GenerationStatus.PARTIAL_ON_CANCEL,
+            match_count=47,
+        )
+        with patch.object(sigmaker.Clipboard, "set_text", return_value=True):
+            result.display(self.cfg)
+        combined = "".join(self.msg_calls)
+        self.assertIn("NOT unique", combined)
+        self.assertIn("47", combined)
+        self.assertIn("Partial", combined)
+
+    def test_partial_display_does_not_recompute_match_count(self):
+        sig = self._make_sig()
+        result = sigmaker.GeneratedSignature(
+            sig,
+            sigmaker.Match(0x1000),
+            status=sigmaker.GenerationStatus.PARTIAL_ON_CANCEL,
+            match_count=3,
+        )
+        with patch.object(sigmaker.SignatureSearcher, "find_all") as fa, \
+                patch.object(sigmaker.Clipboard, "set_text", return_value=True):
+            result.display(self.cfg)
+        fa.assert_not_called()
+
+
 class TestGenerationStatusAndPolicy(CoveredUnitTest):
     """GenerationStatus and GenerationPolicy classmethods give callers a clean opt-in switch."""
 

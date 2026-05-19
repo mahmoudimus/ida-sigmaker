@@ -2053,12 +2053,14 @@ Options
 <#Print top X shortest signatures when generating xref signatures#Print top X XREF signatures     :{opt1}>
 <#Stop after reaching X bytes when generating a single signature#Maximum single signature length :{opt2}>
 <#Stop after reaching X bytes when generating xref signatures#Maximum xref signature length   :{opt3}>
+<#Seconds before the first 'Continue?' prompt fires. -1 disables the prompt entirely (default).#Prompt interval (seconds, -1 disables):{opt4}>
 """
 
         self.controls = {
             "opt1": F.NumericInput(tp=F.FT_DEC),
             "opt2": F.NumericInput(tp=F.FT_DEC),
             "opt3": F.NumericInput(tp=F.FT_DEC),
+            "opt4": F.NumericInput(tp=F.FT_DEC),
         }
         super().__init__(form_text, self.controls)
 
@@ -2069,6 +2071,7 @@ Options
         self.controls["opt1"].value = SigMakerConfig.print_top_x
         self.controls["opt2"].value = SigMakerConfig.max_single_signature_length
         self.controls["opt3"].value = SigMakerConfig.max_xref_signature_length
+        self.controls["opt4"].value = SigMakerConfig.prompt_interval
 
         result = self.Execute()
         if result != 1:
@@ -2078,6 +2081,7 @@ Options
         SigMakerConfig.print_top_x = self.controls["opt1"].value
         SigMakerConfig.max_single_signature_length = self.controls["opt2"].value
         SigMakerConfig.max_xref_signature_length = self.controls["opt3"].value
+        SigMakerConfig.prompt_interval = self.controls["opt4"].value
         self.Free()
         return result
 

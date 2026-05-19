@@ -423,6 +423,49 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
         except sigmaker.Unexpected as e:
             self.skipTest(f"Could not generate range signature: {e}")
 
+    def test_minimal_function_signature_against_real_function(self):
+        """MinimalFunctionSignatureGenerator returns a unique signature
+        inside the chosen function in the test binary."""
+        start_ea = self.get_code_address()
+        self.assertIsNotNone(start_ea, "Should find at least one code address")
+
+        pfn = idaapi.get_func(start_ea)
+        if pfn is None:
+            self.skipTest("Chosen code address is not inside a function")
+
+        ctx = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+            ask_longer_signature=False,
+            max_single_signature_length=128,
+        )
+
+        try:
+            generator = sigmaker.MinimalFunctionSignatureGenerator(
+                sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+            )
+            result = generator.generate(pfn, ctx)
+        except sigmaker.Unexpected as e:
+            self.skipTest(f"No unique sig within function: {e}")
+
+        self.assertIsInstance(result, sigmaker.GeneratedSignature)
+        self.assertGreaterEqual(
+            len(result.signature),
+            sigmaker.MinimalFunctionSignatureGenerator.MIN_USEFUL_SIG_BYTES,
+        )
+
+        ida_text = f"{result.signature:ida}"
+        matches = sigmaker.SignatureSearcher.find_all(ida_text)
+        self.assertEqual(
+            len(matches), 1, f"Expected exactly one match for {ida_text}"
+        )
+
+        match_ea = int(matches[0])
+        self.assertGreaterEqual(match_ea, pfn.start_ea)
+        self.assertLess(match_ea, pfn.end_ea)
+
     def test_generate_signature_error_handling(self):
         signature_maker = sigmaker.SignatureMaker()
 

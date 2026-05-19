@@ -2192,6 +2192,19 @@ class TestActionEnum(CoveredUnitTest):
         self.assertTrue(issubclass(sigmaker.Action, _enum.IntEnum))
 
 
+class TestActionEnumAddsFunctionSig(CoveredUnitTest):
+    """The Action IntEnum gains FIND_FUNCTION_SIG=4 for issue #17."""
+
+    def test_find_function_sig_value(self):
+        self.assertEqual(int(sigmaker.Action.FIND_FUNCTION_SIG), 4)
+
+    def test_existing_action_values_unchanged(self):
+        self.assertEqual(int(sigmaker.Action.CREATE_UNIQUE), 0)
+        self.assertEqual(int(sigmaker.Action.FIND_XREF), 1)
+        self.assertEqual(int(sigmaker.Action.COPY_RANGE), 2)
+        self.assertEqual(int(sigmaker.Action.SEARCH), 3)
+
+
 class TestGeneratedSignatureOrdering(CoveredUnitTest):
     """GeneratedSignature.__lt__ ranks by (size, wildcards) ascending."""
 

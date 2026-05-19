@@ -628,7 +628,8 @@ class Action(enum.IntEnum):
     """User-selectable action in SignatureMakerForm.
 
     Values are bound to the rAction radio-group order:
-    ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature").
+    ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature",
+     "rFindFunctionSig").
     Changing values requires updating the radio group too.
     """
 
@@ -636,6 +637,7 @@ class Action(enum.IntEnum):
     FIND_XREF = 1
     COPY_RANGE = 2
     SEARCH = 3
+    FIND_FUNCTION_SIG = 4
 
 
 class SignatureByte(typing.NamedTuple):

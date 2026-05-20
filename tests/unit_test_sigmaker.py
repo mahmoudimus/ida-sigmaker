@@ -2290,6 +2290,58 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
                     0x1000, self._make_cfg(), policy=sigmaker.GenerationPolicy.permissive()
                 )
 
+    def test_permissive_policy_does_not_trust_interrupted_count(self):
+        """count_matches bails early when idaapi_user_canceled() is True
+        during its scan, returning a partial (often 0) count. The generator
+        must NOT record that as last_match_count, otherwise the partial sig
+        prints '0 matches' for a sig that actually matches many places.
+        Bug reported by @OshidaBCF on issue #22 after testing PR #25.
+        """
+        # First two iterations: clean count_matches calls returning 100 and 50.
+        # Third iteration: count_matches returns 0 AND idaapi_user_canceled
+        # has just flipped to True (simulating cancel mid-scan).
+        # Fourth iteration: should_cancel sees the cancel and builds the
+        # partial. We expect match_count=None (since the last count was
+        # interrupted), NOT 0.
+        gen = self._make_generator(cancel_after_iterations=3)
+        counts = iter([100, 50, 0])
+        user_canceled_state = {"value": False}
+
+        def fake_count_matches(_ida_sig):
+            v = next(counts)
+            if v == 0:
+                # Simulate find_all bailing because the user just clicked Cancel.
+                user_canceled_state["value"] = True
+            return v
+
+        def fake_user_canceled():
+            return user_canceled_state["value"]
+
+        original_user_canceled = sigmaker.idaapi_user_canceled
+        sigmaker.idaapi_user_canceled = fake_user_canceled
+        try:
+            with patch.object(
+                sigmaker.SignatureSearcher,
+                "count_matches",
+                side_effect=fake_count_matches,
+            ):
+                result = gen.generate(
+                    0x1000,
+                    self._make_cfg(),
+                    policy=sigmaker.GenerationPolicy.permissive(),
+                )
+        finally:
+            sigmaker.idaapi_user_canceled = original_user_canceled
+
+        self.assertEqual(
+            result.status, sigmaker.GenerationStatus.PARTIAL_ON_CANCEL
+        )
+        self.assertIsNone(
+            result.match_count,
+            "match_count must be None (rendered as 'match count "
+            "unavailable'), not the interrupted count_matches result of 0",
+        )
+
 
 class TestGeneratedSignatureDisplay(CoveredUnitTest):
     """display() branches on status and respects the no-clipboard rule for partials."""

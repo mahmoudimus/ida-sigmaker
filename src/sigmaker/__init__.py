@@ -1439,10 +1439,20 @@ class UniqueSignatureGenerator:
                 bytes_since_last_check += ins_len
 
                 count = SignatureSearcher.count_matches(f"{sig:ida}")
-                last_match_count = count
-                if count == 1:
-                    sig.trim_signature()
-                    return GeneratedSignature(sig, Match(ea))
+                # SignatureSearcher.find_all polls idaapi_user_canceled inside
+                # its scan loop and bails when set, returning whatever partial
+                # count it had so far (often 0). If we just stored that, the
+                # partial-on-cancel path would show "0 matches" for a signature
+                # that actually matches many places. Detect the interruption
+                # and degrade gracefully to "match count unavailable" rather
+                # than reporting a falsely-low count.
+                if idaapi_user_canceled():
+                    last_match_count = None
+                else:
+                    last_match_count = count
+                    if count == 1:
+                        sig.trim_signature()
+                        return GeneratedSignature(sig, Match(ea))
         except UserCanceledError:
             # InstructionWalker raises UserCanceledError on cancel too (issue #18).
             # Honor the policy here as well.

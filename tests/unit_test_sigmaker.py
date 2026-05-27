@@ -2290,19 +2290,23 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
                     0x1000, self._make_cfg(), policy=sigmaker.GenerationPolicy.permissive()
                 )
 
-    def test_permissive_policy_does_not_trust_interrupted_count(self):
+    def test_permissive_policy_preserves_last_good_count_on_interruption(self):
         """count_matches bails early when idaapi_user_canceled() is True
         during its scan, returning a partial (often 0) count. The generator
-        must NOT record that as last_match_count, otherwise the partial sig
-        prints '0 matches' for a sig that actually matches many places.
-        Bug reported by @OshidaBCF on issue #22 after testing PR #25.
+        must not record that as last_match_count -- but it also must not
+        throw away the previous trustworthy count. The partial-on-cancel
+        path should show the last fully-completed iteration's count, which
+        is an upper bound on the actual match count for the (slightly
+        longer) emitted partial signature. Bug reported by @OshidaBCF on
+        issue #22 after testing PR #25.
         """
         # First two iterations: clean count_matches calls returning 100 and 50.
         # Third iteration: count_matches returns 0 AND idaapi_user_canceled
         # has just flipped to True (simulating cancel mid-scan).
         # Fourth iteration: should_cancel sees the cancel and builds the
-        # partial. We expect match_count=None (since the last count was
-        # interrupted), NOT 0.
+        # partial. We expect match_count == 50 (the prior trustworthy
+        # value), NOT 0 (the interrupted bogus value), and NOT None
+        # (which would discard useful information).
         gen = self._make_generator(cancel_after_iterations=3)
         counts = iter([100, 50, 0])
         user_canceled_state = {"value": False}
@@ -2336,10 +2340,51 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
         self.assertEqual(
             result.status, sigmaker.GenerationStatus.PARTIAL_ON_CANCEL
         )
+        self.assertEqual(
+            result.match_count,
+            50,
+            "match_count must preserve the last trustworthy count "
+            "(50 from the prior iteration), not the interrupted "
+            "count_matches result of 0",
+        )
+
+    def test_permissive_policy_match_count_none_when_interrupted_on_first(self):
+        """If the very first count_matches call is interrupted, we have no
+        prior trustworthy count to fall back on, so match_count is None
+        (rendered as 'match count unavailable')."""
+        gen = self._make_generator(cancel_after_iterations=1)
+        user_canceled_state = {"value": False}
+
+        def fake_count_matches(_ida_sig):
+            # First (and only) call returns 0 with cancel flag already set.
+            user_canceled_state["value"] = True
+            return 0
+
+        def fake_user_canceled():
+            return user_canceled_state["value"]
+
+        original_user_canceled = sigmaker.idaapi_user_canceled
+        sigmaker.idaapi_user_canceled = fake_user_canceled
+        try:
+            with patch.object(
+                sigmaker.SignatureSearcher,
+                "count_matches",
+                side_effect=fake_count_matches,
+            ):
+                result = gen.generate(
+                    0x1000,
+                    self._make_cfg(),
+                    policy=sigmaker.GenerationPolicy.permissive(),
+                )
+        finally:
+            sigmaker.idaapi_user_canceled = original_user_canceled
+
+        self.assertEqual(
+            result.status, sigmaker.GenerationStatus.PARTIAL_ON_CANCEL
+        )
         self.assertIsNone(
             result.match_count,
-            "match_count must be None (rendered as 'match count "
-            "unavailable'), not the interrupted count_matches result of 0",
+            "match_count must be None when no prior trustworthy count exists",
         )
 
 

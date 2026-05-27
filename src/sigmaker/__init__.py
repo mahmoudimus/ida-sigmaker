@@ -1441,14 +1441,17 @@ class UniqueSignatureGenerator:
                 count = SignatureSearcher.count_matches(f"{sig:ida}")
                 # SignatureSearcher.find_all polls idaapi_user_canceled inside
                 # its scan loop and bails when set, returning whatever partial
-                # count it had so far (often 0). If we just stored that, the
+                # count it had so far (often 0). If we stored that, the
                 # partial-on-cancel path would show "0 matches" for a signature
-                # that actually matches many places. Detect the interruption
-                # and degrade gracefully to "match count unavailable" rather
-                # than reporting a falsely-low count.
-                if idaapi_user_canceled():
-                    last_match_count = None
-                else:
+                # that actually matches many places.
+                #
+                # When the call was interrupted, keep last_match_count at its
+                # prior trustworthy value (the count from the previous fully
+                # completed iteration). The reported number then corresponds
+                # to a signature one instruction shorter than the partial we
+                # emit, which means it is an UPPER BOUND on the partial's
+                # actual match count -- a useful number, not a meaningless 0.
+                if not idaapi_user_canceled():
                     last_match_count = count
                     if count == 1:
                         sig.trim_signature()

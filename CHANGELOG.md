@@ -2,6 +2,27 @@
 
 All notable user-visible changes to this plugin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.1] - 2026-05-27
+
+### Added
+
+- **New `Find shortest unique signature for current function` action** on the main form. Iterates every instruction in the containing function as a possible start point, growing a signature from each (bounded by function end and by the current best candidate's size), and returns the smallest unique result with the fewest wildcards. Output annotates the address with an offset into the function so you can see exactly where the unique sequence sits. ([#17](https://github.com/mahmoudimus/ida-sigmaker/issues/17), [#26](https://github.com/mahmoudimus/ida-sigmaker/pull/26))
+- **Automatic xref fallback for the new action.** If no unique signature exists anywhere in the function body (e.g., the function is a small thunk identical to many others), the action falls back to generating signatures rooted at each code xref into the function and picks the best. Output reads `Xref signature into 0x... (from 0x...):`. ([#17](https://github.com/mahmoudimus/ida-sigmaker/issues/17), [#26](https://github.com/mahmoudimus/ida-sigmaker/pull/26))
+
+### Changed
+
+- **`WildcardPolicy.for_x86()` no longer wildcards `o_imm` immediates.** An immediate like the `0x13371338` in `mov rcx, 0x13371338` is a literal value baked into the instruction encoding; it does not shift between binary builds, so wildcarding it only removed bytes that would have made the signature unique. Memory addresses (`o_mem`), jump/call targets (`o_far`, `o_near`), and architecture-specific register operands still get wildcarded. This is a strict improvement to every action with `wildcard_operands=True`, including the existing `Create unique signature` and `Find shortest XREF signature` actions. ([#26](https://github.com/mahmoudimus/ida-sigmaker/pull/26))
+- **`GeneratedSignature.__lt__` now ranks by `(size, wildcards)` ascending** instead of just size. Same-length signatures with fewer wildcards rank first. The existing `Find shortest XREF signature` action picks this up for free, picking more specific candidates as the "best" result. ([#26](https://github.com/mahmoudimus/ida-sigmaker/pull/26))
+- **README acknowledgements** clarified to better reflect the historical relationship between this plugin and the broader SigMaker ecosystem.
+
+### Internal
+
+- New `MinimalFunctionSignatureGenerator` class implements the function-wide search with monotonic best-size pruning and an ideal-candidate early exit (size <= 5 bytes and zero wildcards stops the outer loop).
+- New `Action.FIND_FUNCTION_SIG = 4` enum value for the new form action.
+- Integration test coverage exercises both the function-search end to end and the x86 immediate preservation against the compiled test binary.
+
+[1.7.1]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.7.0...v1.7.1
+
 ## [1.7.0] - 2026-05-27
 
 ### Added

@@ -134,7 +134,7 @@ There are also various options that be configured via the `Other options` button
 
 ## Acknowledgements
 
-Thank you to [@A200K](https://github.com/A200K)'s [IDA-Pro-SigMaker](https://github.com/A200K/IDA-Pro-SigMaker) plugin which served as an inspiration and the initial port of this plugin. A special thank you to [@kweatherman](https://github.com/kweatherman)'s [sigmakerex](https://github.com/kweatherman/sigmakerex) for the inspiration behind [@A200K]'s plugin. From [@kweatherman](https://github.com/kweatherman)'s own [README](https://github.com/kweatherman/sigmakerex#credits), there is a long history of SigMaker authors and I would like to also acknowledge my thanks to them:
+Thank you to [@A200K](https://github.com/A200K)'s [IDA-Pro-SigMaker](https://github.com/A200K/IDA-Pro-SigMaker) plugin, which served as inspiration and the basis for the initial port of this plugin. I would also like to acknowledge [@kweatherman](https://github.com/kweatherman)'s [sigmakerex](https://github.com/kweatherman/sigmakerex) as independent prior work within the SigMaker ecosystem. While the initial port did not draw from sigmakerex, members of the community later requested compatibility and feature parity with parts of its functionality (for example, see [issue #17](https://github.com/mahmoudimus/ida-sigmaker/issues/17)). As documented in [sigmakerex's README credits](https://github.com/kweatherman/sigmakerex#credits), there is a long history of SigMaker authors and contributors, and I would like to thank and acknowledge them as well:
 
 > thanks to the previous creators of the original SigMaker tool back from the gamedeception.net days up to the current C/C++ and Python iteration authors:
 > P4TR!CK, bobbysing, xero|hawk, ajkhoury, and zoomgod et al.

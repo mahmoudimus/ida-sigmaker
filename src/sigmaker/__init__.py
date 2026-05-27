@@ -631,7 +631,8 @@ class Action(enum.IntEnum):
     """User-selectable action in SignatureMakerForm.
 
     Values are bound to the rAction radio-group order:
-    ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature").
+    ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature",
+     "rFindFunctionSig").
     Changing values requires updating the radio group too.
     """
 
@@ -639,6 +640,7 @@ class Action(enum.IntEnum):
     FIND_XREF = 1
     COPY_RANGE = 2
     SEARCH = 3
+    FIND_FUNCTION_SIG = 4
 
 
 class GenerationStatus(enum.Enum):
@@ -926,7 +928,14 @@ class WildcardPolicy:
     # construction helpers
     @classmethod
     def for_x86(cls) -> "WildcardPolicy":
-        return cls(frozenset(cls.BaseKind) | frozenset(cls.X86Kind))
+        # Exclude BaseKind.IMM. An immediate like the 0x13371338 in
+        # `mov rcx, 0x13371338` is a literal value baked into the
+        # instruction encoding; it does not shift between binary builds,
+        # so wildcarding it only removes bytes that would have made the
+        # signature unique. MEM/FAR/NEAR still get wildcarded because
+        # those operands DO encode addresses that move between builds.
+        x86_base = frozenset(cls.BaseKind) - {cls.BaseKind.IMM}
+        return cls(x86_base | frozenset(cls.X86Kind))
 
     @classmethod
     def for_arm(cls) -> "WildcardPolicy":
@@ -1045,10 +1054,17 @@ class GeneratedSignature:
         if not Clipboard.set_text(fmted):
             idaapi.msg("Failed to copy to clipboard!")
 
+    def _wildcard_count(self) -> int:
+        """Number of wildcard bytes in this signature."""
+        return sum(1 for b in self.signature if b.is_wildcard)
+
     def __lt__(self, other) -> bool:
         if not isinstance(other, GeneratedSignature):
             return NotImplemented
-        return len(self.signature) < len(other.signature)
+        return (len(self.signature), self._wildcard_count()) < (
+            len(other.signature),
+            other._wildcard_count(),
+        )
 
 
 @dataclasses.dataclass(slots=True)
@@ -1464,6 +1480,122 @@ class UniqueSignatureGenerator:
             raise
 
         raise Unexpected("Signature not unique (reached end of analysis)")
+
+
+class MinimalFunctionSignatureGenerator:
+    """Find the shortest unique signature anywhere within a function body.
+
+    Iterates every instruction in the function as a possible start point,
+    growing a signature from each until unique (bounded by function end and
+    by the size of the best candidate found so far). Returns the smallest
+    unique signature with the fewest wildcards. Raises Unexpected if no
+    unique signature exists within the function.
+    """
+
+    MIN_USEFUL_SIG_BYTES = 5
+
+    def __init__(
+        self,
+        processor: InstructionProcessor,
+        progress_reporter: typing.Optional[ProgressReporter] = None,
+    ):
+        self.processor = processor
+        self.progress_reporter = progress_reporter
+
+    def generate(
+        self, pfn: "idaapi.func_t", cfg: SigMakerConfig
+    ) -> GeneratedSignature:
+        """Search the function body for the shortest unique signature.
+
+        Args:
+            pfn: The function to search (idaapi.func_t).
+            cfg: Configuration. Uses max_single_signature_length as the
+                initial budget; the budget shrinks monotonically as
+                better candidates are found.
+
+        Returns:
+            The best unique GeneratedSignature found.
+
+        Raises:
+            Unexpected: If no start point produces a unique signature within
+                the length budget, or all candidates are degenerate
+                (< MIN_USEFUL_SIG_BYTES bytes).
+            UserCanceledError: If the progress reporter signals cancel.
+        """
+        candidates: list[GeneratedSignature] = []
+        best_size = cfg.max_single_signature_length
+
+        # Materialize start EAs upfront so we can iterate independently of
+        # the inner growth loop's walker state.
+        start_eas = [
+            cur_ea for cur_ea, _, _ in InstructionWalker(pfn.start_ea, pfn.end_ea)
+        ]
+
+        for start_ea in start_eas:
+            if (
+                self.progress_reporter is not None
+                and self.progress_reporter.should_cancel()
+            ):
+                raise UserCanceledError(
+                    "Function signature search canceled by user"
+                )
+
+            sig = self._grow_unique_from(start_ea, pfn.end_ea, best_size, cfg)
+            if sig is None:
+                continue
+            if len(sig) < self.MIN_USEFUL_SIG_BYTES:
+                continue
+
+            candidate = GeneratedSignature(sig, Match(start_ea))
+            candidates.append(candidate)
+            best_size = min(best_size, len(sig))
+
+            # Ideal candidate: small enough and no wildcards. Stop scanning.
+            wildcard_count = sum(1 for b in sig if b.is_wildcard)
+            if len(sig) <= self.MIN_USEFUL_SIG_BYTES and wildcard_count == 0:
+                break
+
+        if not candidates:
+            raise Unexpected("No unique signature within function")
+
+        candidates.sort()  # (size, wildcards) ascending via __lt__
+        return candidates[0]
+
+    def _grow_unique_from(
+        self, start: int, end_ea: int, max_len: int, cfg: SigMakerConfig
+    ) -> typing.Optional[Signature]:
+        """Grow a signature from ``start`` until unique, bounded by
+        ``end_ea`` and ``max_len`` bytes.
+
+        Returns the trimmed Signature on uniqueness, or None if the search
+        exhausts the budget without becoming unique.
+        """
+        sig = Signature()
+        for cur_ea, ins, _ins_len in InstructionWalker(start, end_ea):
+            if (
+                self.progress_reporter is not None
+                and self.progress_reporter.should_cancel()
+            ):
+                raise UserCanceledError(
+                    "Function signature search canceled by user"
+                )
+
+            self.processor.append_instruction_to_sig(
+                sig,
+                cur_ea,
+                ins,
+                cfg.wildcard_operands,
+                cfg.wildcard_optimized,
+            )
+
+            if len(sig) > max_len:
+                return None
+
+            if SignatureSearcher.is_unique(f"{sig:ida}"):
+                sig.trim_signature()
+                return sig
+
+        return None
 
 
 class RangeSignatureGenerator:
@@ -2219,7 +2351,8 @@ Select action:
 <#Select an address, and create a code signature for it#Create unique signature for current code address:{rCreateUniqueSig}>
 <#Select an address or variable, and create code signatures for its references. Will output the shortest 5 signatures#Find shortest XREF signature for current data or code address:{rFindXRefSig}>
 <#Select 1+ instructions, and copy the bytes using the specified output format#Copy selected code:{rCopyCode}>
-<#Paste any string containing your signature/mask and find matches#Search for a signature:{rSearchSignature}>{rAction}>
+<#Paste any string containing your signature/mask and find matches#Search for a signature:{rSearchSignature}>
+<#Find the shortest unique signature anywhere inside the current function, with automatic xref fallback if the function body is not unique#Find shortest unique signature for current function:{rFindFunctionSig}>{rAction}>
 
 Output format:
 <#Example - E8 ? ? ? ? 45 33 F6 66 44 89 34 33#IDA Signature:{rIDASig}>
@@ -2241,7 +2374,13 @@ Quick Options:
             "cVersion": F.StringLabel(PLUGIN_VERSION),
             "FormChangeCb": F.FormChangeCb(self.OnFormChange),
             "rAction": F.RadGroupControl(
-                ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature")
+                (
+                    "rCreateUniqueSig",
+                    "rFindXRefSig",
+                    "rCopyCode",
+                    "rSearchSignature",
+                    "rFindFunctionSig",
+                )
             ),
             "rOutputFormat": F.RadGroupControl(
                 ("rIDASig", "rx64DbgSig", "rByteArrayMaskSig", "rRawBytesBitmaskSig")
@@ -2449,6 +2588,8 @@ class SigMakerPlugin(idaapi.plugin_t):
                     results.display()
                 else:
                     idaapi.msg("No signature entered!\n")
+            elif action == Action.FIND_FUNCTION_SIG:
+                self._run_find_function_sig(config)
             else:
                 idaapi.msg("Invalid action!\n")
         except Unexpected as e:
@@ -2459,6 +2600,53 @@ class SigMakerPlugin(idaapi.plugin_t):
         except Exception as e:
             LOGGER.error("Exception occurred: %s%s%s", e, os.linesep, traceback.format_exc())
             return
+
+    def _run_find_function_sig(self, config: SigMakerConfig) -> None:
+        """Action.FIND_FUNCTION_SIG: shortest unique sig within the function,
+        falling back to xref signatures if the function body is not unique."""
+        ea = idaapi.get_screen_ea()
+        pfn = idaapi.get_func(ea)
+        if pfn is None:
+            idaapi.msg("Place cursor inside a function first.\n")
+            return
+
+        try:
+            with ProgressDialog(
+                "Finding shortest function signature...\n\nPress Cancel to stop"
+            ):
+                generator = MinimalFunctionSignatureGenerator(
+                    InstructionProcessor(OperandProcessor())
+                )
+                result = generator.generate(pfn, config)
+            offset = int(result.address) - int(pfn.start_ea)
+            idaapi.msg(
+                f"Function signature (offset +{hex(offset)} into function "
+                f"{hex(pfn.start_ea)}):\n"
+            )
+            result.display(config)
+            return
+        except Unexpected:
+            idaapi.msg(
+                f"No unique signature inside function "
+                f"{hex(pfn.start_ea)}; trying xref signatures...\n"
+            )
+
+        with ProgressDialog(
+            "Falling back to xref signatures...\n\nPress Cancel to stop"
+        ):
+            xref_result = XrefFinder().find_xrefs(pfn.start_ea, config)
+
+        if xref_result.signatures:
+            best = xref_result.signatures[0]
+            idaapi.msg(
+                f"Xref signature into {hex(pfn.start_ea)} (from {best.address}):\n"
+            )
+            best.display(config)
+        else:
+            idaapi.msg(
+                f"No unique signature found for function {hex(pfn.start_ea)} "
+                f"(no unique sig within body and no usable xrefs)\n"
+            )
 
     def term(self) -> None:
         self._deregister_actions()

@@ -2147,6 +2147,15 @@ class TestSigMakerConfigDefaults(CoveredUnitTest):
         self.assertFalse(cfg.enable_continue_prompt)
         self.assertEqual(cfg.prompt_interval, -1)
 
+    def test_default_output_partial_on_cancel_is_false(self):
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+        self.assertFalse(cfg.output_partial_on_cancel)
+
 
 class TestInstructionWalkerCancellation(CoveredUnitTest):
     """User-cancellation inside InstructionWalker must raise UserCanceledError, not StopIteration."""
@@ -2190,6 +2199,315 @@ class TestActionEnum(CoveredUnitTest):
         import enum as _enum
 
         self.assertTrue(issubclass(sigmaker.Action, _enum.IntEnum))
+
+
+class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
+    """policy=permissive returns a partial GeneratedSignature on cancel."""
+
+    def setUp(self):
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        # idaapi is module-level MagicMock; idaapi_user_canceled is bound from
+        # it at import time and would return a truthy MagicMock by default,
+        # firing the walker's cancel branch on every iteration. Reset.
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.decode_insn = MagicMock(return_value=1)
+        sigmaker.idaapi.get_byte = MagicMock(return_value=0x90)
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=b"\x90")
+        sigmaker.idaapi.get_func = MagicMock(return_value=None)
+        self._is_code_patcher = patch.object(
+            sigmaker, "is_address_marked_as_code", return_value=True
+        )
+        self._is_code_patcher.start()
+
+    def tearDown(self):
+        self._is_code_patcher.stop()
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
+
+    def _make_generator(self, cancel_after_iterations: int):
+        """Construct a UniqueSignatureGenerator whose progress_reporter cancels
+        on the Nth should_cancel() call."""
+        calls = {"n": 0}
+
+        def should_cancel():
+            calls["n"] += 1
+            return calls["n"] > cancel_after_iterations
+
+        reporter = MagicMock()
+        reporter.should_cancel.side_effect = should_cancel
+        reporter.enabled.return_value = False
+        processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        return sigmaker.UniqueSignatureGenerator(processor, reporter)
+
+    def _make_cfg(self) -> sigmaker.SigMakerConfig:
+        return sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=True,
+            wildcard_optimized=False,
+            ask_longer_signature=False,
+        )
+
+    def test_strict_policy_cancel_raises(self):
+        gen = self._make_generator(cancel_after_iterations=3)
+        with patch.object(sigmaker.SignatureSearcher, "count_matches", return_value=2):
+            with self.assertRaises(sigmaker.UserCanceledError):
+                gen.generate(0x1000, self._make_cfg(), policy=sigmaker.GenerationPolicy.strict())
+
+    def test_permissive_policy_cancel_returns_partial(self):
+        gen = self._make_generator(cancel_after_iterations=3)
+        with patch.object(sigmaker.SignatureSearcher, "count_matches", return_value=2):
+            result = gen.generate(
+                0x1000, self._make_cfg(), policy=sigmaker.GenerationPolicy.permissive()
+            )
+        self.assertIsInstance(result, sigmaker.GeneratedSignature)
+        self.assertEqual(result.status, sigmaker.GenerationStatus.PARTIAL_ON_CANCEL)
+        self.assertEqual(result.match_count, 2)
+        self.assertGreater(len(result.signature), 0)
+        self.assertEqual(result.address, sigmaker.Match(0x1000))
+
+    def test_permissive_policy_unique_returns_unique(self):
+        gen = self._make_generator(cancel_after_iterations=99)
+        counts = iter([2, 2, 1])
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "count_matches",
+            side_effect=lambda *_: next(counts),
+        ):
+            result = gen.generate(
+                0x1000, self._make_cfg(), policy=sigmaker.GenerationPolicy.permissive()
+            )
+        self.assertEqual(result.status, sigmaker.GenerationStatus.UNIQUE)
+        self.assertIsInstance(result, sigmaker.GeneratedSignature)
+
+    def test_permissive_policy_cancel_before_any_byte_raises(self):
+        gen = self._make_generator(cancel_after_iterations=0)
+        with patch.object(sigmaker.SignatureSearcher, "count_matches", return_value=2):
+            with self.assertRaises(sigmaker.UserCanceledError):
+                gen.generate(
+                    0x1000, self._make_cfg(), policy=sigmaker.GenerationPolicy.permissive()
+                )
+
+    def test_permissive_policy_preserves_last_good_count_on_interruption(self):
+        """count_matches bails early when idaapi_user_canceled() is True
+        during its scan, returning a partial (often 0) count. The generator
+        must not record that as last_match_count -- but it also must not
+        throw away the previous trustworthy count. The partial-on-cancel
+        path should show the last fully-completed iteration's count, which
+        is an upper bound on the actual match count for the (slightly
+        longer) emitted partial signature. Bug reported by @OshidaBCF on
+        issue #22 after testing PR #25.
+        """
+        # First two iterations: clean count_matches calls returning 100 and 50.
+        # Third iteration: count_matches returns 0 AND idaapi_user_canceled
+        # has just flipped to True (simulating cancel mid-scan).
+        # Fourth iteration: should_cancel sees the cancel and builds the
+        # partial. We expect match_count == 50 (the prior trustworthy
+        # value), NOT 0 (the interrupted bogus value), and NOT None
+        # (which would discard useful information).
+        gen = self._make_generator(cancel_after_iterations=3)
+        counts = iter([100, 50, 0])
+        user_canceled_state = {"value": False}
+
+        def fake_count_matches(_ida_sig):
+            v = next(counts)
+            if v == 0:
+                # Simulate find_all bailing because the user just clicked Cancel.
+                user_canceled_state["value"] = True
+            return v
+
+        def fake_user_canceled():
+            return user_canceled_state["value"]
+
+        original_user_canceled = sigmaker.idaapi_user_canceled
+        sigmaker.idaapi_user_canceled = fake_user_canceled
+        try:
+            with patch.object(
+                sigmaker.SignatureSearcher,
+                "count_matches",
+                side_effect=fake_count_matches,
+            ):
+                result = gen.generate(
+                    0x1000,
+                    self._make_cfg(),
+                    policy=sigmaker.GenerationPolicy.permissive(),
+                )
+        finally:
+            sigmaker.idaapi_user_canceled = original_user_canceled
+
+        self.assertEqual(
+            result.status, sigmaker.GenerationStatus.PARTIAL_ON_CANCEL
+        )
+        self.assertEqual(
+            result.match_count,
+            50,
+            "match_count must preserve the last trustworthy count "
+            "(50 from the prior iteration), not the interrupted "
+            "count_matches result of 0",
+        )
+
+    def test_permissive_policy_match_count_none_when_interrupted_on_first(self):
+        """If the very first count_matches call is interrupted, we have no
+        prior trustworthy count to fall back on, so match_count is None
+        (rendered as 'match count unavailable')."""
+        gen = self._make_generator(cancel_after_iterations=1)
+        user_canceled_state = {"value": False}
+
+        def fake_count_matches(_ida_sig):
+            # First (and only) call returns 0 with cancel flag already set.
+            user_canceled_state["value"] = True
+            return 0
+
+        def fake_user_canceled():
+            return user_canceled_state["value"]
+
+        original_user_canceled = sigmaker.idaapi_user_canceled
+        sigmaker.idaapi_user_canceled = fake_user_canceled
+        try:
+            with patch.object(
+                sigmaker.SignatureSearcher,
+                "count_matches",
+                side_effect=fake_count_matches,
+            ):
+                result = gen.generate(
+                    0x1000,
+                    self._make_cfg(),
+                    policy=sigmaker.GenerationPolicy.permissive(),
+                )
+        finally:
+            sigmaker.idaapi_user_canceled = original_user_canceled
+
+        self.assertEqual(
+            result.status, sigmaker.GenerationStatus.PARTIAL_ON_CANCEL
+        )
+        self.assertIsNone(
+            result.match_count,
+            "match_count must be None when no prior trustworthy count exists",
+        )
+
+
+class TestGeneratedSignatureDisplay(CoveredUnitTest):
+    """display() branches on status and respects the no-clipboard rule for partials."""
+
+    def setUp(self):
+        self.cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+        self.original_msg = sigmaker.idaapi.msg
+        self.msg_calls: list[str] = []
+        sigmaker.idaapi.msg = lambda s: self.msg_calls.append(s)
+
+    def tearDown(self):
+        sigmaker.idaapi.msg = self.original_msg
+
+    def _make_sig(self, n_bytes: int = 4) -> sigmaker.Signature:
+        sig = sigmaker.Signature()
+        for i in range(n_bytes):
+            sig.append(sigmaker.SignatureByte(0xE8 + i, False))
+        return sig
+
+    def test_unique_display_writes_clipboard(self):
+        sig = self._make_sig()
+        result = sigmaker.GeneratedSignature(sig, sigmaker.Match(0x1000))
+        with patch.object(sigmaker.Clipboard, "set_text", return_value=True) as set_text:
+            result.display(self.cfg)
+        set_text.assert_called_once()
+        self.assertTrue(any("Signature for" in m for m in self.msg_calls))
+
+    def test_partial_display_does_not_write_clipboard(self):
+        sig = self._make_sig()
+        result = sigmaker.GeneratedSignature(
+            sig,
+            sigmaker.Match(0x1000),
+            status=sigmaker.GenerationStatus.PARTIAL_ON_CANCEL,
+            match_count=47,
+        )
+        with patch.object(sigmaker.Clipboard, "set_text", return_value=True) as set_text:
+            result.display(self.cfg)
+        set_text.assert_not_called()
+
+    def test_partial_display_includes_match_count_in_message(self):
+        sig = self._make_sig()
+        result = sigmaker.GeneratedSignature(
+            sig,
+            sigmaker.Match(0x140001234),
+            status=sigmaker.GenerationStatus.PARTIAL_ON_CANCEL,
+            match_count=47,
+        )
+        with patch.object(sigmaker.Clipboard, "set_text", return_value=True):
+            result.display(self.cfg)
+        combined = "".join(self.msg_calls)
+        self.assertIn("NOT unique", combined)
+        self.assertIn("47", combined)
+        self.assertIn("Partial", combined)
+
+    def test_partial_display_does_not_recompute_match_count(self):
+        sig = self._make_sig()
+        result = sigmaker.GeneratedSignature(
+            sig,
+            sigmaker.Match(0x1000),
+            status=sigmaker.GenerationStatus.PARTIAL_ON_CANCEL,
+            match_count=3,
+        )
+        with patch.object(sigmaker.SignatureSearcher, "find_all") as fa, \
+                patch.object(sigmaker.Clipboard, "set_text", return_value=True):
+            result.display(self.cfg)
+        fa.assert_not_called()
+
+
+class TestGenerationStatusAndPolicy(CoveredUnitTest):
+    """GenerationStatus and GenerationPolicy classmethods give callers a clean opt-in switch."""
+
+    def test_generation_status_members(self):
+        import enum as _enum
+
+        self.assertTrue(issubclass(sigmaker.GenerationStatus, _enum.Enum))
+        self.assertEqual(sigmaker.GenerationStatus.UNIQUE.value, "unique")
+        self.assertEqual(sigmaker.GenerationStatus.PARTIAL_ON_CANCEL.value, "partial_on_cancel")
+
+    def test_generation_policy_strict_default(self):
+        policy = sigmaker.GenerationPolicy.strict()
+        self.assertFalse(policy.return_partial_on_cancel)
+
+    def test_generation_policy_permissive(self):
+        policy = sigmaker.GenerationPolicy.permissive()
+        self.assertTrue(policy.return_partial_on_cancel)
+
+    def test_generation_policy_default_constructor_matches_strict(self):
+        # A bare GenerationPolicy() must equal GenerationPolicy.strict() so the
+        # default kwarg in generate() preserves the existing contract.
+        self.assertEqual(
+            sigmaker.GenerationPolicy(),
+            sigmaker.GenerationPolicy.strict(),
+        )
+
+
+class TestSignatureSearcherCountMatches(CoveredUnitTest):
+    """count_matches returns the cardinality of find_all; is_unique stays True only at 1."""
+
+    def test_count_matches_returns_len_of_find_all(self):
+        fake_matches = [sigmaker.Match(0x1000), sigmaker.Match(0x2000), sigmaker.Match(0x3000)]
+        with patch.object(sigmaker.SignatureSearcher, "find_all", return_value=fake_matches):
+            count = sigmaker.SignatureSearcher.count_matches("E8 ?? ?? ?? ??")
+        self.assertEqual(count, 3)
+
+    def test_count_matches_zero_when_no_hits(self):
+        with patch.object(sigmaker.SignatureSearcher, "find_all", return_value=[]):
+            count = sigmaker.SignatureSearcher.count_matches("DE AD BE EF")
+        self.assertEqual(count, 0)
+
+    def test_is_unique_true_only_at_one(self):
+        with patch.object(sigmaker.SignatureSearcher, "find_all", return_value=[sigmaker.Match(0x1000)]):
+            self.assertTrue(sigmaker.SignatureSearcher.is_unique("xx"))
+        with patch.object(sigmaker.SignatureSearcher, "find_all", return_value=[]):
+            self.assertFalse(sigmaker.SignatureSearcher.is_unique("xx"))
+        with patch.object(sigmaker.SignatureSearcher, "find_all", return_value=[sigmaker.Match(1), sigmaker.Match(2)]):
+            self.assertFalse(sigmaker.SignatureSearcher.is_unique("xx"))
 
 
 if __name__ == "__main__":

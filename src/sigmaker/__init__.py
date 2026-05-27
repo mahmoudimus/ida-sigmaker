@@ -25,7 +25,7 @@ import idaapi
 import idc
 
 __author__ = "mahmoudimus"
-__version__ = "1.6.0"
+__version__ = "1.7.0"
 
 PLUGIN_NAME: str = "Signature Maker (py)"
 PLUGIN_VERSION: str = __version__
@@ -2455,7 +2455,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             idaapi.msg(f"Error: {str(e)}\n")
         except UserCanceledError:
             # User cancellation is expected, not an error
-            idaapi.msg("Operation cancelled by user\n")
+            idaapi.msg("Operation canceled by user\n")
         except Exception as e:
             LOGGER.error("Exception occurred: %s%s%s", e, os.linesep, traceback.format_exc())
             return

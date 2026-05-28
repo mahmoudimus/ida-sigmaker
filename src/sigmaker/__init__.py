@@ -168,22 +168,6 @@ class ProgressReporter(typing.Protocol):
         """Return the elapsed time since the operation started."""
         ...
 
-    def report_progress(
-        self,
-        *,
-        message: typing.Optional[str] = None,
-        metadata: typing.Optional[dict[str, typing.Any]] = None,
-        **metadata_kwargs,
-    ) -> None:
-        """Update progress information.
-
-        Args:
-            message: Optional progress message to display
-            metadata: Optional dictionary of metadata to report
-            **metadata_kwargs: Additional metadata as keyword arguments
-        """
-        ...
-
     def should_cancel(self) -> bool:
         """Check if the operation should be canceled.
 
@@ -282,12 +266,6 @@ class CheckContinuePrompt:
 
     start_time: float = dataclasses.field(init=False)
     _timer: ExponentialBackoffTimer = dataclasses.field(init=False)
-    _dynamic_metadata: dict[str, typing.Any] = dataclasses.field(
-        default_factory=dict, init=False, repr=False
-    )
-    _progress_message: typing.Optional[str] = dataclasses.field(
-        default=None, init=False, repr=False
-    )
     _user_canceled: bool = dataclasses.field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -304,36 +282,6 @@ class CheckContinuePrompt:
     def elapsed_time(self) -> float:
         """Return the elapsed time since the operation started."""
         return time.time() - self.start_time
-
-    def report_progress(
-        self,
-        *,
-        message: typing.Optional[str] = None,
-        metadata: typing.Optional[dict[str, typing.Any]] = None,
-        **metadata_kwargs,
-    ) -> None:
-        """Update metadata/message used in the next prompt.
-
-        Args:
-            message: Optional progress message to display
-            metadata: Optional dictionary of metadata to report
-            **metadata_kwargs: Additional metadata as keyword arguments
-        """
-        combined = metadata.copy() if metadata else {}
-        if metadata_kwargs:
-            combined.update(metadata_kwargs)
-        if combined:
-            self._dynamic_metadata.update(combined)
-        if message is not None:
-            self._progress_message = message
-
-        if self.logger is not None and self.logger.isEnabledFor(logging.DEBUG):
-            self.logger.debug(
-                "Progress reported (%.1fs elapsed): message=%s, metadata=%s",
-                self.elapsed_time,
-                message,
-                combined or None,
-            )
 
     def should_cancel(self) -> bool:
         """Check if the operation should be canceled.
@@ -396,20 +344,9 @@ class CheckContinuePrompt:
         time_str = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
         message_lines = [f"{func_name} has been running for {time_str}.", ""]
 
-        # Combine static and dynamic metadata
-        combined_metadata: dict[str, typing.Any] = {}
         if self.metadata:
-            combined_metadata.update(self.metadata)
-        if self._dynamic_metadata:
-            combined_metadata.update(self._dynamic_metadata)
-
-        if combined_metadata:
-            for key, value in combined_metadata.items():
+            for key, value in self.metadata.items():
                 message_lines.append(f"{key}: {value}")
-            message_lines.append("")
-
-        if self._progress_message:
-            message_lines.append(self._progress_message)
             message_lines.append("")
 
         message_lines.append("Continue?")
@@ -716,6 +653,35 @@ class GenerationPolicy:
     def permissive(cls) -> "GenerationPolicy":
         """Cancel returns a partial GeneratedSignature instead of raising."""
         return cls(return_partial_on_cancel=True)
+
+
+@dataclasses.dataclass(slots=True)
+class _CancelToPartial:
+    """Context manager that converts UserCanceledError into a partial result.
+
+    If ``policy.return_partial_on_cancel`` is True and a UserCanceledError
+    is raised inside the ``with`` block, calls ``build_partial()`` and
+    stashes the result in ``.partial``, suppressing the original exception.
+    If ``build_partial()`` itself raises UserCanceledError (the empty-sig
+    case where there's nothing useful to return), the original
+    UserCanceledError is allowed to propagate, not this new one.
+    """
+
+    policy: GenerationPolicy
+    build_partial: typing.Callable[[], "GeneratedSignature"]
+    partial: typing.Optional["GeneratedSignature"] = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is UserCanceledError and self.policy.return_partial_on_cancel:
+            try:
+                self.partial = self.build_partial()
+            except UserCanceledError:
+                return False  # propagate the ORIGINAL UserCanceledError
+            return True  # suppress; partial is ready
+        return False
 
 
 class SignatureByte(typing.NamedTuple):
@@ -1459,10 +1425,9 @@ class UniqueSignatureGenerator:
         sig = Signature()
         start_fn = idaapi.get_func(ea)
         bytes_since_last_check = 0
-        instruction_count = 0
-        last_match_count: int | None = None
+        progress = _UniqueSigProgress(sig=sig)
 
-        def _build_partial() -> GeneratedSignature:
+        def build_partial() -> GeneratedSignature:
             # Trim trailing wildcards, mirror the success path.
             sig.trim_signature()
             if len(sig) == 0:
@@ -1471,26 +1436,23 @@ class UniqueSignatureGenerator:
                 sig,
                 Match(ea),
                 status=GenerationStatus.PARTIAL_ON_CANCEL,
-                match_count=last_match_count,
+                match_count=progress.last_match_count,
             )
 
-        try:
-            for cur_ea, ins, ins_len in InstructionWalker(ea):
-                # Check for cancellation via progress reporter
-                if self.progress_reporter is not None and self.progress_reporter.should_cancel():
-                    if policy.return_partial_on_cancel:
-                        return _build_partial()
+        with _CancelToPartial(policy, build_partial) as cancel:
+            for cur_ea, ins, ins_len in ProgressBox(
+                InstructionWalker(ea),
+                initial_message="Generating signature...\n\nPress Cancel to stop",
+                format_message=progress,
+            ):
+                # Modal continue-prompt opt-in (issue #18) still goes through
+                # the progress reporter. The wait-box cancel is already handled
+                # by ProgressBox raising UserCanceledError.
+                if (
+                    self.progress_reporter is not None
+                    and self.progress_reporter.should_cancel()
+                ):
                     raise UserCanceledError("Signature generation canceled by user")
-
-                # Update progress periodically
-                instruction_count += 1
-                progress_reporting = self.progress_reporter is not None and self.progress_reporter.enabled()
-                if progress_reporting and instruction_count % 100 == 0:
-                    self.progress_reporter.report_progress(
-                        message=f"Generating signature at {hex(cur_ea)}",
-                        signature_length=len(sig),
-                        instructions_processed=instruction_count,
-                    )
 
                 # Check length constraint
                 if bytes_since_last_check > cfg.max_single_signature_length:
@@ -1521,28 +1483,18 @@ class UniqueSignatureGenerator:
                 count = SignatureSearcher.count_matches(f"{sig:ida}")
                 # SignatureSearcher.find_all polls idaapi_user_canceled inside
                 # its scan loop and bails when set, returning whatever partial
-                # count it had so far (often 0). If we stored that, the
-                # partial-on-cancel path would show "0 matches" for a signature
-                # that actually matches many places.
-                #
-                # When the call was interrupted, keep last_match_count at its
-                # prior trustworthy value (the count from the previous fully
-                # completed iteration). The reported number then corresponds
-                # to a signature one instruction shorter than the partial we
-                # emit, which means it is an UPPER BOUND on the partial's
-                # actual match count -- a useful number, not a meaningless 0.
+                # count it had so far (often 0). When the call was interrupted,
+                # keep last_match_count at its prior trustworthy value (issue
+                # #22): the reported number is an upper bound on the partial's
+                # actual match count rather than a meaningless 0.
                 if not idaapi_user_canceled():
-                    last_match_count = count
+                    progress.last_match_count = count
                     if count == 1:
                         sig.trim_signature()
                         return GeneratedSignature(sig, Match(ea))
-        except UserCanceledError:
-            # InstructionWalker raises UserCanceledError on cancel too (issue #18).
-            # Honor the policy here as well.
-            if policy.return_partial_on_cancel:
-                return _build_partial()
-            raise
 
+        if cancel.partial is not None:
+            return cancel.partial
         raise Unexpected("Signature not unique (reached end of analysis)")
 
 
@@ -1637,7 +1589,12 @@ class MinimalFunctionSignatureGenerator:
             UserCanceledError: If the progress reporter signals cancel.
         """
         candidates: list[GeneratedSignature] = []
-        best_size = cfg.max_single_signature_length
+        progress = _FunctionSigProgress(
+            pfn_start_ea=int(pfn.start_ea),
+            pfn_end_ea=int(pfn.end_ea),
+            candidates=candidates,
+            best_size=cfg.max_single_signature_length,
+        )
 
         decoded = _decode_function_for_anchors(pfn, self.processor, cfg)
         if not decoded:
@@ -1651,7 +1608,17 @@ class MinimalFunctionSignatureGenerator:
             with ProgressDialog("Please stand by, copying segments..."):
                 buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
 
-        for anchor_idx in range(len(decoded)):
+        # Iterate the pre-decoded anchors inside a ProgressBox so the wait
+        # box shows live progress (issue #27). enumerate() keeps the index
+        # for slicing while leaving the yielded item a non-int, so
+        # _FunctionSigProgress falls back to current_anchor_ea for display.
+        for anchor_idx, di in ProgressBox(
+            enumerate(decoded),
+            total=len(decoded),
+            initial_message="Finding shortest function signature...\n\n"
+                            "Press Cancel to stop",
+            format_message=progress,
+        ):
             if (
                 self.progress_reporter is not None
                 and self.progress_reporter.should_cancel()
@@ -1660,17 +1627,25 @@ class MinimalFunctionSignatureGenerator:
                     "Function signature search canceled by user"
                 )
 
+            # Reset the inner-state fields for this anchor so the wait-box
+            # display starts fresh rather than showing the previous anchor's
+            # final state.
+            progress.current_anchor_ea = di.ea
+            progress.inner_length = 0
+            progress.inner_matches = None
+
             sig = self._grow_unique_from_decoded(
-                decoded, anchor_idx, best_size, cfg, buf=buf,
+                decoded, anchor_idx, progress.best_size, cfg,
+                buf=buf, progress=progress,
             )
             if sig is None:
                 continue
             if len(sig) < self.MIN_USEFUL_SIG_BYTES:
                 continue
 
-            candidate = GeneratedSignature(sig, Match(decoded[anchor_idx].ea))
+            candidate = GeneratedSignature(sig, Match(di.ea))
             candidates.append(candidate)
-            best_size = min(best_size, len(sig))
+            progress.best_size = min(progress.best_size, len(sig))
 
             wildcard_count = sum(1 for b in sig if b.is_wildcard)
             if len(sig) <= self.MIN_USEFUL_SIG_BYTES and wildcard_count == 0:
@@ -1689,13 +1664,20 @@ class MinimalFunctionSignatureGenerator:
         max_len: int,
         cfg: SigMakerConfig,
         buf: typing.Optional["InMemoryBuffer"] = None,
+        progress: typing.Optional["_FunctionSigProgress"] = None,
     ) -> typing.Optional[Signature]:
         """Grow a signature from ``decoded[anchor_idx]`` forward until unique.
 
         Reads all instruction data from the pre-decoded list. The ``buf``
-        argument is forwarded to ``SignatureSearcher.is_unique`` so the
-        segment buffer is reused across all is_unique calls inside one
-        generate() session.
+        argument is forwarded to the searcher so the segment buffer is
+        reused across all uniqueness checks inside one generate() session.
+
+        Uniqueness is decided with an early-bail scan (bail at the second
+        match) rather than a full match count, so short common signatures
+        do not enumerate every hit. If ``progress`` is supplied, the
+        per-iteration sig length and the (capped) match count are written
+        into its ``inner_length`` / ``inner_matches`` fields for the live
+        wait-box display; ``inner_matches`` of 2 means "two or more".
         """
         sig = Signature()
         for i in range(anchor_idx, len(decoded)):
@@ -1712,7 +1694,14 @@ class MinimalFunctionSignatureGenerator:
             if len(sig) > max_len:
                 return None
 
-            if SignatureSearcher.is_unique(f"{sig:ida}", buf=buf):
+            unique = SignatureSearcher.is_unique(f"{sig:ida}", buf=buf)
+            if progress is not None:
+                progress.inner_length = len(sig)
+                # is_unique early-bails at the second match, so we cannot
+                # show an exact count here; 1 means unique, 2 means "2 or
+                # more, keep growing".
+                progress.inner_matches = 1 if unique else 2
+            if unique:
                 sig.trim_signature()
                 return sig
 
@@ -1784,19 +1773,7 @@ class RangeSignatureGenerator:
             if self.progress_reporter is not None and self.progress_reporter.should_cancel():
                 raise UserCanceledError("Signature generation canceled by user")
 
-            # Update progress periodically
             instruction_count += 1
-            progress_reporting = self.progress_reporter is not None and self.progress_reporter.enabled()
-            if progress_reporting and instruction_count % 50 == 0:
-                range_size = end_ea - start_ea
-                bytes_processed = cur_ea - start_ea
-                progress_pct = (bytes_processed / range_size * 100) if range_size > 0 else 0
-                self.progress_reporter.report_progress(
-                    message=f"Processing range at {hex(cur_ea)}",
-                    signature_length=len(sig),
-                    instructions_processed=instruction_count,
-                    progress_percent=f"{progress_pct:.1f}%",
-                )
 
             self.processor.append_instruction_to_sig(
                 sig, cur_ea, ins, cfg.wildcard_operands, cfg.wildcard_optimized
@@ -2337,9 +2314,6 @@ def stop_profiling(
     return output_path
 
 
-# no cover: start
-# we do not cover the below because this is mainly executing IDA GUI functionality.
-# any logic here should be pulled out into a separate class and tested separately.
 class ProgressDialog:
     """Context manager wrapping IDA wait boxes.
 
@@ -2396,6 +2370,157 @@ class ProgressDialog:
     user_cancelled = user_canceled
 
 
+@dataclasses.dataclass(slots=True)
+class ProgressBox:
+    """Wait-box-backed iteration progress reporter.
+
+    Wraps an iterable, opens an IDA wait box via ``dialog_factory`` on
+    iteration start, calls ``format_message(idx, item, elapsed, total)``
+    on each tick (throttled to ``throttle_seconds``), and exits the
+    dialog context manager on completion or cancel. Cancel via the
+    wait-box Cancel button raises ``UserCanceledError``.
+
+    ``clock`` and ``dialog_factory`` are injection points for testing:
+    the default ``clock=time.monotonic`` and ``dialog_factory=ProgressDialog``
+    give production behavior; tests pass fakes to drive throttling
+    deterministically and to record dialog calls without touching idaapi.
+    """
+
+    iterable: typing.Iterable
+    total: typing.Optional[int] = None
+    initial_message: str = "Executing..."
+    format_message: typing.Optional[
+        typing.Callable[[int, typing.Any, float, typing.Optional[int]], str]
+    ] = None
+    throttle_seconds: float = 0.1
+    clock: typing.Callable[[], float] = dataclasses.field(default=time.monotonic)
+    # default_factory (not default=ProgressDialog) so tests that monkey-patch
+    # sigmaker.ProgressDialog after class definition are honored: the lambda
+    # re-resolves the name from module scope at each ProgressBox() construction.
+    dialog_factory: typing.Callable[[str], typing.Any] = dataclasses.field(
+        default_factory=lambda: ProgressDialog
+    )
+
+    def __post_init__(self):
+        if self.total is None and self.iterable is not None:
+            try:
+                self.total = len(self.iterable)
+            except (TypeError, AttributeError):
+                self.total = None
+        if self.total == float("inf"):
+            self.total = None
+
+    def __iter__(self):
+        with self.dialog_factory(self.initial_message) as dialog:
+            start = self.clock()
+            last_update = 0.0
+            for idx, item in enumerate(self.iterable, start=1):
+                if idaapi_user_canceled():
+                    raise UserCanceledError("Canceled by user")
+                now = self.clock()
+                if now - last_update > self.throttle_seconds:
+                    elapsed = now - start
+                    if self.format_message is not None:
+                        msg = self.format_message(idx, item, elapsed, self.total)
+                    elif self.total:
+                        msg = f"Processing ({idx}/{self.total}) | Elapsed: {int(elapsed)}s"
+                    else:
+                        msg = f"Processing ({idx}) | Elapsed: {int(elapsed)}s"
+                    dialog.replace_message(msg)
+                    last_update = now
+                yield item
+
+
+@dataclasses.dataclass(slots=True)
+class _UniqueSigProgress:
+    """Formatter for the CREATE_UNIQUE wait-box message.
+
+    Holds a live reference to the generator's growing Signature plus the
+    most recently observed match count. ``__call__`` renders the template
+    using the current state on every invocation; the generator updates
+    ``last_match_count`` per iteration so the wait box stays current.
+    """
+
+    sig: "Signature"
+    last_match_count: typing.Optional[int] = None
+    _TEMPLATE: typing.ClassVar[str] = (
+        "Generating signature...\n\n"
+        "Length: {length} bytes\n"
+        "Matches: {matches}\n"
+        "Elapsed: {elapsed}s\n\n"
+        "Press Cancel to stop"
+    )
+
+    def __call__(self, idx, item, elapsed, total) -> str:
+        match_str = "?" if self.last_match_count is None else str(self.last_match_count)
+        return self._TEMPLATE.format(
+            length=len(self.sig),
+            matches=match_str,
+            elapsed=int(elapsed),
+        )
+
+
+@dataclasses.dataclass(slots=True)
+class _FunctionSigProgress:
+    """Formatter for the FIND_FUNCTION_SIG wait-box message.
+
+    Holds live references to the function bounds, the candidates list,
+    and the current best-size. The generator updates ``current_anchor_ea``
+    at the top of every outer iteration; the inner ``_grow_unique_from``
+    updates ``inner_length`` and ``inner_matches`` as the per-anchor
+    search grows. ``__call__`` renders the template using whatever state
+    is current at tick time (throttled by ProgressBox).
+    """
+
+    pfn_start_ea: int
+    pfn_end_ea: int
+    candidates: list
+    best_size: int
+    current_anchor_ea: int = 0
+    inner_length: int = 0
+    inner_matches: typing.Optional[int] = None
+    _TEMPLATE: typing.ClassVar[str] = (
+        "Finding shortest unique signature for this function.\n"
+        "For each instruction, grow a byte pattern until unique in the binary.\n"
+        "\n"
+        "Function:     {fn_bounds}  ({fn_size} bytes)\n"
+        "Anchor (#{idx}): {anchor:#x}\n"
+        "Inner search: {inner_bounds}  ({inner_length} bytes, {inner_matches_str})\n"
+        "Best found:   {best}\n"
+        "Candidates:   {candidates_count} unique so far\n"
+        "Elapsed:      {elapsed}s\n"
+        "\n"
+        "Press Cancel to stop"
+    )
+
+    def __call__(self, idx, item, elapsed, total) -> str:
+        fn_bounds = f"{self.pfn_start_ea:#x} .. {self.pfn_end_ea:#x}"
+        fn_size = self.pfn_end_ea - self.pfn_start_ea
+        anchor = item if isinstance(item, int) else self.current_anchor_ea
+        inner_end = anchor + self.inner_length
+        inner_bounds = f"{anchor:#x} .. {inner_end:#x}"
+        if self.inner_matches is None:
+            inner_matches_str = "scanning..."
+        else:
+            inner_matches_str = f"{self.inner_matches} matches so far"
+        best = f"{self.best_size} bytes" if self.candidates else "-"
+        return self._TEMPLATE.format(
+            fn_bounds=fn_bounds,
+            fn_size=fn_size,
+            idx=idx,
+            anchor=anchor,
+            inner_bounds=inner_bounds,
+            inner_length=self.inner_length,
+            inner_matches_str=inner_matches_str,
+            best=best,
+            candidates_count=len(self.candidates),
+            elapsed=int(elapsed),
+        )
+
+
+# no cover: start
+# we do not cover the below because this is mainly executing IDA GUI functionality.
+# any logic here should be pulled out into a separate class and tested separately.
 class Clipboard:
     """Cross platform utilities for setting text on the system clipboard."""
 
@@ -2846,12 +2971,11 @@ class SigMakerPlugin(idaapi.plugin_t):
                     if config.output_partial_on_cancel
                     else GenerationPolicy.strict()
                 )
-                with ProgressDialog(
-                    "Generating signature...\n\nPress Cancel to stop"
-                ):
-                    signature = SignatureMaker().make_signature(
-                        ea, config, policy=policy
-                    )
+                # ProgressBox inside UniqueSignatureGenerator.generate owns
+                # the wait box; no outer wrapper needed.
+                signature = SignatureMaker().make_signature(
+                    ea, config, policy=policy
+                )
                 signature.display(config)
             elif action == Action.FIND_XREF:
                 ea = idaapi.get_screen_ea()
@@ -2902,13 +3026,12 @@ class SigMakerPlugin(idaapi.plugin_t):
             return
 
         try:
-            with ProgressDialog(
-                "Finding shortest function signature...\n\nPress Cancel to stop"
-            ):
-                generator = MinimalFunctionSignatureGenerator(
-                    InstructionProcessor(OperandProcessor())
-                )
-                result = generator.generate(pfn, config)
+            # ProgressBox inside MinimalFunctionSignatureGenerator.generate
+            # owns the wait box; no outer wrapper needed.
+            generator = MinimalFunctionSignatureGenerator(
+                InstructionProcessor(OperandProcessor())
+            )
+            result = generator.generate(pfn, config)
             offset = int(result.address) - int(pfn.start_ea)
             idaapi.msg(
                 f"Function signature (offset +{hex(offset)} into function "

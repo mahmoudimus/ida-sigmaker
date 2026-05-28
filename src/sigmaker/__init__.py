@@ -47,6 +47,53 @@ with contextlib.suppress(ImportError):
     SIMD_SPEEDUP_AVAILABLE = True
 
 
+def _load_speedups_sibling() -> bool:
+    """Load the compiled _speedups extension that sits next to this file.
+
+    The package-level `from sigmaker._speedups import simd_scan` above
+    resolves to whatever `sigmaker` is first on sys.path. In a dev or
+    symlink layout (e.g. IDA loading this file from a source tree while a
+    pip-installed `sigmaker` namespace package without a matching compiled
+    extension shadows it), that import yields nothing. When this file lives
+    in a real package directory with a sibling `_speedups/`, load the
+    extension by path instead. Returns True on success.
+
+    No-ops for the shipped single-file `sigmaker.py`, which has no sibling
+    `_speedups/` directory and relies on the pip-installed extension.
+    """
+    global simd_scan, _SimdSignature, _simd_scan_bytes, SIMD_SPEEDUP_AVAILABLE
+    import importlib.machinery
+    import importlib.util
+
+    speedups_dir = pathlib.Path(__file__).resolve().parent / "_speedups"
+    if not speedups_dir.is_dir():
+        return False
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        candidate = speedups_dir / f"simd_scan{suffix}"
+        if not candidate.exists():
+            continue
+        # The spec name's final component must be "simd_scan" so the C
+        # extension loader finds its PyInit_simd_scan export.
+        spec = importlib.util.spec_from_file_location(
+            "sigmaker._speedups.simd_scan", candidate
+        )
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        simd_scan = module
+        _SimdSignature = module.Signature
+        _simd_scan_bytes = module.scan_bytes
+        SIMD_SPEEDUP_AVAILABLE = True
+        return True
+    return False
+
+
+if not SIMD_SPEEDUP_AVAILABLE:
+    with contextlib.suppress(Exception):
+        _load_speedups_sibling()
+
+
 def configure_logging(
     logger=None,
     logging_name="sigmaker",
@@ -1297,6 +1344,23 @@ class InstructionProcessor:
             )
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class _DecodedInstruction:
+    """Pre-decoded instruction data; produced once per function and reused
+    across anchor growth loops in MinimalFunctionSignatureGenerator.
+
+    operand_offb / operand_length describe the byte range to wildcard for
+    this cfg's operand policy. Both are 0 when no operand should be
+    wildcarded (e.g. wildcard_operands=False, or the instruction has no
+    operand that matches the current WildcardPolicy).
+    """
+    ea: int
+    size: int
+    raw_bytes: bytes
+    operand_offb: int
+    operand_length: int
+
+
 @dataclasses.dataclass(slots=True)
 class InstructionWalker:
     """
@@ -1482,14 +1546,63 @@ class UniqueSignatureGenerator:
         raise Unexpected("Signature not unique (reached end of analysis)")
 
 
+def _decode_function_for_anchors(
+    pfn: "idaapi.func_t",
+    processor: "InstructionProcessor",
+    cfg: "SigMakerConfig",
+) -> list[_DecodedInstruction]:
+    """Decode a function's instructions once and capture per-instruction
+    data for use across all anchor growth loops.
+
+    Reads all function bytes via one idaapi.get_bytes call, then walks
+    instructions via InstructionWalker. The operand wildcard decision is
+    baked in based on cfg.wildcard_operands / cfg.wildcard_optimized;
+    operand_offb / operand_length are both 0 when no operand should be
+    wildcarded.
+    """
+    total = pfn.end_ea - pfn.start_ea
+    if total <= 0:
+        return []
+    func_bytes = idaapi.get_bytes(pfn.start_ea, total)
+    if not func_bytes:
+        return []
+
+    decoded: list[_DecodedInstruction] = []
+    for ea, ins, ins_len in InstructionWalker(pfn.start_ea, pfn.end_ea):
+        offset = ea - pfn.start_ea
+        if offset < 0 or offset + ins_len > len(func_bytes):
+            break
+        raw = bytes(func_bytes[offset:offset + ins_len])
+
+        operand_offb = 0
+        operand_length = 0
+        if cfg.wildcard_operands:
+            off, length = [0], [0]
+            if processor.operand_processor.get_operand(
+                ins, off, length, cfg.wildcard_optimized
+            ):
+                operand_offb = off[0]
+                operand_length = length[0]
+
+        decoded.append(_DecodedInstruction(
+            ea=ea,
+            size=ins_len,
+            raw_bytes=raw,
+            operand_offb=operand_offb,
+            operand_length=operand_length,
+        ))
+    return decoded
+
+
 class MinimalFunctionSignatureGenerator:
     """Find the shortest unique signature anywhere within a function body.
 
-    Iterates every instruction in the function as a possible start point,
-    growing a signature from each until unique (bounded by function end and
-    by the size of the best candidate found so far). Returns the smallest
-    unique signature with the fewest wildcards. Raises Unexpected if no
-    unique signature exists within the function.
+    Decodes the function once at the start of generate(), then iterates
+    every instruction as a possible anchor over the pre-decoded list,
+    growing a signature from each until unique (bounded by function end
+    and by the size of the best candidate found so far). Returns the
+    smallest unique signature with the fewest wildcards. Raises
+    Unexpected if no unique signature exists within the function.
     """
 
     MIN_USEFUL_SIG_BYTES = 5
@@ -1517,21 +1630,28 @@ class MinimalFunctionSignatureGenerator:
             The best unique GeneratedSignature found.
 
         Raises:
-            Unexpected: If no start point produces a unique signature within
-                the length budget, or all candidates are degenerate
-                (< MIN_USEFUL_SIG_BYTES bytes).
+            Unexpected: If the function has no instructions, if its bytes
+                cannot be read, or if no start point produces a unique
+                signature within the length budget (or all candidates are
+                degenerate, < MIN_USEFUL_SIG_BYTES bytes).
             UserCanceledError: If the progress reporter signals cancel.
         """
         candidates: list[GeneratedSignature] = []
         best_size = cfg.max_single_signature_length
 
-        # Materialize start EAs upfront so we can iterate independently of
-        # the inner growth loop's walker state.
-        start_eas = [
-            cur_ea for cur_ea, _, _ in InstructionWalker(pfn.start_ea, pfn.end_ea)
-        ]
+        decoded = _decode_function_for_anchors(pfn, self.processor, cfg)
+        if not decoded:
+            raise Unexpected("No unique signature within function")
 
-        for start_ea in start_eas:
+        # Load the segment buffer once and reuse it across every is_unique
+        # call. Profiling against a real binary showed _load_segments was
+        # 84% of generate() wall time when called per-is_unique.
+        buf: typing.Optional["InMemoryBuffer"] = None
+        if SIMD_SPEEDUP_AVAILABLE:
+            with ProgressDialog("Please stand by, copying segments..."):
+                buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
+
+        for anchor_idx in range(len(decoded)):
             if (
                 self.progress_reporter is not None
                 and self.progress_reporter.should_cancel()
@@ -1540,17 +1660,18 @@ class MinimalFunctionSignatureGenerator:
                     "Function signature search canceled by user"
                 )
 
-            sig = self._grow_unique_from(start_ea, pfn.end_ea, best_size, cfg)
+            sig = self._grow_unique_from_decoded(
+                decoded, anchor_idx, best_size, cfg, buf=buf,
+            )
             if sig is None:
                 continue
             if len(sig) < self.MIN_USEFUL_SIG_BYTES:
                 continue
 
-            candidate = GeneratedSignature(sig, Match(start_ea))
+            candidate = GeneratedSignature(sig, Match(decoded[anchor_idx].ea))
             candidates.append(candidate)
             best_size = min(best_size, len(sig))
 
-            # Ideal candidate: small enough and no wildcards. Stop scanning.
             wildcard_count = sum(1 for b in sig if b.is_wildcard)
             if len(sig) <= self.MIN_USEFUL_SIG_BYTES and wildcard_count == 0:
                 break
@@ -1558,20 +1679,26 @@ class MinimalFunctionSignatureGenerator:
         if not candidates:
             raise Unexpected("No unique signature within function")
 
-        candidates.sort()  # (size, wildcards) ascending via __lt__
+        candidates.sort()
         return candidates[0]
 
-    def _grow_unique_from(
-        self, start: int, end_ea: int, max_len: int, cfg: SigMakerConfig
+    def _grow_unique_from_decoded(
+        self,
+        decoded: list[_DecodedInstruction],
+        anchor_idx: int,
+        max_len: int,
+        cfg: SigMakerConfig,
+        buf: typing.Optional["InMemoryBuffer"] = None,
     ) -> typing.Optional[Signature]:
-        """Grow a signature from ``start`` until unique, bounded by
-        ``end_ea`` and ``max_len`` bytes.
+        """Grow a signature from ``decoded[anchor_idx]`` forward until unique.
 
-        Returns the trimmed Signature on uniqueness, or None if the search
-        exhausts the budget without becoming unique.
+        Reads all instruction data from the pre-decoded list. The ``buf``
+        argument is forwarded to ``SignatureSearcher.is_unique`` so the
+        segment buffer is reused across all is_unique calls inside one
+        generate() session.
         """
         sig = Signature()
-        for cur_ea, ins, _ins_len in InstructionWalker(start, end_ea):
+        for i in range(anchor_idx, len(decoded)):
             if (
                 self.progress_reporter is not None
                 and self.progress_reporter.should_cancel()
@@ -1580,22 +1707,35 @@ class MinimalFunctionSignatureGenerator:
                     "Function signature search canceled by user"
                 )
 
-            self.processor.append_instruction_to_sig(
-                sig,
-                cur_ea,
-                ins,
-                cfg.wildcard_operands,
-                cfg.wildcard_optimized,
-            )
+            self._append_decoded_to_sig(sig, decoded[i])
 
             if len(sig) > max_len:
                 return None
 
-            if SignatureSearcher.is_unique(f"{sig:ida}"):
+            if SignatureSearcher.is_unique(f"{sig:ida}", buf=buf):
                 sig.trim_signature()
                 return sig
 
         return None
+
+    def _append_decoded_to_sig(
+        self, sig: Signature, di: _DecodedInstruction
+    ) -> None:
+        """Append a pre-decoded instruction's bytes to ``sig``, honoring its
+        baked operand-wildcard decision.
+
+        Mirrors InstructionProcessor.append_instruction_to_sig but reads
+        from di.raw_bytes instead of calling idaapi.get_bytes.
+        """
+        raw = di.raw_bytes
+        if di.operand_length <= 0:
+            sig.extend(SignatureByte(b, False) for b in raw)
+            return
+
+        end_operand = di.operand_offb + di.operand_length
+        sig.extend(SignatureByte(b, False) for b in raw[:di.operand_offb])
+        sig.extend(SignatureByte(b, True) for b in raw[di.operand_offb:end_operand])
+        sig.extend(SignatureByte(b, False) for b in raw[end_operand:])
 
 
 class RangeSignatureGenerator:
@@ -2003,11 +2143,14 @@ class SignatureSearcher:
 
     @staticmethod
     def _find_all_simd(
-        ida_signature: str, skip_more_than_one: bool = False
+        ida_signature: str,
+        skip_more_than_one: bool = False,
+        buf: typing.Optional["InMemoryBuffer"] = None,
     ) -> list[Match]:
         simd_signature, _ = SigText.normalize(ida_signature)
-        with ProgressDialog("Please stand by, copying segments..."):
-            buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
+        if buf is None:
+            with ProgressDialog("Please stand by, copying segments..."):
+                buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
         data_mv = buf.data()
         LOGGER.debug(
             "searching for",
@@ -2045,43 +2188,153 @@ class SignatureSearcher:
         return results
 
     @staticmethod
-    def find_all(ida_signature: str) -> list[Match]:
+    def find_all(
+        ida_signature: str,
+        buf: typing.Optional["InMemoryBuffer"] = None,
+        skip_more_than_one: bool = False,
+    ) -> list[Match]:
         # Use SIMD if available
         if SIMD_SPEEDUP_AVAILABLE:
-            return SignatureSearcher._find_all_simd(ida_signature)
+            return SignatureSearcher._find_all_simd(
+                ida_signature, skip_more_than_one=skip_more_than_one, buf=buf
+            )
         binary = idaapi.compiled_binpat_vec_t()
         idaapi.parse_binpat_str(binary, idaapi.inf_get_min_ea(), ida_signature, 16)
         out: list[Match] = []
         ea = idaapi.inf_get_min_ea()
+        max_ea = idaapi.inf_get_max_ea()
         _bin_search = getattr(idaapi, "bin_search", None) or getattr(
             idaapi, "bin_search3"
         )
+        flags = idaapi.BIN_SEARCH_NOCASE | idaapi.BIN_SEARCH_FORWARD
         while True:
             # Check for user cancellation
             if idaapi_user_canceled():
                 LOGGER.info("Search canceled by user")
                 break
 
-            hit, _ = _bin_search(
-                ea,
-                idaapi.inf_get_max_ea(),
-                binary,
-                idaapi.BIN_SEARCH_NOCASE | idaapi.BIN_SEARCH_FORWARD,
-            )
+            hit, _ = _bin_search(ea, max_ea, binary, flags)
             if hit == idaapi.BADADDR:
                 break
             out.append(Match(hit))
+            # is_unique only needs to know if there is more than one match;
+            # bail at 2 instead of enumerating every match in the database.
+            if skip_more_than_one and len(out) > 1:
+                break
             ea = hit + 1
         return out
 
     @classmethod
-    def count_matches(cls, ida_signature: str) -> int:
-        """Return the number of matches for the given IDA-format signature."""
-        return len(cls.find_all(ida_signature))
+    def count_matches(
+        cls,
+        ida_signature: str,
+        buf: typing.Optional["InMemoryBuffer"] = None,
+    ) -> int:
+        """Return the number of matches for the given IDA-format signature.
+
+        Enumerates every match; callers that only need uniqueness should use
+        is_unique (which bails at the second match).
+        """
+        return len(cls.find_all(ida_signature, buf=buf))
 
     @classmethod
-    def is_unique(cls, ida_signature: str) -> bool:
-        return cls.count_matches(ida_signature) == 1
+    def is_unique(
+        cls,
+        ida_signature: str,
+        buf: typing.Optional["InMemoryBuffer"] = None,
+    ) -> bool:
+        """Return True iff the signature matches exactly one location.
+
+        Bails at the second match. Enumerating all matches of a short,
+        common signature is catastrophic on a large binary (observed:
+        110M+ scan iterations for one function-signature search), and
+        uniqueness only depends on whether the count is 0, 1, or 2+.
+        """
+        matches = cls.find_all(ida_signature, buf=buf, skip_more_than_one=True)
+        return len(matches) == 1
+
+
+_ACTIVE_PROFILE: typing.Any = None
+
+
+def start_profiling() -> None:
+    """Begin a cProfile session that captures whatever runs after this call.
+
+    Intended for in-IDA diagnostics. Pair with stop_profiling().
+
+        >>> import sigmaker
+        >>> sigmaker.start_profiling()
+        ... # run whatever (FIND_FUNCTION_SIG, FIND_XREF, etc.)
+        >>> sigmaker.stop_profiling()    # dumps to {IDAUSR}/sigmaker_profile.*
+
+    Calling start_profiling() twice without an intervening stop_profiling()
+    discards the previous session and begins a fresh one.
+    """
+    import cProfile
+    global _ACTIVE_PROFILE
+    if _ACTIVE_PROFILE is not None:
+        _ACTIVE_PROFILE.disable()
+        idaapi.msg("start_profiling: discarding previous active session\n")
+    pr = cProfile.Profile()
+    pr.enable()
+    _ACTIVE_PROFILE = pr
+    idaapi.msg("start_profiling: profiling enabled\n")
+
+
+def stop_profiling(
+    output_path: typing.Optional[str] = None,
+    top_n: int = 30,
+    sort_by: str = "cumulative",
+) -> typing.Optional[str]:
+    """Stop the active cProfile session, dump the result, and print a summary.
+
+    Args:
+        output_path: Where to write the binary cProfile dump. None writes
+            to {IDAUSR}/sigmaker_profile.prof. A .txt sibling with the
+            top_n summary is always written next to the .prof file.
+        top_n: How many functions to print in the text summary.
+        sort_by: pstats sort key (cumulative, tottime, ncalls, ...).
+
+    Returns:
+        The .prof file path on success, or None if no profiling was active.
+        Output is also printed via idaapi.msg so it appears in the IDA
+        Output window.
+    """
+    import pstats
+    import io as _io
+    global _ACTIVE_PROFILE
+    if _ACTIVE_PROFILE is None:
+        idaapi.msg("stop_profiling: no active session; call start_profiling() first\n")
+        return None
+    pr = _ACTIVE_PROFILE
+    _ACTIVE_PROFILE = None
+    pr.disable()
+
+    if output_path is None:
+        idausr = idaapi.get_user_idadir()
+        output_path = os.path.join(idausr, "sigmaker_profile.prof")
+    text_path = output_path + ".txt" if not output_path.endswith(".txt") else output_path
+
+    pr.dump_stats(output_path)
+
+    buf = _io.StringIO()
+    pstats.Stats(pr, stream=buf).sort_stats(sort_by).print_stats(top_n)
+    text = buf.getvalue()
+
+    header = (
+        f"stop_profiling:\n"
+        f"  prof dump:   {output_path}\n"
+        f"  text dump:   {text_path}\n"
+        f"  sort by:     {sort_by}\n"
+        f"  top {top_n}:\n"
+    )
+    with open(text_path, "w") as f:
+        f.write(header)
+        f.write(text)
+
+    idaapi.msg(header)
+    idaapi.msg(text)
+    return output_path
 
 
 # no cover: start
@@ -2430,15 +2683,18 @@ Quick Options:
 class _ActionHandler(idaapi.action_handler_t):
     """Internal helper bridging IDA UI actions to plugin methods."""
 
-    def __init__(self, action_function):
+    def __init__(self, action_function, always_enabled: bool = False):
         super().__init__()
         self.action_function = action_function
+        self.always_enabled = always_enabled
 
     def activate(self, ctx: idaapi.action_ctx_base_t) -> int:
         self.action_function(ctx=ctx)
         return 1
 
     def update(self, ctx: idaapi.action_ctx_base_t) -> int:
+        if self.always_enabled:
+            return idaapi.AST_ENABLE_ALWAYS
         if ctx.widget_type == idaapi.BWN_DISASM:
             return idaapi.AST_ENABLE_FOR_WIDGET
         return idaapi.AST_DISABLE_FOR_WIDGET
@@ -2490,6 +2746,9 @@ class SigMakerPlugin(idaapi.plugin_t):
     wanted_hotkey = "Ctrl-Alt-S"
 
     ACTION_SHOW_SIGMAKER: str = "pysigmaker:show"
+    ACTION_START_PROFILING: str = "pysigmaker:start_profiling"
+    ACTION_STOP_PROFILING: str = "pysigmaker:stop_profiling"
+    PROFILING_MENU_PATH: str = "Edit/Plugins/"
 
     def init(self) -> int:
         self._hooks = self._init_hooks(_PopupHook(self.ACTION_SHOW_SIGMAKER))
@@ -2517,9 +2776,41 @@ class SigMakerPlugin(idaapi.plugin_t):
                 154,
             )
         )
+        idaapi.register_action(
+            idaapi.action_desc_t(
+                self.ACTION_START_PROFILING,
+                "SigMaker: Start profiling",
+                _ActionHandler(self._action_start_profiling, always_enabled=True),
+                None,
+                "Start a cProfile session capturing subsequent SigMaker activity.",
+            )
+        )
+        idaapi.register_action(
+            idaapi.action_desc_t(
+                self.ACTION_STOP_PROFILING,
+                "SigMaker: Stop profiling and dump",
+                _ActionHandler(self._action_stop_profiling, always_enabled=True),
+                None,
+                "Stop the active cProfile session and write the dump to the user IDA dir.",
+            )
+        )
+        idaapi.attach_action_to_menu(
+            self.PROFILING_MENU_PATH, self.ACTION_START_PROFILING, idaapi.SETMENU_APP
+        )
+        idaapi.attach_action_to_menu(
+            self.PROFILING_MENU_PATH, self.ACTION_STOP_PROFILING, idaapi.SETMENU_APP
+        )
 
     def _deregister_actions(self) -> None:
         idaapi.unregister_action(self.ACTION_SHOW_SIGMAKER)
+        idaapi.unregister_action(self.ACTION_START_PROFILING)
+        idaapi.unregister_action(self.ACTION_STOP_PROFILING)
+
+    def _action_start_profiling(self, ctx=None) -> None:
+        start_profiling()
+
+    def _action_stop_profiling(self, ctx=None) -> None:
+        stop_profiling()
 
     def run(self, ctx) -> None:
         """Entry point called when the user activates the plugin."""

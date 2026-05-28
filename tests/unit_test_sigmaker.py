@@ -6,6 +6,7 @@ to ensure reliable testing across different platforms and architectures.
 """
 
 import array
+import dataclasses
 import gc
 import itertools
 import logging
@@ -14,6 +15,7 @@ import platform
 import random
 import re
 import sys
+import tempfile
 import time
 import unittest
 from unittest.mock import MagicMock, patch
@@ -2509,6 +2511,26 @@ class TestSignatureSearcherCountMatches(CoveredUnitTest):
         with patch.object(sigmaker.SignatureSearcher, "find_all", return_value=[sigmaker.Match(1), sigmaker.Match(2)]):
             self.assertFalse(sigmaker.SignatureSearcher.is_unique("xx"))
 
+    def test_is_unique_requests_early_bail(self):
+        """is_unique must ask find_all to stop at the second match (skip_more_than_one)."""
+        with patch.object(
+            sigmaker.SignatureSearcher, "find_all", return_value=[sigmaker.Match(1)]
+        ) as mp:
+            sigmaker.SignatureSearcher.is_unique("xx")
+        _, kwargs = mp.call_args
+        self.assertTrue(kwargs.get("skip_more_than_one"))
+
+    def test_count_matches_does_not_early_bail(self):
+        """count_matches must enumerate all matches (issue #22 partial-on-cancel count)."""
+        with patch.object(
+            sigmaker.SignatureSearcher, "find_all",
+            return_value=[sigmaker.Match(i) for i in range(5)],
+        ) as mp:
+            count = sigmaker.SignatureSearcher.count_matches("xx")
+        self.assertEqual(count, 5)
+        _, kwargs = mp.call_args
+        self.assertFalse(kwargs.get("skip_more_than_one", False))
+
 
 class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
     """Iterates every instruction in a function and returns the shortest unique signature."""
@@ -2521,9 +2543,28 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
         sigmaker.idaapi.decode_insn = MagicMock(return_value=1)
         sigmaker.idaapi.get_byte = MagicMock(return_value=0x90)
-        sigmaker.idaapi.get_bytes = MagicMock(return_value=b"\x90")
+        # get_bytes side_effect tolerant of both int counts (from the new
+        # pre-decode bulk read) and MagicMock counts (from existing code
+        # paths that pass ins.size where ins is an auto-attribute MagicMock).
+        def _fake_get_bytes(ea, count):
+            if isinstance(count, int):
+                return b"\x90" * count
+            return b"\x90"
+        sigmaker.idaapi.get_bytes = MagicMock(side_effect=_fake_get_bytes)
+        # generate() now pre-loads the segment buffer once up front, so
+        # patch InMemoryBuffer.load (otherwise _load_segments infinite-loops
+        # iterating MagicMock segments via while seg: ...).
+        fake_buf = MagicMock()
+        fake_buf.data.return_value = memoryview(b"\x90" * 100)
+        fake_buf.imagebase = 0x1000
+        fake_buf.file_size = 100
+        self._load_patcher = patch.object(
+            sigmaker.InMemoryBuffer, "load", return_value=fake_buf
+        )
+        self._load_patcher.start()
 
     def tearDown(self):
+        self._load_patcher.stop()
         sigmaker.idaapi_user_canceled = self.original_user_canceled
 
     def _make_pfn(self, start_ea: int, end_ea: int):
@@ -2554,7 +2595,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_ida_sig_str):
+        def fake_is_unique(_ida_sig_str, *_a, **_kw):
             calls["n"] += 1
             n = calls["n"]
             if n <= 10:
@@ -2578,7 +2619,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_):
+        def fake_is_unique(_, *_a, **_kw):
             calls["n"] += 1
             return calls["n"] == 7
 
@@ -2596,7 +2637,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_):
+        def fake_is_unique(_, *_a, **_kw):
             calls["n"] += 1
             return calls["n"] == 5
 
@@ -2623,7 +2664,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_):
+        def fake_is_unique(_, *_a, **_kw):
             calls["n"] += 1
             return calls["n"] % 3 == 0
 
@@ -2637,6 +2678,113 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         self.assertEqual(
             sigmaker.MinimalFunctionSignatureGenerator.MIN_USEFUL_SIG_BYTES, 5
         )
+
+    def test_predecode_calls_get_bytes_once_per_generate(self):
+        """Pre-decode collapses N per-instruction get_bytes calls into 1 bulk call."""
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x100A)
+
+        calls = {"n": 0}
+
+        def fake_is_unique(_, *_a, **_kw):
+            calls["n"] += 1
+            return calls["n"] == 5
+
+        sigmaker.idaapi.get_bytes.reset_mock()
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+        ):
+            gen.generate(pfn, self._make_cfg(max_len=50))
+
+        # One bulk call for the whole function. Growth loops read from the
+        # cached bytes, not from idaapi.
+        self.assertEqual(sigmaker.idaapi.get_bytes.call_count, 1)
+        sigmaker.idaapi.get_bytes.assert_called_with(0x1000, 10)
+
+    def test_predecode_empty_function_raises(self):
+        """A function with start_ea == end_ea has no instructions to anchor on."""
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x1000)
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", return_value=False
+        ):
+            with self.assertRaises(sigmaker.Unexpected):
+                gen.generate(pfn, self._make_cfg(max_len=10))
+
+    def test_predecode_get_bytes_none_raises(self):
+        """When idaapi.get_bytes returns None (unmapped function), generate raises."""
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x1005)
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=None)
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", return_value=False
+        ):
+            with self.assertRaises(sigmaker.Unexpected):
+                gen.generate(pfn, self._make_cfg(max_len=10))
+
+    def test_generate_loads_buffer_at_most_once(self):
+        """The whole point of the cache: even if many is_unique calls happen, the InMemoryBuffer load round-trip happens at most once per generate()."""
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x100A)
+
+        # Fake is_unique that exercises many scans before deciding.
+        calls = {"n": 0}
+
+        def fake_is_unique(_ida_sig_str, *args, **kwargs):
+            calls["n"] += 1
+            return calls["n"] == 5
+
+        fake_buf = MagicMock()
+        fake_buf.data.return_value = memoryview(b"\x90" * 100)
+        fake_buf.imagebase = 0
+        fake_buf.file_size = 100
+
+        with patch.object(
+            sigmaker.InMemoryBuffer, "load", return_value=fake_buf
+        ) as mp_load, patch.object(
+            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+        ):
+            gen.generate(pfn, self._make_cfg(max_len=50))
+
+        self.assertLessEqual(mp_load.call_count, 1)
+
+
+class TestSignatureSearcherBufferCache(CoveredUnitTest):
+    """The SignatureSearcher scan API accepts an optional cached buffer."""
+
+    def setUp(self):
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
+
+    def _fake_buf(self, size: int = 100):
+        fake_buf = MagicMock()
+        fake_buf.data.return_value = memoryview(b"\x90" * size)
+        fake_buf.imagebase = 0x1000
+        fake_buf.file_size = size
+        return fake_buf
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_find_all_simd_skips_load_when_buf_provided(self):
+        """When _find_all_simd is given a buf=..., it must NOT call InMemoryBuffer.load."""
+        with patch.object(
+            sigmaker.InMemoryBuffer, "load"
+        ) as mp_load, patch.object(
+            sigmaker, "_simd_scan_bytes", return_value=-1
+        ), patch.object(sigmaker, "ProgressDialog"):
+            sigmaker.SignatureSearcher._find_all_simd("48 8B C4", buf=self._fake_buf())
+        mp_load.assert_not_called()
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_find_all_simd_loads_when_buf_is_none(self):
+        """When _find_all_simd is given buf=None (default), it loads fresh (today's behavior)."""
+        with patch.object(
+            sigmaker.InMemoryBuffer, "load", return_value=self._fake_buf()
+        ) as mp_load, patch.object(
+            sigmaker, "_simd_scan_bytes", return_value=-1
+        ), patch.object(sigmaker, "ProgressDialog"):
+            sigmaker.SignatureSearcher._find_all_simd("48 8B C4")
+        mp_load.assert_called_once()
 
 
 class TestActionEnumAddsFunctionSig(CoveredUnitTest):
@@ -2692,6 +2840,149 @@ class TestGeneratedSignatureOrdering(CoveredUnitTest):
             [(0xE8, False), (0x00, True), (0x00, True), (0x33, False)]
         )
         self.assertEqual(sig._wildcard_count(), 2)
+
+
+class TestDecodeFunctionForAnchors(CoveredUnitTest):
+    """The one-shot decode helper used by MinimalFunctionSignatureGenerator.generate."""
+
+    def setUp(self):
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.decode_insn = MagicMock(return_value=1)
+        sigmaker.idaapi.get_bytes = MagicMock(
+            side_effect=lambda ea, count: b"\x90" * count
+        )
+
+    def tearDown(self):
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
+
+    def _processor(self):
+        return sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+
+    def _cfg(self, **kw):
+        return sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+            **kw,
+        )
+
+    def _pfn(self, start_ea: int, end_ea: int):
+        pfn = MagicMock()
+        pfn.start_ea = start_ea
+        pfn.end_ea = end_ea
+        return pfn
+
+    def test_empty_function_returns_empty_list(self):
+        pfn = self._pfn(0x1000, 0x1000)
+        decoded = sigmaker._decode_function_for_anchors(
+            pfn, self._processor(), self._cfg()
+        )
+        self.assertEqual(decoded, [])
+
+    def test_single_byte_instructions(self):
+        pfn = self._pfn(0x1000, 0x1005)
+        decoded = sigmaker._decode_function_for_anchors(
+            pfn, self._processor(), self._cfg()
+        )
+        self.assertEqual(len(decoded), 5)
+        for i, di in enumerate(decoded):
+            self.assertEqual(di.ea, 0x1000 + i)
+            self.assertEqual(di.size, 1)
+            self.assertEqual(di.raw_bytes, b"\x90")
+            self.assertEqual(di.operand_offb, 0)
+            self.assertEqual(di.operand_length, 0)
+
+    def test_single_get_bytes_call(self):
+        pfn = self._pfn(0x1000, 0x100A)
+        sigmaker.idaapi.get_bytes.reset_mock()
+        sigmaker._decode_function_for_anchors(pfn, self._processor(), self._cfg())
+        sigmaker.idaapi.get_bytes.assert_called_once_with(0x1000, 10)
+
+    def test_short_read_returns_empty_when_function_bytes_none(self):
+        pfn = self._pfn(0x1000, 0x1005)
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=None)
+        decoded = sigmaker._decode_function_for_anchors(
+            pfn, self._processor(), self._cfg()
+        )
+        self.assertEqual(decoded, [])
+
+
+class TestStartStopProfiling(CoveredUnitTest):
+    """The console-callable cProfile helpers for in-IDA diagnostics."""
+
+    def setUp(self):
+        sigmaker.idaapi.msg = MagicMock()
+        sigmaker.idaapi.get_user_idadir = MagicMock(
+            return_value=tempfile.mkdtemp()
+        )
+        # Ensure no stale session leaks between tests.
+        sigmaker._ACTIVE_PROFILE = None
+
+    def tearDown(self):
+        sigmaker._ACTIVE_PROFILE = None
+
+    def test_stop_without_start_returns_none(self):
+        result = sigmaker.stop_profiling()
+        self.assertIsNone(result)
+        sigmaker.idaapi.msg.assert_called()
+
+    def test_start_then_stop_writes_files(self):
+        out = tempfile.NamedTemporaryFile(suffix=".prof", delete=False).name
+        sigmaker.start_profiling()
+        # Tiny "real" workload so the profile has something to capture.
+        sum(range(100))
+        result = sigmaker.stop_profiling(output_path=out, top_n=5)
+        self.assertEqual(result, out)
+        import os
+        self.assertGreater(os.path.getsize(out), 0)
+        self.assertGreater(os.path.getsize(out + ".txt"), 0)
+
+    def test_start_twice_discards_previous(self):
+        sigmaker.start_profiling()
+        first = sigmaker._ACTIVE_PROFILE
+        sigmaker.start_profiling()
+        self.assertIsNotNone(sigmaker._ACTIVE_PROFILE)
+        self.assertIsNot(sigmaker._ACTIVE_PROFILE, first)
+        sigmaker.stop_profiling(output_path=tempfile.NamedTemporaryFile(suffix=".prof", delete=False).name)
+
+
+class TestDecodedInstruction(CoveredUnitTest):
+    """The pre-decoded instruction container used by MinimalFunctionSignatureGenerator."""
+
+    def test_construction_with_all_fields(self):
+        di = sigmaker._DecodedInstruction(
+            ea=0x1000,
+            size=3,
+            raw_bytes=b"\x48\x8b\xc4",
+            operand_offb=0,
+            operand_length=0,
+        )
+        self.assertEqual(di.ea, 0x1000)
+        self.assertEqual(di.size, 3)
+        self.assertEqual(di.raw_bytes, b"\x48\x8b\xc4")
+        self.assertEqual(di.operand_offb, 0)
+        self.assertEqual(di.operand_length, 0)
+
+    def test_is_frozen(self):
+        di = sigmaker._DecodedInstruction(
+            ea=0x1000, size=1, raw_bytes=b"\x90",
+            operand_offb=0, operand_length=0,
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            di.ea = 0x2000
+
+    def test_uses_slots(self):
+        di = sigmaker._DecodedInstruction(
+            ea=0x1000, size=1, raw_bytes=b"\x90",
+            operand_offb=0, operand_length=0,
+        )
+        self.assertTrue(hasattr(sigmaker._DecodedInstruction, "__slots__"))
+        self.assertFalse(hasattr(di, "__dict__"))
 
 
 if __name__ == "__main__":

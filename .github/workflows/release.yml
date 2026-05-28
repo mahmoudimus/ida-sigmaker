@@ -104,14 +104,24 @@ jobs:
               if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
               run: |
                   cp src/sigmaker/__init__.py sigmaker.py
+            - &read-changelog
+              name: 📖 Read CHANGELOG section for this version
+              id: changelog
+              if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
+              # Pinned to v2.4.0 (mindsers/changelog-reader-action).
+              uses: mindsers/changelog-reader-action@1faaf50aa09d5793d9a100819973df801febfb31
+              with:
+                  version: ${{ steps.version.outputs.version }}
+                  path: ./CHANGELOG.md
             - &create-release-body
               name: ✏️ Create release body
               if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
+              # changes_file is a path to the parsed section body, so we cat it
+              # in (never interpolate changelog text into the shell, which would
+              # execute backticks/$() in the markdown).
               run: |
                   VERSION="${{ steps.version.outputs.version }}"
-                  # Build release_body.md, embedding this version's CHANGELOG.md
-                  # section (from its "## [VERSION]" heading up to the next
-                  # "## [" heading) directly into the published release notes.
+                  CHANGES_FILE="${{ steps.changelog.outputs.changes_file }}"
                   {
                     echo "# sigmaker.py - IDA Python Standalone Python Release"
                     echo ""
@@ -122,17 +132,8 @@ jobs:
                     echo ""
                     echo "## What changed"
                     echo ""
-                    if [ -f CHANGELOG.md ]; then
-                      SECTION=$(awk -v ver="$VERSION" '
-                          $0 ~ ("^## \\[" ver "\\]") { capture = 1; print; next }
-                          capture && /^## \[/ { exit }
-                          capture { print }
-                      ' CHANGELOG.md)
-                    else
-                      SECTION=""
-                    fi
-                    if [ -n "$SECTION" ]; then
-                      printf '%s\n' "$SECTION"
+                    if [ -n "$CHANGES_FILE" ] && [ -f "$CHANGES_FILE" ]; then
+                      cat "$CHANGES_FILE"
                     else
                       echo "See [CHANGELOG.md](https://github.com/mahmoudimus/ida-sigmaker/blob/main/CHANGELOG.md) for details."
                     fi
@@ -213,5 +214,6 @@ jobs:
 
             - *setup-python
             - *create-sigmaker-py
+            - *read-changelog
             - *create-release-body
             - *generate-release

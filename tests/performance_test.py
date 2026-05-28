@@ -239,6 +239,69 @@ class TestBenchmarkPerformance(unittest.TestCase):
             "speedup_factor": sum(python_times) / sum(simd_times),
         }
 
+    def benchmark_predecode_function_sig(self, iterations: int = 3) -> dict:
+        """Time MinimalFunctionSignatureGenerator on a real function.
+
+        Picks the largest function in the test binary that has at least 10
+        instructions, runs generate() N times, reports median wall time.
+        """
+        if not self.ida_available:
+            self.skipTest("IDA Pro API not available for benchmarking")
+
+        func_qty = idaapi.get_func_qty()
+        if func_qty == 0:
+            self.skipTest("No functions in test binary")
+
+        best_pfn = None
+        best_size = 0
+        for i in range(func_qty):
+            pfn = idaapi.getn_func(i)
+            if pfn is None:
+                continue
+            size = pfn.end_ea - pfn.start_ea
+            if size > best_size:
+                best_size = size
+                best_pfn = pfn
+
+        if best_pfn is None or best_size < 10:
+            self.skipTest("No suitable function found for benchmarking")
+
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=True,
+            continue_outside_of_function=False,
+            wildcard_optimized=True,
+            ask_longer_signature=False,
+            max_single_signature_length=100,
+        )
+        processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        gen = sigmaker.MinimalFunctionSignatureGenerator(processor)
+
+        times = []
+        for _ in range(iterations):
+            t0 = time.perf_counter()
+            try:
+                gen.generate(best_pfn, cfg)
+            except sigmaker.Unexpected:
+                pass
+            times.append(time.perf_counter() - t0)
+
+        times.sort()
+        median = times[len(times) // 2]
+
+        print("\n--- benchmark_predecode_function_sig ---")
+        print(f"function bytes: {best_size}")
+        print(f"iterations: {iterations}")
+        print(f"median wall time: {median:.4f}s")
+
+        return {
+            "operation": "predecode_function_sig",
+            "function_bytes": best_size,
+            "iterations": iterations,
+            "median_wall_seconds": median,
+            "times": times,
+        }
+
     def test_performance_benchmarks(self):
         """Run all performance benchmarks and display results."""
         print("\n" + "=" * 80)

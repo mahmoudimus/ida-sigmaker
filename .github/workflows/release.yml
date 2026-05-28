@@ -104,34 +104,54 @@ jobs:
               if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
               run: |
                   cp src/sigmaker/__init__.py sigmaker.py
+            - &read-changelog
+              name: 📖 Read CHANGELOG section for this version
+              id: changelog
+              if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
+              # Pinned to v2.4.0 (mindsers/changelog-reader-action).
+              uses: mindsers/changelog-reader-action@1faaf50aa09d5793d9a100819973df801febfb31
+              with:
+                  version: ${{ steps.version.outputs.version }}
+                  path: ./CHANGELOG.md
             - &create-release-body
               name: ✏️ Create release body
               if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
+              # changes_file is a path to the parsed section body, so we cat it
+              # in (never interpolate changelog text into the shell, which would
+              # execute backticks/$() in the markdown).
               run: |
-                  cat > release_body.md << 'EOF'
-                  # sigmaker.py - IDA Python Standalone Python Release
+                  VERSION="${{ steps.version.outputs.version }}"
+                  CHANGES_FILE="${{ steps.changelog.outputs.changes_file }}"
+                  {
+                    echo "# sigmaker.py - IDA Python Standalone Python Release"
+                    echo ""
+                    echo "## Release Information"
+                    echo "- **Version**: ${VERSION}"
+                    echo "- **Source**: https://github.com/mahmoudimus/ida-sigmaker"
+                    echo "- **Author**: @mahmoudimus (Mahmoud Abdelkader)"
+                    echo ""
+                    echo "## What changed"
+                    echo ""
+                    if [ -n "$CHANGES_FILE" ] && [ -f "$CHANGES_FILE" ]; then
+                      cat "$CHANGES_FILE"
+                    else
+                      echo "See [CHANGELOG.md](https://github.com/mahmoudimus/ida-sigmaker/blob/main/CHANGELOG.md) for details."
+                    fi
+                    echo ""
+                    echo "## Description"
+                    echo "This is a standalone release of the IDA Pro signature maker plugin. The file \`sigmaker.py\` contains the complete plugin code that can be directly imported into IDA Pro."
+                    echo ""
+                    echo "## Installation"
+                    echo "1. Copy \`sigmaker.py\` to your IDA Pro plugins directory"
+                    echo "2. Restart IDA Pro"
+                    echo "3. Use Ctrl+Alt+S to access the Signature Maker menu"
+                    echo ""
+                    echo "## License"
+                    echo "See the main repository for license information."
+                  } > release_body.md
 
-                  ## Release Information
-                  - **Version**: ${{ steps.version.outputs.version }}
-                  - **Source**: https://github.com/mahmoudimus/ida-sigmaker
-                  - **Author**: @mahmoudimus (Mahmoud Abdelkader)
-
-                  ## Description
-                  This is a standalone release of the IDA Pro signature maker plugin. The file `sigmaker.py` contains the complete plugin code that can be directly imported into IDA Pro.
-
-                  ## Installation
-                  1. Copy `sigmaker.py` to your IDA Pro plugins directory
-                  2. Restart IDA Pro
-                  3. Use Ctrl+Alt+S to access the Signature Maker menu
-
-                  ## License
-                  See the main repository for license information.
-                  EOF
-
-                  echo "RELEASE_BODY<<EOF" >> $GITHUB_ENV
-                  cat release_body.md >> $GITHUB_ENV
-                  echo "EOF" >> $GITHUB_ENV
-                  rm release_body.md
+                  echo "----- release_body.md -----"
+                  cat release_body.md
             - &generate-release
               name: 📦 Generate Release
               if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
@@ -141,7 +161,7 @@ jobs:
                       sigmaker.py
                   tag_name: ${{ steps.version.outputs.tag }} # e.g. v1.3.0
                   name: ${{ steps.version.outputs.tag }}
-                  body: ${{ env.RELEASE_BODY }}
+                  body_path: release_body.md
                   draft: false
                   generate_release_notes: false
                   prerelease: ${{ contains(steps.version.outputs.version, '-') }}
@@ -194,5 +214,6 @@ jobs:
 
             - *setup-python
             - *create-sigmaker-py
+            - *read-changelog
             - *create-release-body
             - *generate-release

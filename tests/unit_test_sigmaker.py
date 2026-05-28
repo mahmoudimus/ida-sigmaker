@@ -3105,7 +3105,7 @@ class TestProgressFormatters(CoveredUnitTest):
             best_size=100,
             current_anchor_ea=0x140001040,
             inner_length=7,
-            inner_matches=3,
+            inner_matches=2,
         )
         msg = fmt(idx=18, item=0x140001040, elapsed=4.0, total=None)
         # Function bounds + size shown.
@@ -3114,10 +3114,11 @@ class TestProgressFormatters(CoveredUnitTest):
         # Anchor with idx.
         self.assertIn("Anchor (#18):", msg)
         self.assertIn("0x140001040", msg)
-        # Inner search bounds + length + matches.
+        # Inner search bounds + length + matches. Early-bail caps the count,
+        # so 2-or-more renders as "2+".
         self.assertIn("0x140001040 .. 0x140001047", msg)
         self.assertIn("7 bytes", msg)
-        self.assertIn("3 matches", msg)
+        self.assertIn("2+ matches", msg)
         # Best so far + candidates + elapsed.
         self.assertIn("Best found:   -", msg)
         self.assertIn("0 unique so far", msg)

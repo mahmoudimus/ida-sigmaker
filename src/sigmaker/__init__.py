@@ -2501,6 +2501,10 @@ class _FunctionSigProgress:
         inner_bounds = f"{anchor:#x} .. {inner_end:#x}"
         if self.inner_matches is None:
             inner_matches_str = "scanning..."
+        elif self.inner_matches >= 2:
+            # Uniqueness is decided with an early-bail scan that stops at the
+            # second match, so the exact count past 1 is unknown: show "2+".
+            inner_matches_str = "2+ matches so far"
         else:
             inner_matches_str = f"{self.inner_matches} matches so far"
         best = f"{self.best_size} bytes" if self.candidates else "-"

@@ -6,6 +6,7 @@ to ensure reliable testing across different platforms and architectures.
 """
 
 import array
+import dataclasses
 import gc
 import itertools
 import logging
@@ -2692,6 +2693,40 @@ class TestGeneratedSignatureOrdering(CoveredUnitTest):
             [(0xE8, False), (0x00, True), (0x00, True), (0x33, False)]
         )
         self.assertEqual(sig._wildcard_count(), 2)
+
+
+class TestDecodedInstruction(CoveredUnitTest):
+    """The pre-decoded instruction container used by MinimalFunctionSignatureGenerator."""
+
+    def test_construction_with_all_fields(self):
+        di = sigmaker._DecodedInstruction(
+            ea=0x1000,
+            size=3,
+            raw_bytes=b"\x48\x8b\xc4",
+            operand_offb=0,
+            operand_length=0,
+        )
+        self.assertEqual(di.ea, 0x1000)
+        self.assertEqual(di.size, 3)
+        self.assertEqual(di.raw_bytes, b"\x48\x8b\xc4")
+        self.assertEqual(di.operand_offb, 0)
+        self.assertEqual(di.operand_length, 0)
+
+    def test_is_frozen(self):
+        di = sigmaker._DecodedInstruction(
+            ea=0x1000, size=1, raw_bytes=b"\x90",
+            operand_offb=0, operand_length=0,
+        )
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            di.ea = 0x2000
+
+    def test_uses_slots(self):
+        di = sigmaker._DecodedInstruction(
+            ea=0x1000, size=1, raw_bytes=b"\x90",
+            operand_offb=0, operand_length=0,
+        )
+        self.assertTrue(hasattr(sigmaker._DecodedInstruction, "__slots__"))
+        self.assertFalse(hasattr(di, "__dict__"))
 
 
 if __name__ == "__main__":

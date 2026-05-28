@@ -1297,6 +1297,23 @@ class InstructionProcessor:
             )
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
+class _DecodedInstruction:
+    """Pre-decoded instruction data; produced once per function and reused
+    across anchor growth loops in MinimalFunctionSignatureGenerator.
+
+    operand_offb / operand_length describe the byte range to wildcard for
+    this cfg's operand policy. Both are 0 when no operand should be
+    wildcarded (e.g. wildcard_operands=False, or the instruction has no
+    operand that matches the current WildcardPolicy).
+    """
+    ea: int
+    size: int
+    raw_bytes: bytes
+    operand_offb: int
+    operand_length: int
+
+
 @dataclasses.dataclass(slots=True)
 class InstructionWalker:
     """

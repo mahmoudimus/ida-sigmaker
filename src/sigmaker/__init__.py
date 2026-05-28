@@ -2144,32 +2144,36 @@ class SignatureSearcher:
     def find_all(
         ida_signature: str,
         buf: typing.Optional["InMemoryBuffer"] = None,
+        skip_more_than_one: bool = False,
     ) -> list[Match]:
         # Use SIMD if available
         if SIMD_SPEEDUP_AVAILABLE:
-            return SignatureSearcher._find_all_simd(ida_signature, buf=buf)
+            return SignatureSearcher._find_all_simd(
+                ida_signature, skip_more_than_one=skip_more_than_one, buf=buf
+            )
         binary = idaapi.compiled_binpat_vec_t()
         idaapi.parse_binpat_str(binary, idaapi.inf_get_min_ea(), ida_signature, 16)
         out: list[Match] = []
         ea = idaapi.inf_get_min_ea()
+        max_ea = idaapi.inf_get_max_ea()
         _bin_search = getattr(idaapi, "bin_search", None) or getattr(
             idaapi, "bin_search3"
         )
+        flags = idaapi.BIN_SEARCH_NOCASE | idaapi.BIN_SEARCH_FORWARD
         while True:
             # Check for user cancellation
             if idaapi_user_canceled():
                 LOGGER.info("Search canceled by user")
                 break
 
-            hit, _ = _bin_search(
-                ea,
-                idaapi.inf_get_max_ea(),
-                binary,
-                idaapi.BIN_SEARCH_NOCASE | idaapi.BIN_SEARCH_FORWARD,
-            )
+            hit, _ = _bin_search(ea, max_ea, binary, flags)
             if hit == idaapi.BADADDR:
                 break
             out.append(Match(hit))
+            # is_unique only needs to know if there is more than one match;
+            # bail at 2 instead of enumerating every match in the database.
+            if skip_more_than_one and len(out) > 1:
+                break
             ea = hit + 1
         return out
 
@@ -2179,7 +2183,11 @@ class SignatureSearcher:
         ida_signature: str,
         buf: typing.Optional["InMemoryBuffer"] = None,
     ) -> int:
-        """Return the number of matches for the given IDA-format signature."""
+        """Return the number of matches for the given IDA-format signature.
+
+        Enumerates every match; callers that only need uniqueness should use
+        is_unique (which bails at the second match).
+        """
         return len(cls.find_all(ida_signature, buf=buf))
 
     @classmethod
@@ -2188,7 +2196,15 @@ class SignatureSearcher:
         ida_signature: str,
         buf: typing.Optional["InMemoryBuffer"] = None,
     ) -> bool:
-        return cls.count_matches(ida_signature, buf=buf) == 1
+        """Return True iff the signature matches exactly one location.
+
+        Bails at the second match. Enumerating all matches of a short,
+        common signature is catastrophic on a large binary (observed:
+        110M+ scan iterations for one function-signature search), and
+        uniqueness only depends on whether the count is 0, 1, or 2+.
+        """
+        matches = cls.find_all(ida_signature, buf=buf, skip_more_than_one=True)
+        return len(matches) == 1
 
 
 _ACTIVE_PROFILE: typing.Any = None

@@ -2511,6 +2511,26 @@ class TestSignatureSearcherCountMatches(CoveredUnitTest):
         with patch.object(sigmaker.SignatureSearcher, "find_all", return_value=[sigmaker.Match(1), sigmaker.Match(2)]):
             self.assertFalse(sigmaker.SignatureSearcher.is_unique("xx"))
 
+    def test_is_unique_requests_early_bail(self):
+        """is_unique must ask find_all to stop at the second match (skip_more_than_one)."""
+        with patch.object(
+            sigmaker.SignatureSearcher, "find_all", return_value=[sigmaker.Match(1)]
+        ) as mp:
+            sigmaker.SignatureSearcher.is_unique("xx")
+        _, kwargs = mp.call_args
+        self.assertTrue(kwargs.get("skip_more_than_one"))
+
+    def test_count_matches_does_not_early_bail(self):
+        """count_matches must enumerate all matches (issue #22 partial-on-cancel count)."""
+        with patch.object(
+            sigmaker.SignatureSearcher, "find_all",
+            return_value=[sigmaker.Match(i) for i in range(5)],
+        ) as mp:
+            count = sigmaker.SignatureSearcher.count_matches("xx")
+        self.assertEqual(count, 5)
+        _, kwargs = mp.call_args
+        self.assertFalse(kwargs.get("skip_more_than_one", False))
+
 
 class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
     """Iterates every instruction in a function and returns the shortest unique signature."""

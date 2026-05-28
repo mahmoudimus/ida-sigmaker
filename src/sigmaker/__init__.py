@@ -1503,6 +1503,25 @@ class UniqueSignatureGenerator:
         raise Unexpected("Signature not unique (reached end of analysis)")
 
 
+def _refine_offsets(
+    data_mv: memoryview,
+    offsets: list[int],
+    j: int,
+    value: int,
+    mask: int,
+) -> list[int]:
+    """Keep offsets c where (data_mv[c + j] & mask) == (value & mask).
+
+    j is the pattern-relative index of the byte being checked; c is a match
+    start offset into data_mv. Candidates whose c + j runs past the buffer
+    cannot match and are dropped. Used to refine a shrinking candidate set
+    as a signature grows, instead of re-scanning the whole database.
+    """
+    n = len(data_mv)
+    target = value & mask
+    return [c for c in offsets if c + j < n and (data_mv[c + j] & mask) == target]
+
+
 def _decode_function_for_anchors(
     pfn: "idaapi.func_t",
     processor: "InstructionProcessor",

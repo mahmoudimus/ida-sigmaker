@@ -2553,6 +2553,40 @@ class TestSignatureSearcherCountMatches(CoveredUnitTest):
         self.assertFalse(kwargs.get("skip_more_than_one", False))
 
 
+class TestRefineOffsets(CoveredUnitTest):
+    """In-memory candidate refinement: keep offsets whose byte at c+j matches."""
+
+    def _mv(self, b: bytes):
+        return memoryview(bytearray(b))
+
+    def test_exact_byte_keeps_matching(self):
+        data = self._mv(b"\x90\x48\x90\x48\x90")
+        # offsets 0..4; appended byte index j=1 must equal 0x48 (mask 0xFF)
+        out = sigmaker._refine_offsets(data, [0, 1, 2, 3], 1, 0x48, 0xFF)
+        # c=0 -> data[1]=0x48 keep; c=1 -> data[2]=0x90 drop; c=2 -> data[3]=0x48 keep; c=3 -> data[4]=0x90 drop
+        self.assertEqual(out, [0, 2])
+
+    def test_full_wildcard_keeps_all(self):
+        data = self._mv(b"\x01\x02\x03\x04")
+        out = sigmaker._refine_offsets(data, [0, 1, 2], 1, 0x00, 0x00)
+        self.assertEqual(out, [0, 1, 2])
+
+    def test_nibble_mask(self):
+        data = self._mv(b"\x4A\x4B\x9C")
+        # mask 0xF0 keeps where high nibble == 0x40
+        out = sigmaker._refine_offsets(data, [0, 1, 2], 0, 0x40, 0xF0)
+        self.assertEqual(out, [0, 1])
+
+    def test_out_of_bounds_dropped(self):
+        data = self._mv(b"\x90\x90")
+        # c=1, j=2 -> c+j=3 is past the buffer; must be dropped, not raise
+        out = sigmaker._refine_offsets(data, [0, 1], 2, 0x90, 0xFF)
+        self.assertEqual(out, [])
+
+    def test_empty_input(self):
+        self.assertEqual(sigmaker._refine_offsets(self._mv(b"\x90"), [], 0, 0x90, 0xFF), [])
+
+
 class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
     """Iterates every instruction in a function and returns the shortest unique signature."""
 

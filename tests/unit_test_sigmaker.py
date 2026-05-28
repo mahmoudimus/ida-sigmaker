@@ -2522,7 +2522,14 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
         sigmaker.idaapi.decode_insn = MagicMock(return_value=1)
         sigmaker.idaapi.get_byte = MagicMock(return_value=0x90)
-        sigmaker.idaapi.get_bytes = MagicMock(return_value=b"\x90")
+        # get_bytes side_effect tolerant of both int counts (from the new
+        # pre-decode bulk read) and MagicMock counts (from existing code
+        # paths that pass ins.size where ins is an auto-attribute MagicMock).
+        def _fake_get_bytes(ea, count):
+            if isinstance(count, int):
+                return b"\x90" * count
+            return b"\x90"
+        sigmaker.idaapi.get_bytes = MagicMock(side_effect=_fake_get_bytes)
 
     def tearDown(self):
         sigmaker.idaapi_user_canceled = self.original_user_canceled
@@ -2638,6 +2645,49 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         self.assertEqual(
             sigmaker.MinimalFunctionSignatureGenerator.MIN_USEFUL_SIG_BYTES, 5
         )
+
+    def test_predecode_calls_get_bytes_once_per_generate(self):
+        """Pre-decode collapses N per-instruction get_bytes calls into 1 bulk call."""
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x100A)
+
+        calls = {"n": 0}
+
+        def fake_is_unique(_):
+            calls["n"] += 1
+            return calls["n"] == 5
+
+        sigmaker.idaapi.get_bytes.reset_mock()
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+        ):
+            gen.generate(pfn, self._make_cfg(max_len=50))
+
+        # One bulk call for the whole function. Growth loops read from the
+        # cached bytes, not from idaapi.
+        self.assertEqual(sigmaker.idaapi.get_bytes.call_count, 1)
+        sigmaker.idaapi.get_bytes.assert_called_with(0x1000, 10)
+
+    def test_predecode_empty_function_raises(self):
+        """A function with start_ea == end_ea has no instructions to anchor on."""
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x1000)
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", return_value=False
+        ):
+            with self.assertRaises(sigmaker.Unexpected):
+                gen.generate(pfn, self._make_cfg(max_len=10))
+
+    def test_predecode_get_bytes_none_raises(self):
+        """When idaapi.get_bytes returns None (unmapped function), generate raises."""
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x1005)
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=None)
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", return_value=False
+        ):
+            with self.assertRaises(sigmaker.Unexpected):
+                gen.generate(pfn, self._make_cfg(max_len=10))
 
 
 class TestActionEnumAddsFunctionSig(CoveredUnitTest):

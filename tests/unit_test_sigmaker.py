@@ -2616,6 +2616,51 @@ class TestFindAllOffsets(CoveredUnitTest):
         self.assertIs(ret, buf)
 
 
+class TestRefinementEquivalence(CoveredUnitTest):
+    """Refinement of a seed set equals a full masked rescan at every step."""
+
+    def _full_matches(self, data: bytes, pattern: list[tuple[int, int]]):
+        # pattern: list of (value, mask); brute-force all start offsets
+        n = len(data)
+        m = len(pattern)
+        out = []
+        for c in range(n - m + 1):
+            ok = True
+            for j, (v, msk) in enumerate(pattern):
+                if (data[c + j] & msk) != (v & msk):
+                    ok = False
+                    break
+            if ok:
+                out.append(c)
+        return out
+
+    def test_refine_tracks_full_rescan(self):
+        import random
+        rng = random.Random(1234)
+        data = bytes(rng.randrange(256) for _ in range(4096))
+        mv = memoryview(bytearray(data))
+        # Build a random growing masked pattern taken from the buffer at anchor a
+        a = 100
+        pattern = []
+        # seed on the first byte via brute force, then refine forward
+        offsets = None
+        for j in range(12):
+            v = data[a + j]
+            msk = 0x00 if (j % 3 == 0) else 0xFF  # sprinkle wildcards
+            pattern.append((v, msk))
+            if offsets is None:
+                offsets = self._full_matches(data, pattern)  # seed at length 1
+            else:
+                offsets = sigmaker._refine_offsets(mv, offsets, j, v, msk)
+            expected = self._full_matches(data, pattern)
+            self.assertEqual(
+                sorted(offsets), sorted(expected),
+                f"divergence at length {j + 1}",
+            )
+        # anchor itself must always survive
+        self.assertIn(a, offsets)
+
+
 class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
     """Iterates every instruction in a function and returns the shortest unique signature."""
 

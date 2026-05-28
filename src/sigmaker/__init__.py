@@ -2620,15 +2620,18 @@ Quick Options:
 class _ActionHandler(idaapi.action_handler_t):
     """Internal helper bridging IDA UI actions to plugin methods."""
 
-    def __init__(self, action_function):
+    def __init__(self, action_function, always_enabled: bool = False):
         super().__init__()
         self.action_function = action_function
+        self.always_enabled = always_enabled
 
     def activate(self, ctx: idaapi.action_ctx_base_t) -> int:
         self.action_function(ctx=ctx)
         return 1
 
     def update(self, ctx: idaapi.action_ctx_base_t) -> int:
+        if self.always_enabled:
+            return idaapi.AST_ENABLE_ALWAYS
         if ctx.widget_type == idaapi.BWN_DISASM:
             return idaapi.AST_ENABLE_FOR_WIDGET
         return idaapi.AST_DISABLE_FOR_WIDGET
@@ -2680,6 +2683,9 @@ class SigMakerPlugin(idaapi.plugin_t):
     wanted_hotkey = "Ctrl-Alt-S"
 
     ACTION_SHOW_SIGMAKER: str = "pysigmaker:show"
+    ACTION_START_PROFILING: str = "pysigmaker:start_profiling"
+    ACTION_STOP_PROFILING: str = "pysigmaker:stop_profiling"
+    PROFILING_MENU_PATH: str = "Edit/Plugins/"
 
     def init(self) -> int:
         self._hooks = self._init_hooks(_PopupHook(self.ACTION_SHOW_SIGMAKER))
@@ -2707,9 +2713,41 @@ class SigMakerPlugin(idaapi.plugin_t):
                 154,
             )
         )
+        idaapi.register_action(
+            idaapi.action_desc_t(
+                self.ACTION_START_PROFILING,
+                "SigMaker: Start profiling",
+                _ActionHandler(self._action_start_profiling, always_enabled=True),
+                None,
+                "Start a cProfile session capturing subsequent SigMaker activity.",
+            )
+        )
+        idaapi.register_action(
+            idaapi.action_desc_t(
+                self.ACTION_STOP_PROFILING,
+                "SigMaker: Stop profiling and dump",
+                _ActionHandler(self._action_stop_profiling, always_enabled=True),
+                None,
+                "Stop the active cProfile session and write the dump to the user IDA dir.",
+            )
+        )
+        idaapi.attach_action_to_menu(
+            self.PROFILING_MENU_PATH, self.ACTION_START_PROFILING, idaapi.SETMENU_APP
+        )
+        idaapi.attach_action_to_menu(
+            self.PROFILING_MENU_PATH, self.ACTION_STOP_PROFILING, idaapi.SETMENU_APP
+        )
 
     def _deregister_actions(self) -> None:
         idaapi.unregister_action(self.ACTION_SHOW_SIGMAKER)
+        idaapi.unregister_action(self.ACTION_START_PROFILING)
+        idaapi.unregister_action(self.ACTION_STOP_PROFILING)
+
+    def _action_start_profiling(self, ctx=None) -> None:
+        start_profiling()
+
+    def _action_stop_profiling(self, ctx=None) -> None:
+        stop_profiling()
 
     def run(self, ctx) -> None:
         """Entry point called when the user activates the plugin."""

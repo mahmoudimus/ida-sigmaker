@@ -2198,6 +2198,38 @@ class SignatureSearcher:
         return results
 
     @staticmethod
+    def find_all_offsets(
+        ida_signature: str,
+        buf: typing.Optional["InMemoryBuffer"] = None,
+    ) -> tuple[list[int], "InMemoryBuffer"]:
+        """Return (offsets, buf): every match as a 0-based offset into
+        buf.data(), plus the buffer used. The offsets seed an in-memory
+        refinement; reusing the returned buf keeps subsequent refinement on
+        the same bytes. SIMD path only.
+        """
+        simd_signature, _ = SigText.normalize(ida_signature)
+        if buf is None:
+            with ProgressDialog("Please stand by, copying segments..."):
+                buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
+        data_mv = buf.data()
+        sig = _SimdSignature(simd_signature)
+        offsets: list[int] = []
+        k = sig.size_bytes
+        if k == 0:
+            return [0], buf
+        n = len(data_mv)
+        off = 0
+        while off <= n - k:
+            if idaapi_user_canceled():
+                break
+            idx = _simd_scan_bytes(data_mv[off:], sig)
+            if idx < 0:
+                break
+            offsets.append(off + idx)
+            off += idx + 1
+        return offsets, buf
+
+    @staticmethod
     def find_all(
         ida_signature: str,
         buf: typing.Optional["InMemoryBuffer"] = None,

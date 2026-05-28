@@ -2587,6 +2587,35 @@ class TestRefineOffsets(CoveredUnitTest):
         self.assertEqual(sigmaker._refine_offsets(self._mv(b"\x90"), [], 0, 0x90, 0xFF), [])
 
 
+class TestFindAllOffsets(CoveredUnitTest):
+    """find_all_offsets returns raw buffer offsets plus the buffer used."""
+
+    def setUp(self):
+        self._saved = sigmaker.idaapi_user_canceled
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
+
+    def tearDown(self):
+        sigmaker.idaapi_user_canceled = self._saved
+
+    def _fake_buf(self, b: bytes):
+        buf = MagicMock()
+        buf.data.return_value = memoryview(bytearray(b))
+        buf.imagebase = 0x1000
+        buf.file_size = len(b)
+        return buf
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_offsets_match_find_all_positions(self):
+        # Pattern "90" should be found at every 0x90 byte; offsets are
+        # buffer-relative (0-based), and the returned buf is the one passed.
+        buf = self._fake_buf(b"\x90\x00\x90\x00\x90")
+        with patch.object(sigmaker, "ProgressDialog"):
+            offs, ret = sigmaker.SignatureSearcher.find_all_offsets("90", buf=buf)
+        self.assertEqual(offs, [0, 2, 4])
+        self.assertIs(ret, buf)
+
+
 class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
     """Iterates every instruction in a function and returns the shortest unique signature."""
 

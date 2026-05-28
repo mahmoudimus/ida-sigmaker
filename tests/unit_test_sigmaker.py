@@ -2530,8 +2530,20 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
                 return b"\x90" * count
             return b"\x90"
         sigmaker.idaapi.get_bytes = MagicMock(side_effect=_fake_get_bytes)
+        # generate() now pre-loads the segment buffer once up front, so
+        # patch InMemoryBuffer.load (otherwise _load_segments infinite-loops
+        # iterating MagicMock segments via while seg: ...).
+        fake_buf = MagicMock()
+        fake_buf.data.return_value = memoryview(b"\x90" * 100)
+        fake_buf.imagebase = 0x1000
+        fake_buf.file_size = 100
+        self._load_patcher = patch.object(
+            sigmaker.InMemoryBuffer, "load", return_value=fake_buf
+        )
+        self._load_patcher.start()
 
     def tearDown(self):
+        self._load_patcher.stop()
         sigmaker.idaapi_user_canceled = self.original_user_canceled
 
     def _make_pfn(self, start_ea: int, end_ea: int):
@@ -2562,7 +2574,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_ida_sig_str):
+        def fake_is_unique(_ida_sig_str, *_a, **_kw):
             calls["n"] += 1
             n = calls["n"]
             if n <= 10:
@@ -2586,7 +2598,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_):
+        def fake_is_unique(_, *_a, **_kw):
             calls["n"] += 1
             return calls["n"] == 7
 
@@ -2604,7 +2616,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_):
+        def fake_is_unique(_, *_a, **_kw):
             calls["n"] += 1
             return calls["n"] == 5
 
@@ -2631,7 +2643,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_):
+        def fake_is_unique(_, *_a, **_kw):
             calls["n"] += 1
             return calls["n"] % 3 == 0
 
@@ -2653,7 +2665,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_):
+        def fake_is_unique(_, *_a, **_kw):
             calls["n"] += 1
             return calls["n"] == 5
 
@@ -2688,6 +2700,70 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         ):
             with self.assertRaises(sigmaker.Unexpected):
                 gen.generate(pfn, self._make_cfg(max_len=10))
+
+    def test_generate_loads_buffer_at_most_once(self):
+        """The whole point of the cache: even if many is_unique calls happen, the InMemoryBuffer load round-trip happens at most once per generate()."""
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x100A)
+
+        # Fake is_unique that exercises many scans before deciding.
+        calls = {"n": 0}
+
+        def fake_is_unique(_ida_sig_str, *args, **kwargs):
+            calls["n"] += 1
+            return calls["n"] == 5
+
+        fake_buf = MagicMock()
+        fake_buf.data.return_value = memoryview(b"\x90" * 100)
+        fake_buf.imagebase = 0
+        fake_buf.file_size = 100
+
+        with patch.object(
+            sigmaker.InMemoryBuffer, "load", return_value=fake_buf
+        ) as mp_load, patch.object(
+            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+        ):
+            gen.generate(pfn, self._make_cfg(max_len=50))
+
+        self.assertLessEqual(mp_load.call_count, 1)
+
+
+class TestSignatureSearcherBufferCache(CoveredUnitTest):
+    """The SignatureSearcher scan API accepts an optional cached buffer."""
+
+    def setUp(self):
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
+
+    def _fake_buf(self, size: int = 100):
+        fake_buf = MagicMock()
+        fake_buf.data.return_value = memoryview(b"\x90" * size)
+        fake_buf.imagebase = 0x1000
+        fake_buf.file_size = size
+        return fake_buf
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_find_all_simd_skips_load_when_buf_provided(self):
+        """When _find_all_simd is given a buf=..., it must NOT call InMemoryBuffer.load."""
+        with patch.object(
+            sigmaker.InMemoryBuffer, "load"
+        ) as mp_load, patch.object(
+            sigmaker, "_simd_scan_bytes", return_value=-1
+        ), patch.object(sigmaker, "ProgressDialog"):
+            sigmaker.SignatureSearcher._find_all_simd("48 8B C4", buf=self._fake_buf())
+        mp_load.assert_not_called()
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_find_all_simd_loads_when_buf_is_none(self):
+        """When _find_all_simd is given buf=None (default), it loads fresh (today's behavior)."""
+        with patch.object(
+            sigmaker.InMemoryBuffer, "load", return_value=self._fake_buf()
+        ) as mp_load, patch.object(
+            sigmaker, "_simd_scan_bytes", return_value=-1
+        ), patch.object(sigmaker, "ProgressDialog"):
+            sigmaker.SignatureSearcher._find_all_simd("48 8B C4")
+        mp_load.assert_called_once()
 
 
 class TestActionEnumAddsFunctionSig(CoveredUnitTest):

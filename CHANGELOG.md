@@ -2,6 +2,31 @@
 
 All notable user-visible changes to this plugin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.2] - 2026-05-28
+
+### Added
+
+- **Live wait-box progress** for the `Create unique signature` and `Find shortest unique signature for current function` actions. The wait box updates as the search runs: current signature length and elapsed time for both, plus function bounds, current anchor, inner-search bounds, best size, and candidate count for the function search. ([#27](https://github.com/mahmoudimus/ida-sigmaker/issues/27), [#30](https://github.com/mahmoudimus/ida-sigmaker/pull/30))
+- **Self-describing wait boxes.** Every action's wait box now leads with the action name and a one-line explanation of what it is doing, so a screenshot always identifies which action produced it. ([#30](https://github.com/mahmoudimus/ida-sigmaker/pull/30))
+- **`start_profiling` / `stop_profiling` helpers**, exposed as `Edit/Plugins` menu actions, for capturing a cProfile dump of a slow run from inside IDA. ([#30](https://github.com/mahmoudimus/ida-sigmaker/pull/30))
+
+### Changed
+
+- **`Find shortest unique signature for current function` is dramatically faster.** Uniqueness checks now stop at the second match instead of enumerating every match in the database, and the segment buffer is loaded once per search instead of once per growth step. A function search that previously took minutes on a large database now completes in seconds. ([#31](https://github.com/mahmoudimus/ida-sigmaker/pull/31))
+- **Wait-box refresh throttle default is now 1 second** (previously 100 ms), so the box does not repaint faster than it can be read. ([#27](https://github.com/mahmoudimus/ida-sigmaker/issues/27), [#30](https://github.com/mahmoudimus/ida-sigmaker/pull/30))
+
+### Removed
+
+- **The live `Matches:` count is temporarily removed from the `Create unique signature` wait box.** Counting every match on every growth step was the search's bottleneck; the wait box still shows the growing length and elapsed time. A future release restores an exact count cheaply via incremental candidate refinement. ([#27](https://github.com/mahmoudimus/ida-sigmaker/issues/27), [#30](https://github.com/mahmoudimus/ida-sigmaker/pull/30))
+
+### Internal
+
+- `MinimalFunctionSignatureGenerator` decodes each function instruction once up front and grows anchors over the cached data, instead of re-decoding per anchor. ([#31](https://github.com/mahmoudimus/ida-sigmaker/pull/31))
+- `SignatureSearcher.is_unique` stops at the second match; `count_matches` still enumerates fully for callers that need the exact count (such as partial-on-cancel). ([#31](https://github.com/mahmoudimus/ida-sigmaker/pull/31))
+- The compiled `_speedups` SIMD extension now loads from a sibling directory when the package-level import resolves to a namespace package without a matching compiled build (dev and symlink layouts). ([#31](https://github.com/mahmoudimus/ida-sigmaker/pull/31))
+
+[1.7.2]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.7.1...v1.7.2
+
 ## [1.7.1] - 2026-05-27
 
 ### Added

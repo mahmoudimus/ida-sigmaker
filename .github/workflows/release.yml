@@ -108,30 +108,49 @@ jobs:
               name: ✏️ Create release body
               if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
               run: |
-                  cat > release_body.md << 'EOF'
-                  # sigmaker.py - IDA Python Standalone Python Release
+                  VERSION="${{ steps.version.outputs.version }}"
+                  # Build release_body.md, embedding this version's CHANGELOG.md
+                  # section (from its "## [VERSION]" heading up to the next
+                  # "## [" heading) directly into the published release notes.
+                  {
+                    echo "# sigmaker.py - IDA Python Standalone Python Release"
+                    echo ""
+                    echo "## Release Information"
+                    echo "- **Version**: ${VERSION}"
+                    echo "- **Source**: https://github.com/mahmoudimus/ida-sigmaker"
+                    echo "- **Author**: @mahmoudimus (Mahmoud Abdelkader)"
+                    echo ""
+                    echo "## What changed"
+                    echo ""
+                    if [ -f CHANGELOG.md ]; then
+                      SECTION=$(awk -v ver="$VERSION" '
+                          $0 ~ ("^## \\[" ver "\\]") { capture = 1; print; next }
+                          capture && /^## \[/ { exit }
+                          capture { print }
+                      ' CHANGELOG.md)
+                    else
+                      SECTION=""
+                    fi
+                    if [ -n "$SECTION" ]; then
+                      printf '%s\n' "$SECTION"
+                    else
+                      echo "See [CHANGELOG.md](https://github.com/mahmoudimus/ida-sigmaker/blob/main/CHANGELOG.md) for details."
+                    fi
+                    echo ""
+                    echo "## Description"
+                    echo "This is a standalone release of the IDA Pro signature maker plugin. The file \`sigmaker.py\` contains the complete plugin code that can be directly imported into IDA Pro."
+                    echo ""
+                    echo "## Installation"
+                    echo "1. Copy \`sigmaker.py\` to your IDA Pro plugins directory"
+                    echo "2. Restart IDA Pro"
+                    echo "3. Use Ctrl+Alt+S to access the Signature Maker menu"
+                    echo ""
+                    echo "## License"
+                    echo "See the main repository for license information."
+                  } > release_body.md
 
-                  ## Release Information
-                  - **Version**: ${{ steps.version.outputs.version }}
-                  - **Source**: https://github.com/mahmoudimus/ida-sigmaker
-                  - **Author**: @mahmoudimus (Mahmoud Abdelkader)
-
-                  ## Description
-                  This is a standalone release of the IDA Pro signature maker plugin. The file `sigmaker.py` contains the complete plugin code that can be directly imported into IDA Pro.
-
-                  ## Installation
-                  1. Copy `sigmaker.py` to your IDA Pro plugins directory
-                  2. Restart IDA Pro
-                  3. Use Ctrl+Alt+S to access the Signature Maker menu
-
-                  ## License
-                  See the main repository for license information.
-                  EOF
-
-                  echo "RELEASE_BODY<<EOF" >> $GITHUB_ENV
-                  cat release_body.md >> $GITHUB_ENV
-                  echo "EOF" >> $GITHUB_ENV
-                  rm release_body.md
+                  echo "----- release_body.md -----"
+                  cat release_body.md
             - &generate-release
               name: 📦 Generate Release
               if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
@@ -141,7 +160,7 @@ jobs:
                       sigmaker.py
                   tag_name: ${{ steps.version.outputs.tag }} # e.g. v1.3.0
                   name: ${{ steps.version.outputs.tag }}
-                  body: ${{ env.RELEASE_BODY }}
+                  body_path: release_body.md
                   draft: false
                   generate_release_notes: false
                   prerelease: ${{ contains(steps.version.outputs.version, '-') }}

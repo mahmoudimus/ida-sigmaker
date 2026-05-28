@@ -47,6 +47,53 @@ with contextlib.suppress(ImportError):
     SIMD_SPEEDUP_AVAILABLE = True
 
 
+def _load_speedups_sibling() -> bool:
+    """Load the compiled _speedups extension that sits next to this file.
+
+    The package-level `from sigmaker._speedups import simd_scan` above
+    resolves to whatever `sigmaker` is first on sys.path. In a dev or
+    symlink layout (e.g. IDA loading this file from a source tree while a
+    pip-installed `sigmaker` namespace package without a matching compiled
+    extension shadows it), that import yields nothing. When this file lives
+    in a real package directory with a sibling `_speedups/`, load the
+    extension by path instead. Returns True on success.
+
+    No-ops for the shipped single-file `sigmaker.py`, which has no sibling
+    `_speedups/` directory and relies on the pip-installed extension.
+    """
+    global simd_scan, _SimdSignature, _simd_scan_bytes, SIMD_SPEEDUP_AVAILABLE
+    import importlib.machinery
+    import importlib.util
+
+    speedups_dir = pathlib.Path(__file__).resolve().parent / "_speedups"
+    if not speedups_dir.is_dir():
+        return False
+    for suffix in importlib.machinery.EXTENSION_SUFFIXES:
+        candidate = speedups_dir / f"simd_scan{suffix}"
+        if not candidate.exists():
+            continue
+        # The spec name's final component must be "simd_scan" so the C
+        # extension loader finds its PyInit_simd_scan export.
+        spec = importlib.util.spec_from_file_location(
+            "sigmaker._speedups.simd_scan", candidate
+        )
+        if spec is None or spec.loader is None:
+            continue
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        simd_scan = module
+        _SimdSignature = module.Signature
+        _simd_scan_bytes = module.scan_bytes
+        SIMD_SPEEDUP_AVAILABLE = True
+        return True
+    return False
+
+
+if not SIMD_SPEEDUP_AVAILABLE:
+    with contextlib.suppress(Exception):
+        _load_speedups_sibling()
+
+
 def configure_logging(
     logger=None,
     logging_name="sigmaker",

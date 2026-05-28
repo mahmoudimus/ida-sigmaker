@@ -1922,20 +1922,6 @@ class TestProgressReporter(CoveredUnitTest):
         sigmaker.idaapi.ask_yn = self.original_ask_yn
         sigmaker.idaapi_user_canceled = self.original_user_canceled
 
-    def test_check_continue_prompt_basic(self):
-        """Test basic CheckContinuePrompt functionality."""
-        prompt = sigmaker.CheckContinuePrompt(
-            enable_prompt=False  # Disable prompting for this test
-        )
-
-        # Check initial state
-        self.assertGreater(prompt.elapsed_time, 0)
-        self.assertFalse(prompt.should_cancel())
-
-        # Update progress
-        prompt.report_progress(message="Test message", test_key="test_value")
-        self.assertFalse(prompt.should_cancel())
-
     def test_check_continue_prompt_disabled(self):
         """Test that prompting can be disabled."""
         prompt = sigmaker.CheckContinuePrompt(enable_prompt=False)
@@ -1943,22 +1929,6 @@ class TestProgressReporter(CoveredUnitTest):
         # Should never cancel when prompting is disabled
         for _ in range(10):
             self.assertFalse(prompt.should_cancel())
-
-    def test_check_continue_prompt_metadata(self):
-        """Test progress metadata tracking."""
-        prompt = sigmaker.CheckContinuePrompt(
-            metadata={"static_key": "static_value"}, enable_prompt=False
-        )
-
-        # Add dynamic metadata
-        prompt.report_progress(
-            message="Processing...", dynamic_key="dynamic_value", count=42
-        )
-
-        # Check that metadata was stored
-        self.assertEqual(prompt._dynamic_metadata["dynamic_key"], "dynamic_value")
-        self.assertEqual(prompt._dynamic_metadata["count"], 42)
-        self.assertEqual(prompt._progress_message, "Processing...")
 
     def test_should_cancel_polls_idaapi_user_canceled(self):
         """Even with prompts disabled, the wait-box Cancel must propagate."""
@@ -2224,7 +2194,20 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
         )
         self._is_code_patcher.start()
 
+        # Recording dialog factory so we can inspect ProgressBox's
+        # wait-box message activity without touching idaapi (issue #27).
+        self.recorded_dialogs: list[_FakeDialog] = []
+
+        def _factory(message):
+            d = _FakeDialog(message)
+            self.recorded_dialogs.append(d)
+            return d
+
+        self._dialog_patcher = patch.object(sigmaker, "ProgressDialog", _factory)
+        self._dialog_patcher.start()
+
     def tearDown(self):
+        self._dialog_patcher.stop()
         self._is_code_patcher.stop()
         sigmaker.idaapi_user_canceled = self.original_user_canceled
 
@@ -2388,6 +2371,44 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
             result.match_count,
             "match_count must be None when no prior trustworthy count exists",
         )
+
+    def test_progress_dialog_opens_with_generating_signature_message(self):
+        # Issue #27: ProgressBox-owned wait box should appear with the
+        # CREATE_UNIQUE-specific initial message.
+        gen = self._make_generator(cancel_after_iterations=99)
+        counts = iter([5, 5, 5, 5, 1])
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "count_matches",
+            side_effect=lambda *_: next(counts),
+        ):
+            gen.generate(
+                0x1000,
+                self._make_cfg(),
+                policy=sigmaker.GenerationPolicy.strict(),
+            )
+        self.assertEqual(len(self.recorded_dialogs), 1)
+        self.assertIn(
+            "Create unique signature", self.recorded_dialogs[0].initial_message
+        )
+
+    def test_progress_dialog_lifecycle_on_cancel(self):
+        # Even when the search cancels, the dialog __exit__ must fire so
+        # the wait box closes cleanly.
+        gen = self._make_generator(cancel_after_iterations=2)
+        with patch.object(
+            sigmaker.SignatureSearcher, "count_matches", return_value=5
+        ):
+            try:
+                gen.generate(
+                    0x1000,
+                    self._make_cfg(),
+                    policy=sigmaker.GenerationPolicy.strict(),
+                )
+            except sigmaker.UserCanceledError:
+                pass
+        self.assertEqual(len(self.recorded_dialogs), 1)
+        self.assertEqual(self.recorded_dialogs[0].exit_count, 1)
 
 
 class TestGeneratedSignatureDisplay(CoveredUnitTest):
@@ -2563,8 +2584,20 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         )
         self._load_patcher.start()
 
+        # Recording dialog factory (issue #27 progress display).
+        self.recorded_dialogs: list[_FakeDialog] = []
+
+        def _factory(message):
+            d = _FakeDialog(message)
+            self.recorded_dialogs.append(d)
+            return d
+
+        self._dialog_patcher = patch.object(sigmaker, "ProgressDialog", _factory)
+        self._dialog_patcher.start()
+
     def tearDown(self):
         self._load_patcher.stop()
+        self._dialog_patcher.stop()
         sigmaker.idaapi_user_canceled = self.original_user_canceled
 
     def _make_pfn(self, start_ea: int, end_ea: int):
@@ -2747,6 +2780,50 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
             gen.generate(pfn, self._make_cfg(max_len=50))
 
         self.assertLessEqual(mp_load.call_count, 1)
+
+    def test_progress_dialog_opens_with_function_sig_message(self):
+        # Issue #27: ProgressBox-owned wait box should appear with the
+        # FIND_FUNCTION_SIG-specific initial message.
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x1010)
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", return_value=False
+        ):
+            try:
+                gen.generate(pfn, self._make_cfg(max_len=10))
+            except sigmaker.Unexpected:
+                pass
+        # generate() may also open a short-lived "copying segments" wait box
+        # when SIMD is available, so assert the function-sig wait box is among
+        # the recorded dialogs rather than asserting an exact count.
+        messages = [d.initial_message for d in self.recorded_dialogs]
+        self.assertTrue(
+            any("Find shortest function signature" in m for m in messages),
+            f"Expected a function-sig wait box; got {messages}",
+        )
+
+    def test_cancel_during_decode_raises_before_processing(self):
+        # Cancelling before the search starts must short-circuit promptly.
+        # InstructionWalker.__next__ checks cancel before decode_insn, so the
+        # pre-decode pass raises UserCanceledError without decoding the whole
+        # 256-byte function.
+        gen = self._make_generator()
+        pfn = self._make_pfn(0x1000, 0x1100)  # 256 instruction bytes
+
+        sigmaker.idaapi.decode_insn.reset_mock()
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=True)
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", return_value=False
+        ):
+            with self.assertRaises(sigmaker.UserCanceledError):
+                gen.generate(pfn, self._make_cfg(max_len=10))
+
+        self.assertLess(
+            sigmaker.idaapi.decode_insn.call_count,
+            20,
+            "Cancel should short-circuit pre-decode before walking the "
+            "whole function.",
+        )
 
 
 class TestSignatureSearcherBufferCache(CoveredUnitTest):
@@ -2983,6 +3060,337 @@ class TestDecodedInstruction(CoveredUnitTest):
         )
         self.assertTrue(hasattr(sigmaker._DecodedInstruction, "__slots__"))
         self.assertFalse(hasattr(di, "__dict__"))
+
+
+
+
+class TestProgressFormatters(CoveredUnitTest):
+    """The two __call__-able formatter dataclasses render their templates correctly."""
+
+    def _make_sig(self, n: int) -> sigmaker.Signature:
+        sig = sigmaker.Signature()
+        for i in range(n):
+            sig.append(sigmaker.SignatureByte(0x90 + i, False))
+        return sig
+
+    def test_unique_progress_reflects_sig_length(self):
+        sig = self._make_sig(5)
+        fmt = sigmaker._UniqueSigProgress(sig=sig)
+        msg = fmt(idx=1, item=None, elapsed=2.5, total=None)
+        self.assertIn("Length:  5 bytes", msg)
+        self.assertIn("Elapsed: 2s", msg)
+
+    def test_unique_progress_sig_is_live_reference(self):
+        sig = self._make_sig(2)
+        fmt = sigmaker._UniqueSigProgress(sig=sig)
+        sig.append(sigmaker.SignatureByte(0xCC, False))
+        sig.append(sigmaker.SignatureByte(0xCC, False))
+        msg = fmt(idx=1, item=None, elapsed=0.0, total=None)
+        self.assertIn("Length:  4 bytes", msg)
+
+    def test_function_progress_renders_all_fields(self):
+        candidates: list = []
+        fmt = sigmaker._FunctionSigProgress(
+            pfn_start_ea=0x140001000,
+            pfn_end_ea=0x140001100,
+            candidates=candidates,
+            best_size=100,
+            current_anchor_ea=0x140001040,
+            inner_length=7,
+            inner_matches=2,
+        )
+        msg = fmt(idx=18, item=0x140001040, elapsed=4.0, total=None)
+        # Function bounds + size shown.
+        self.assertIn("0x140001000 .. 0x140001100", msg)
+        self.assertIn("(256 bytes)", msg)
+        # Anchor with idx.
+        self.assertIn("Anchor (#18):", msg)
+        self.assertIn("0x140001040", msg)
+        # Inner search bounds + length + matches. Early-bail caps the count,
+        # so 2-or-more renders as "2+".
+        self.assertIn("0x140001040 .. 0x140001047", msg)
+        self.assertIn("7 bytes", msg)
+        self.assertIn("2+ matches", msg)
+        # Best so far + candidates + elapsed.
+        self.assertIn("Best found:   -", msg)
+        self.assertIn("0 unique so far", msg)
+        self.assertIn("Elapsed:      4s", msg)
+
+    def test_function_progress_inner_matches_none_renders_scanning(self):
+        fmt = sigmaker._FunctionSigProgress(
+            pfn_start_ea=0x1000,
+            pfn_end_ea=0x1100,
+            candidates=[],
+            best_size=50,
+            current_anchor_ea=0x1010,
+            inner_length=0,
+            inner_matches=None,
+        )
+        msg = fmt(idx=1, item=0x1010, elapsed=0.0, total=None)
+        self.assertIn("scanning...", msg)
+
+    def test_function_progress_reflects_best_and_candidates(self):
+        candidates: list = []
+        fmt = sigmaker._FunctionSigProgress(
+            pfn_start_ea=0x1000,
+            pfn_end_ea=0x1100,
+            candidates=candidates,
+            best_size=100,
+            current_anchor_ea=0x1010,
+        )
+        dummy_sig = sigmaker.Signature()
+        dummy_sig.append(sigmaker.SignatureByte(0x90, False))
+        candidates.append(
+            sigmaker.GeneratedSignature(dummy_sig, sigmaker.Match(0x1000))
+        )
+        fmt.best_size = 12
+        msg = fmt(idx=3, item=0x1010, elapsed=2.0, total=None)
+        self.assertIn("Best found:   12 bytes", msg)
+        self.assertIn("1 unique so far", msg)
+
+
+class TestCancelToPartial(CoveredUnitTest):
+    """Context manager that converts UserCanceledError into a partial per policy."""
+
+    def _sentinel_partial(self):
+        sig = sigmaker.Signature()
+        sig.append(sigmaker.SignatureByte(0x90, False))
+        return sigmaker.GeneratedSignature(
+            sig,
+            sigmaker.Match(0x1000),
+            status=sigmaker.GenerationStatus.PARTIAL_ON_CANCEL,
+            match_count=42,
+        )
+
+    def test_strict_propagates_cancel(self):
+        partial = self._sentinel_partial()
+        built = []
+
+        def build_partial():
+            built.append(True)
+            return partial
+
+        cancel = sigmaker._CancelToPartial(
+            sigmaker.GenerationPolicy.strict(), build_partial
+        )
+        with self.assertRaises(sigmaker.UserCanceledError):
+            with cancel:
+                raise sigmaker.UserCanceledError("test cancel")
+
+        self.assertIsNone(cancel.partial)
+        self.assertEqual(built, [])
+
+    def test_permissive_stashes_partial(self):
+        partial = self._sentinel_partial()
+        cancel = sigmaker._CancelToPartial(
+            sigmaker.GenerationPolicy.permissive(), lambda: partial
+        )
+        with cancel:
+            raise sigmaker.UserCanceledError("test cancel")
+        self.assertIs(cancel.partial, partial)
+
+    def test_permissive_propagates_when_build_partial_raises(self):
+        def build_partial():
+            raise sigmaker.UserCanceledError("empty sig, nothing to return")
+
+        cancel = sigmaker._CancelToPartial(
+            sigmaker.GenerationPolicy.permissive(), build_partial
+        )
+        with self.assertRaises(sigmaker.UserCanceledError) as ctx:
+            with cancel:
+                raise sigmaker.UserCanceledError("original cancel")
+
+        self.assertEqual(str(ctx.exception), "original cancel")
+        self.assertIsNone(cancel.partial)
+
+    def test_non_cancel_exceptions_propagate_unchanged(self):
+        cancel = sigmaker._CancelToPartial(
+            sigmaker.GenerationPolicy.permissive(),
+            lambda: self._sentinel_partial(),
+        )
+        with self.assertRaises(ValueError):
+            with cancel:
+                raise ValueError("some other error")
+        self.assertIsNone(cancel.partial)
+
+    def test_no_exception_no_partial(self):
+        cancel = sigmaker._CancelToPartial(
+            sigmaker.GenerationPolicy.permissive(),
+            lambda: self._sentinel_partial(),
+        )
+        with cancel:
+            pass
+        self.assertIsNone(cancel.partial)
+
+
+class _FakeDialog:
+    """Recording stand-in for sigmaker.ProgressDialog used in ProgressBox tests."""
+
+    def __init__(self, message: str):
+        self.initial_message = message
+        self.messages: list[str] = []
+        self.enter_count = 0
+        self.exit_count = 0
+        self.exit_exc_type = None
+
+    def __enter__(self):
+        self.enter_count += 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.exit_count += 1
+        self.exit_exc_type = exc_type
+        return False  # never suppress
+
+    def replace_message(self, msg: str, hide_cancel: bool = False):
+        self.messages.append(msg)
+
+
+class TestProgressBox(CoveredUnitTest):
+    """ProgressBox wraps iteration with a wait box and live message updates."""
+
+    def setUp(self):
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        self.dialogs: list[_FakeDialog] = []
+
+    def tearDown(self):
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
+
+    def _factory(self, message):
+        d = _FakeDialog(message)
+        self.dialogs.append(d)
+        return d
+
+    def _clock(self, ticks):
+        """Return a callable that yields successive tick values, repeating the last."""
+        iterator = iter(ticks)
+        last = [ticks[-1]]
+
+        def call():
+            try:
+                v = next(iterator)
+                last[0] = v
+                return v
+            except StopIteration:
+                return last[0]
+
+        return call
+
+    def test_yields_all_items_in_order(self):
+        items = list(sigmaker.ProgressBox(
+            [1, 2, 3], dialog_factory=self._factory, clock=self._clock([0.0])
+        ))
+        self.assertEqual(items, [1, 2, 3])
+
+    def test_dialog_lifecycle(self):
+        list(sigmaker.ProgressBox(
+            [1, 2, 3], dialog_factory=self._factory, clock=self._clock([0.0])
+        ))
+        self.assertEqual(len(self.dialogs), 1)
+        self.assertEqual(self.dialogs[0].enter_count, 1)
+        self.assertEqual(self.dialogs[0].exit_count, 1)
+
+    def test_throttle_skips_redraws_when_clock_does_not_advance(self):
+        # Clock returns 0.0 always; throttle never elapses.
+        list(sigmaker.ProgressBox(
+            [1, 2, 3, 4, 5],
+            dialog_factory=self._factory,
+            clock=self._clock([0.0]),
+            throttle_seconds=10.0,
+        ))
+        self.assertEqual(len(self.dialogs[0].messages), 0)
+
+    def test_throttle_passes_when_clock_advances(self):
+        # Clock yields: start=0.0, then 0.05, 0.20, 0.30, 0.50, 0.55.
+        # With throttle_seconds=0.1, gaps > 0.1 from last_update pass:
+        #   call#1 last=0.0 now=0.05 -> gap 0.05, skip
+        #   call#2 last=0.0 now=0.20 -> gap 0.20, pass; last=0.20
+        #   call#3 last=0.20 now=0.30 -> gap 0.10, NOT >, skip
+        #   call#4 last=0.20 now=0.50 -> gap 0.30, pass; last=0.50
+        #   call#5 last=0.50 now=0.55 -> gap 0.05, skip
+        # = 2 redraws.
+        list(sigmaker.ProgressBox(
+            [1, 2, 3, 4, 5],
+            dialog_factory=self._factory,
+            clock=self._clock([0.0, 0.05, 0.20, 0.30, 0.50, 0.55]),
+            throttle_seconds=0.1,
+        ))
+        self.assertEqual(len(self.dialogs[0].messages), 2)
+
+    def test_format_message_receives_args(self):
+        received = []
+
+        def fmt(idx, item, elapsed, total):
+            received.append((idx, item, elapsed, total))
+            return f"item {idx}"
+
+        list(sigmaker.ProgressBox(
+            ["a", "b"],
+            format_message=fmt,
+            dialog_factory=self._factory,
+            clock=self._clock([0.0, 1.0, 2.0]),
+            throttle_seconds=0.0,
+        ))
+        self.assertEqual(received[0], (1, "a", 1.0, 2))
+        self.assertEqual(received[1], (2, "b", 2.0, 2))
+
+    def test_cancel_raises_user_canceled_error(self):
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=True)
+        with self.assertRaises(sigmaker.UserCanceledError):
+            list(sigmaker.ProgressBox(
+                [1, 2, 3], dialog_factory=self._factory, clock=self._clock([0.0])
+            ))
+        self.assertEqual(self.dialogs[0].exit_count, 1)
+        self.assertIs(self.dialogs[0].exit_exc_type, sigmaker.UserCanceledError)
+
+    def test_total_is_none_for_generator(self):
+        def gen():
+            yield 1
+            yield 2
+
+        received = []
+
+        def fmt(idx, item, elapsed, total):
+            received.append(total)
+            return ""
+
+        list(sigmaker.ProgressBox(
+            gen(),
+            format_message=fmt,
+            dialog_factory=self._factory,
+            clock=self._clock([0.0, 1.0, 2.0]),
+            throttle_seconds=0.0,
+        ))
+        self.assertEqual(received, [None, None])
+
+    def test_total_computed_from_len(self):
+        received = []
+
+        def fmt(idx, item, elapsed, total):
+            received.append(total)
+            return ""
+
+        list(sigmaker.ProgressBox(
+            [10, 20, 30],
+            format_message=fmt,
+            dialog_factory=self._factory,
+            clock=self._clock([0.0, 1.0, 2.0, 3.0]),
+            throttle_seconds=0.0,
+        ))
+        self.assertTrue(all(t == 3 for t in received))
+
+    def test_default_message_when_no_formatter(self):
+        list(sigmaker.ProgressBox(
+            [1, 2],
+            dialog_factory=self._factory,
+            clock=self._clock([0.0, 1.0, 2.0]),
+            throttle_seconds=0.0,
+        ))
+        self.assertEqual(self.dialogs[0].messages[0], "Processing (1/2) | Elapsed: 1s")
+        self.assertEqual(self.dialogs[0].messages[1], "Processing (2/2) | Elapsed: 2s")
 
 
 if __name__ == "__main__":

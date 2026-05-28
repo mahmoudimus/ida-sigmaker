@@ -2191,6 +2191,89 @@ class SignatureSearcher:
         return cls.count_matches(ida_signature, buf=buf) == 1
 
 
+_ACTIVE_PROFILE: typing.Any = None
+
+
+def start_profiling() -> None:
+    """Begin a cProfile session that captures whatever runs after this call.
+
+    Intended for in-IDA diagnostics. Pair with stop_profiling().
+
+        >>> import sigmaker
+        >>> sigmaker.start_profiling()
+        ... # run whatever (FIND_FUNCTION_SIG, FIND_XREF, etc.)
+        >>> sigmaker.stop_profiling()    # dumps to {IDAUSR}/sigmaker_profile.*
+
+    Calling start_profiling() twice without an intervening stop_profiling()
+    discards the previous session and begins a fresh one.
+    """
+    import cProfile
+    global _ACTIVE_PROFILE
+    if _ACTIVE_PROFILE is not None:
+        _ACTIVE_PROFILE.disable()
+        idaapi.msg("start_profiling: discarding previous active session\n")
+    pr = cProfile.Profile()
+    pr.enable()
+    _ACTIVE_PROFILE = pr
+    idaapi.msg("start_profiling: profiling enabled\n")
+
+
+def stop_profiling(
+    output_path: typing.Optional[str] = None,
+    top_n: int = 30,
+    sort_by: str = "cumulative",
+) -> typing.Optional[str]:
+    """Stop the active cProfile session, dump the result, and print a summary.
+
+    Args:
+        output_path: Where to write the binary cProfile dump. None writes
+            to {IDAUSR}/sigmaker_profile.prof. A .txt sibling with the
+            top_n summary is always written next to the .prof file.
+        top_n: How many functions to print in the text summary.
+        sort_by: pstats sort key (cumulative, tottime, ncalls, ...).
+
+    Returns:
+        The .prof file path on success, or None if no profiling was active.
+        Output is also printed via idaapi.msg so it appears in the IDA
+        Output window.
+    """
+    import pstats
+    import io as _io
+    global _ACTIVE_PROFILE
+    if _ACTIVE_PROFILE is None:
+        idaapi.msg("stop_profiling: no active session; call start_profiling() first\n")
+        return None
+    pr = _ACTIVE_PROFILE
+    _ACTIVE_PROFILE = None
+    pr.disable()
+
+    if output_path is None:
+        idausr = idaapi.get_user_idadir()
+        output_path = os.path.join(idausr, "sigmaker_profile.prof")
+    text_path = output_path + ".txt" if not output_path.endswith(".txt") else output_path
+
+    pr.dump_stats(output_path)
+
+    buf = _io.StringIO()
+    pstats.Stats(pr, stream=buf).sort_stats(sort_by).print_stats(top_n)
+    text = buf.getvalue()
+
+    header = (
+        f"stop_profiling:\n"
+        f"  prof dump:   {output_path}\n"
+        f"  text dump:   {text_path}\n"
+        f"  sort by:     {sort_by}\n"
+        f"  top {top_n}:\n"
+    )
+    with open(text_path, "w") as f:
+        f.write(header)
+        f.write(text)
+
+    idaapi.msg(header)
+    idaapi.msg(text)
+    return output_path
+
+
 # no cover: start
 # we do not cover the below because this is mainly executing IDA GUI functionality.
 # any logic here should be pulled out into a separate class and tested separately.

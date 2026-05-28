@@ -15,6 +15,7 @@ import platform
 import random
 import re
 import sys
+import tempfile
 import time
 import unittest
 from unittest.mock import MagicMock, patch
@@ -2889,6 +2890,45 @@ class TestDecodeFunctionForAnchors(CoveredUnitTest):
             pfn, self._processor(), self._cfg()
         )
         self.assertEqual(decoded, [])
+
+
+class TestStartStopProfiling(CoveredUnitTest):
+    """The console-callable cProfile helpers for in-IDA diagnostics."""
+
+    def setUp(self):
+        sigmaker.idaapi.msg = MagicMock()
+        sigmaker.idaapi.get_user_idadir = MagicMock(
+            return_value=tempfile.mkdtemp()
+        )
+        # Ensure no stale session leaks between tests.
+        sigmaker._ACTIVE_PROFILE = None
+
+    def tearDown(self):
+        sigmaker._ACTIVE_PROFILE = None
+
+    def test_stop_without_start_returns_none(self):
+        result = sigmaker.stop_profiling()
+        self.assertIsNone(result)
+        sigmaker.idaapi.msg.assert_called()
+
+    def test_start_then_stop_writes_files(self):
+        out = tempfile.NamedTemporaryFile(suffix=".prof", delete=False).name
+        sigmaker.start_profiling()
+        # Tiny "real" workload so the profile has something to capture.
+        sum(range(100))
+        result = sigmaker.stop_profiling(output_path=out, top_n=5)
+        self.assertEqual(result, out)
+        import os
+        self.assertGreater(os.path.getsize(out), 0)
+        self.assertGreater(os.path.getsize(out + ".txt"), 0)
+
+    def test_start_twice_discards_previous(self):
+        sigmaker.start_profiling()
+        first = sigmaker._ACTIVE_PROFILE
+        sigmaker.start_profiling()
+        self.assertIsNotNone(sigmaker._ACTIVE_PROFILE)
+        self.assertIsNot(sigmaker._ACTIVE_PROFILE, first)
+        sigmaker.stop_profiling(output_path=tempfile.NamedTemporaryFile(suffix=".prof", delete=False).name)
 
 
 class TestDecodedInstruction(CoveredUnitTest):

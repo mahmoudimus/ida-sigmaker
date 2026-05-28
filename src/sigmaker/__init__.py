@@ -1427,6 +1427,13 @@ class UniqueSignatureGenerator:
         bytes_since_last_check = 0
         progress = _UniqueSigProgress(sig=sig)
 
+        # SIMD path: scan the database once to seed a candidate-offset set,
+        # then refine that set in memory as the pattern grows instead of
+        # re-scanning per appended instruction. offsets is None until the
+        # first scan; buf holds the segment buffer the offsets index into.
+        offsets: typing.Optional[list[int]] = None
+        buf: typing.Optional["InMemoryBuffer"] = None
+
         def build_partial() -> GeneratedSignature:
             # Trim trailing wildcards, mirror the success path.
             sig.trim_signature()
@@ -1480,18 +1487,37 @@ class UniqueSignatureGenerator:
                 ):
                     raise Unexpected("Signature left function scope without being unique")
 
+                prev_len = len(sig)
                 self.processor.append_instruction_to_sig(
                     sig, cur_ea, ins, cfg.wildcard_operands, cfg.wildcard_optimized
                 )
                 bytes_since_last_check += ins_len
 
-                count = SignatureSearcher.count_matches(f"{sig:ida}")
-                # SignatureSearcher.find_all polls idaapi_user_canceled inside
-                # its scan loop and bails when set, returning whatever partial
-                # count it had so far (often 0). When the call was interrupted,
-                # keep last_match_count at its prior trustworthy value (issue
-                # #22): the reported number is an upper bound on the partial's
-                # actual match count rather than a meaningless 0.
+                if not SIMD_SPEEDUP_AVAILABLE:
+                    # Non-SIMD builds have no in-memory buffer to refine
+                    # against, so fall back to the per-step rescan.
+                    count = SignatureSearcher.count_matches(f"{sig:ida}")
+                elif offsets is None:
+                    # Seed once: scan the whole database, keep every match
+                    # offset. The candidate count is the exact match count.
+                    offsets, buf = SignatureSearcher.find_all_offsets(f"{sig:ida}")
+                    count = len(offsets)
+                else:
+                    # Refine the surviving candidates in memory for each byte
+                    # appended this iteration; no rescan of the database.
+                    data_mv = buf.data()
+                    for j in range(prev_len, len(sig)):
+                        sb = sig[j]
+                        mask = 0x00 if sb.is_wildcard else 0xFF
+                        offsets = _refine_offsets(data_mv, offsets, j, sb.value, mask)
+                    count = len(offsets)
+                # find_all_offsets polls idaapi_user_canceled inside its scan
+                # loop and bails when set, returning whatever partial offsets
+                # it had so far (often 0). When the call was interrupted, keep
+                # last_match_count at its prior trustworthy value (issue #22):
+                # the reported number is an upper bound on the partial's actual
+                # match count rather than a meaningless 0. Refinement never
+                # bails mid-pass, so its count is always trustworthy.
                 if not idaapi_user_canceled():
                     progress.last_match_count = count
                     if count == 1:
@@ -2513,13 +2539,16 @@ class _UniqueSigProgress:
         "Growing a pattern from the current address until it matches\n"
         "exactly one place in the binary.\n\n"
         "Length:  {length} bytes\n"
+        "Matches: {matches}\n"
         "Elapsed: {elapsed}s\n\n"
         "Press Cancel to stop"
     )
 
     def __call__(self, idx, item, elapsed, total) -> str:
+        match_str = "?" if self.last_match_count is None else str(self.last_match_count)
         return self._TEMPLATE.format(
             length=len(self.sig),
+            matches=match_str,
             elapsed=int(elapsed),
         )
 

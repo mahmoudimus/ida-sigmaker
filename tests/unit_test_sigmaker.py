@@ -2174,9 +2174,17 @@ class TestActionEnum(CoveredUnitTest):
 
 
 class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
-    """policy=permissive returns a partial GeneratedSignature on cancel."""
+    """policy=permissive returns a partial GeneratedSignature on cancel.
+
+    These tests drive the non-SIMD fallback path (count_matches per step) by
+    forcing SIMD_SPEEDUP_AVAILABLE off, so the patched count_matches stays the
+    source of the match count. The partial-on-cancel / progress-message
+    behavior under test is identical on both code paths.
+    """
 
     def setUp(self):
+        self._original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
         self.original_user_canceled = getattr(
             sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
         )
@@ -2210,6 +2218,7 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
         self._dialog_patcher.stop()
         self._is_code_patcher.stop()
         sigmaker.idaapi_user_canceled = self.original_user_canceled
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = self._original_simd
 
     def _make_generator(self, cancel_after_iterations: int):
         """Construct a UniqueSignatureGenerator whose progress_reporter cancels
@@ -2409,6 +2418,84 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
                 pass
         self.assertEqual(len(self.recorded_dialogs), 1)
         self.assertEqual(self.recorded_dialogs[0].exit_count, 1)
+
+
+class TestUniqueSignatureGeneratorSeedThenRefine(CoveredUnitTest):
+    """SIMD path: generate() seeds once via find_all_offsets, then refines.
+
+    Drives the candidate-refinement branch directly (SIMD on), asserting the
+    seed scan happens exactly once and the in-memory refinement narrows the
+    candidate set to a unique match.
+    """
+
+    def setUp(self):
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.decode_insn = MagicMock(return_value=1)
+        sigmaker.idaapi.get_byte = MagicMock(return_value=0x90)
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=b"\x90")
+        sigmaker.idaapi.get_func = MagicMock(return_value=None)
+        self._is_code_patcher = patch.object(
+            sigmaker, "is_address_marked_as_code", return_value=True
+        )
+        self._is_code_patcher.start()
+        self._dialog_patcher = patch.object(sigmaker, "ProgressDialog", MagicMock())
+        self._dialog_patcher.start()
+
+    def tearDown(self):
+        self._dialog_patcher.stop()
+        self._is_code_patcher.stop()
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
+
+    def _make_cfg(self) -> sigmaker.SigMakerConfig:
+        return sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=True,
+            wildcard_optimized=False,
+            ask_longer_signature=False,
+        )
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_seed_once_then_refine_to_unique(self):
+        processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        gen = sigmaker.UniqueSignatureGenerator(processor)
+
+        # The growing pattern is all 0x90 (get_byte/get_bytes mocked to 0x90).
+        # Seed buffer: 0x90 at offsets 0 and 5, but only offset 0 has a second
+        # 0x90 right after it. After the first append (1 byte) the seed has
+        # two candidates; the second append refines down to the single match
+        # at offset 0.
+        seed_buf = MagicMock()
+        seed_buf.data.return_value = memoryview(
+            bytearray(b"\x90\x90\x00\x00\x00\x90\x00\x00")
+        )
+        seed_offsets = [0, 5]
+
+        load_calls = {"n": 0}
+
+        def fake_find_all_offsets(_ida_sig, buf=None):
+            load_calls["n"] += 1
+            return list(seed_offsets), seed_buf
+
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all_offsets",
+            side_effect=fake_find_all_offsets,
+        ):
+            result = gen.generate(
+                0x1000, self._make_cfg(),
+                policy=sigmaker.GenerationPolicy.strict(),
+            )
+
+        self.assertEqual(result.status, sigmaker.GenerationStatus.UNIQUE)
+        # The database was scanned exactly once; the rest was in-memory refine.
+        self.assertEqual(load_calls["n"], 1)
+        # Two 0x90 bytes survive to uniqueness (offset 0: 0x90 0x90).
+        self.assertEqual(len(result.signature), 2)
 
 
 class TestGeneratedSignatureDisplay(CoveredUnitTest):
@@ -3187,6 +3274,20 @@ class TestProgressFormatters(CoveredUnitTest):
         msg = fmt(idx=1, item=None, elapsed=2.5, total=None)
         self.assertIn("Length:  5 bytes", msg)
         self.assertIn("Elapsed: 2s", msg)
+
+    def test_unique_progress_renders_exact_match_count(self):
+        # Candidate-refinement makes the exact count free again, so the
+        # Matches line is back (it was dropped in cebdf07 as a stopgap).
+        sig = self._make_sig(5)
+        fmt = sigmaker._UniqueSigProgress(sig=sig, last_match_count=42)
+        msg = fmt(idx=1, item=None, elapsed=0.0, total=None)
+        self.assertIn("Matches: 42", msg)
+
+    def test_unique_progress_renders_question_mark_when_count_unknown(self):
+        sig = self._make_sig(5)
+        fmt = sigmaker._UniqueSigProgress(sig=sig)  # last_match_count None
+        msg = fmt(idx=1, item=None, elapsed=0.0, total=None)
+        self.assertIn("Matches: ?", msg)
 
     def test_unique_progress_sig_is_live_reference(self):
         sig = self._make_sig(2)

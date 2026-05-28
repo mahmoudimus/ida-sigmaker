@@ -2749,9 +2749,18 @@ class TestRefinementEquivalence(CoveredUnitTest):
 
 
 class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
-    """Iterates every instruction in a function and returns the shortest unique signature."""
+    """Iterates every instruction in a function and returns the shortest unique signature.
+
+    These tests drive the non-SIMD fallback path (count_matches per step) by
+    forcing SIMD_SPEEDUP_AVAILABLE off, so a patched count_matches stays the
+    source of the match count. The anchor-selection / pruning logic under test
+    is identical on both code paths; the SIMD seed-then-refine path is covered
+    separately and against the real binary in the integration suite.
+    """
 
     def setUp(self):
+        self._original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
         self.original_user_canceled = getattr(
             sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
         )
@@ -2794,6 +2803,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         self._load_patcher.stop()
         self._dialog_patcher.stop()
         sigmaker.idaapi_user_canceled = self.original_user_canceled
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = self._original_simd
 
     def _make_pfn(self, start_ea: int, end_ea: int):
         pfn = MagicMock()
@@ -2823,17 +2833,17 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_ida_sig_str, *_a, **_kw):
+        def fake_count_matches(_ida_sig_str, *_a, **_kw):
             calls["n"] += 1
             n = calls["n"]
             if n <= 10:
-                return n == 10
+                return 1 if n == 10 else 2
             if n <= 16:
-                return n == 16
-            return False
+                return 1 if n == 16 else 2
+            return 2
 
         with patch.object(
-            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+            sigmaker.SignatureSearcher, "count_matches", side_effect=fake_count_matches
         ):
             result = gen.generate(pfn, self._make_cfg(max_len=50))
 
@@ -2847,12 +2857,12 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_, *_a, **_kw):
+        def fake_count_matches(_, *_a, **_kw):
             calls["n"] += 1
-            return calls["n"] == 7
+            return 1 if calls["n"] == 7 else 2
 
         with patch.object(
-            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+            sigmaker.SignatureSearcher, "count_matches", side_effect=fake_count_matches
         ):
             result = gen.generate(pfn, self._make_cfg(max_len=50))
 
@@ -2865,12 +2875,12 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_, *_a, **_kw):
+        def fake_count_matches(_, *_a, **_kw):
             calls["n"] += 1
-            return calls["n"] == 5
+            return 1 if calls["n"] == 5 else 2
 
         with patch.object(
-            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+            sigmaker.SignatureSearcher, "count_matches", side_effect=fake_count_matches
         ):
             result = gen.generate(pfn, self._make_cfg(max_len=50))
 
@@ -2881,7 +2891,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         gen = self._make_generator()
         pfn = self._make_pfn(0x1000, 0x1003)
         with patch.object(
-            sigmaker.SignatureSearcher, "is_unique", return_value=False
+            sigmaker.SignatureSearcher, "count_matches", return_value=2
         ):
             with self.assertRaises(sigmaker.Unexpected):
                 gen.generate(pfn, self._make_cfg(max_len=10))
@@ -2892,12 +2902,12 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_, *_a, **_kw):
+        def fake_count_matches(_, *_a, **_kw):
             calls["n"] += 1
-            return calls["n"] % 3 == 0
+            return 1 if calls["n"] % 3 == 0 else 2
 
         with patch.object(
-            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+            sigmaker.SignatureSearcher, "count_matches", side_effect=fake_count_matches
         ):
             with self.assertRaises(sigmaker.Unexpected):
                 gen.generate(pfn, self._make_cfg(max_len=50))
@@ -2914,13 +2924,13 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
 
         calls = {"n": 0}
 
-        def fake_is_unique(_, *_a, **_kw):
+        def fake_count_matches(_, *_a, **_kw):
             calls["n"] += 1
-            return calls["n"] == 5
+            return 1 if calls["n"] == 5 else 2
 
         sigmaker.idaapi.get_bytes.reset_mock()
         with patch.object(
-            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+            sigmaker.SignatureSearcher, "count_matches", side_effect=fake_count_matches
         ):
             gen.generate(pfn, self._make_cfg(max_len=50))
 
@@ -2934,7 +2944,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         gen = self._make_generator()
         pfn = self._make_pfn(0x1000, 0x1000)
         with patch.object(
-            sigmaker.SignatureSearcher, "is_unique", return_value=False
+            sigmaker.SignatureSearcher, "count_matches", return_value=2
         ):
             with self.assertRaises(sigmaker.Unexpected):
                 gen.generate(pfn, self._make_cfg(max_len=10))
@@ -2945,22 +2955,22 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         pfn = self._make_pfn(0x1000, 0x1005)
         sigmaker.idaapi.get_bytes = MagicMock(return_value=None)
         with patch.object(
-            sigmaker.SignatureSearcher, "is_unique", return_value=False
+            sigmaker.SignatureSearcher, "count_matches", return_value=2
         ):
             with self.assertRaises(sigmaker.Unexpected):
                 gen.generate(pfn, self._make_cfg(max_len=10))
 
     def test_generate_loads_buffer_at_most_once(self):
-        """The whole point of the cache: even if many is_unique calls happen, the InMemoryBuffer load round-trip happens at most once per generate()."""
+        """The whole point of the cache: even if many scans happen, the InMemoryBuffer load round-trip happens at most once per generate()."""
         gen = self._make_generator()
         pfn = self._make_pfn(0x1000, 0x100A)
 
-        # Fake is_unique that exercises many scans before deciding.
+        # Fake scan that exercises many checks before deciding.
         calls = {"n": 0}
 
-        def fake_is_unique(_ida_sig_str, *args, **kwargs):
+        def fake_count_matches(_ida_sig_str, *args, **kwargs):
             calls["n"] += 1
-            return calls["n"] == 5
+            return 1 if calls["n"] == 5 else 2
 
         fake_buf = MagicMock()
         fake_buf.data.return_value = memoryview(b"\x90" * 100)
@@ -2970,7 +2980,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         with patch.object(
             sigmaker.InMemoryBuffer, "load", return_value=fake_buf
         ) as mp_load, patch.object(
-            sigmaker.SignatureSearcher, "is_unique", side_effect=fake_is_unique
+            sigmaker.SignatureSearcher, "count_matches", side_effect=fake_count_matches
         ):
             gen.generate(pfn, self._make_cfg(max_len=50))
 
@@ -2982,7 +2992,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         gen = self._make_generator()
         pfn = self._make_pfn(0x1000, 0x1010)
         with patch.object(
-            sigmaker.SignatureSearcher, "is_unique", return_value=False
+            sigmaker.SignatureSearcher, "count_matches", return_value=2
         ):
             try:
                 gen.generate(pfn, self._make_cfg(max_len=10))
@@ -3008,7 +3018,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         sigmaker.idaapi.decode_insn.reset_mock()
         sigmaker.idaapi_user_canceled = MagicMock(return_value=True)
         with patch.object(
-            sigmaker.SignatureSearcher, "is_unique", return_value=False
+            sigmaker.SignatureSearcher, "count_matches", return_value=2
         ):
             with self.assertRaises(sigmaker.UserCanceledError):
                 gen.generate(pfn, self._make_cfg(max_len=10))
@@ -3019,6 +3029,98 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
             "Cancel should short-circuit pre-decode before walking the "
             "whole function.",
         )
+
+
+class TestMinimalFunctionSignatureGeneratorSeedThenRefine(CoveredUnitTest):
+    """SIMD path: _grow_unique_from_decoded seeds once per anchor, then refines.
+
+    Drives the candidate-refinement branch directly (SIMD on), asserting the
+    seed scan (find_all_offsets) happens once per anchor and that the in-memory
+    refinement narrows the candidate set to the exact match count.
+    """
+
+    def setUp(self):
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.decode_insn = MagicMock(return_value=1)
+        sigmaker.idaapi.get_byte = MagicMock(return_value=0x90)
+
+        def _fake_get_bytes(ea, count):
+            if isinstance(count, int):
+                return b"\x90" * count
+            return b"\x90"
+        sigmaker.idaapi.get_bytes = MagicMock(side_effect=_fake_get_bytes)
+
+        self._seed_buf = MagicMock()
+        # Nine 0x90 bytes then a 0x00. Seed candidates 0 and 5 both start a
+        # 0x90 run; refinement keeps both until the byte at pattern index 4
+        # diverges (buf[9] == 0x00), so candidate 5 survives to length 5 and
+        # is dropped exactly there. Candidate 0 reaches uniqueness at 5 bytes.
+        self._seed_buf.data.return_value = memoryview(
+            bytearray(b"\x90\x90\x90\x90\x90\x90\x90\x90\x90\x00")
+        )
+        self._seed_buf.imagebase = 0x1000
+        self._seed_buf.file_size = 10
+        self._load_patcher = patch.object(
+            sigmaker.InMemoryBuffer, "load", return_value=self._seed_buf
+        )
+        self._load_patcher.start()
+        self._dialog_patcher = patch.object(sigmaker, "ProgressDialog", MagicMock())
+        self._dialog_patcher.start()
+
+    def tearDown(self):
+        self._load_patcher.stop()
+        self._dialog_patcher.stop()
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
+
+    def _make_pfn(self, start_ea: int, end_ea: int):
+        pfn = MagicMock()
+        pfn.start_ea = start_ea
+        pfn.end_ea = end_ea
+        return pfn
+
+    def _make_cfg(self, max_len: int = 50) -> sigmaker.SigMakerConfig:
+        return sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+            ask_longer_signature=False,
+            max_single_signature_length=max_len,
+        )
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_seed_once_per_anchor_then_refine(self):
+        processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        gen = sigmaker.MinimalFunctionSignatureGenerator(processor)
+        pfn = self._make_pfn(0x1000, 0x100A)  # 10 single-byte 0x90 instructions
+
+        seed_calls = {"n": 0}
+
+        def fake_find_all_offsets(_ida_sig, buf=None):
+            # Seed: both offsets 0 and 5 match the first 0x90 byte. As the
+            # pattern grows the refinement drops offset 5 (followed by 0x00),
+            # leaving offset 0 as the unique match.
+            seed_calls["n"] += 1
+            return [0, 5], self._seed_buf
+
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all_offsets",
+            side_effect=fake_find_all_offsets,
+        ):
+            result = gen.generate(pfn, self._make_cfg(max_len=50))
+
+        self.assertIsInstance(result, sigmaker.GeneratedSignature)
+        # The first anchor (offset 0) reaches uniqueness via in-memory
+        # refinement after a single seed scan, and it is a 5-byte all-exact
+        # sig with no wildcards, so generate() takes the ideal early-exit and
+        # never starts a second anchor: exactly one seed scan total.
+        self.assertEqual(seed_calls["n"], 1)
+        self.assertEqual(len(result.signature), 5)
 
 
 class TestSignatureSearcherBufferCache(CoveredUnitTest):
@@ -3306,7 +3408,7 @@ class TestProgressFormatters(CoveredUnitTest):
             best_size=100,
             current_anchor_ea=0x140001040,
             inner_length=7,
-            inner_matches=2,
+            inner_matches=3,
         )
         msg = fmt(idx=18, item=0x140001040, elapsed=4.0, total=None)
         # Function bounds + size shown.
@@ -3315,11 +3417,11 @@ class TestProgressFormatters(CoveredUnitTest):
         # Anchor with idx.
         self.assertIn("Anchor (#18):", msg)
         self.assertIn("0x140001040", msg)
-        # Inner search bounds + length + matches. Early-bail caps the count,
-        # so 2-or-more renders as "2+".
+        # Inner search bounds + length + matches. Candidate-refinement tracks
+        # the exact surviving count, so it renders the real number (no "2+").
         self.assertIn("0x140001040 .. 0x140001047", msg)
         self.assertIn("7 bytes", msg)
-        self.assertIn("2+ matches", msg)
+        self.assertIn("3 matches", msg)
         # Best so far + candidates + elapsed.
         self.assertIn("Best found:   -", msg)
         self.assertIn("0 unique so far", msg)

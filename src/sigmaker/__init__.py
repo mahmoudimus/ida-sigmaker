@@ -1723,17 +1723,21 @@ class MinimalFunctionSignatureGenerator:
         """Grow a signature from ``decoded[anchor_idx]`` forward until unique.
 
         Reads all instruction data from the pre-decoded list. The ``buf``
-        argument is forwarded to the searcher so the segment buffer is
-        reused across all uniqueness checks inside one generate() session.
+        argument is the segment buffer loaded once in generate(); on the SIMD
+        path it seeds an in-memory candidate-offset set that is refined per
+        appended byte, so the database is scanned once per anchor rather than
+        once per growth step. On non-SIMD builds (no in-memory buffer) it
+        falls back to a per-step count_matches scan.
 
-        Uniqueness is decided with an early-bail scan (bail at the second
-        match) rather than a full match count, so short common signatures
-        do not enumerate every hit. If ``progress`` is supplied, the
-        per-iteration sig length and the (capped) match count are written
-        into its ``inner_length`` / ``inner_matches`` fields for the live
-        wait-box display; ``inner_matches`` of 2 means "two or more".
+        The surviving candidate count is the exact match count, so if
+        ``progress`` is supplied the per-iteration sig length and the exact
+        match count are written into its ``inner_length`` / ``inner_matches``
+        fields for the live wait-box display.
         """
         sig = Signature()
+        # SIMD seed-then-refine state (see UniqueSignatureGenerator.generate).
+        offsets: typing.Optional[list[int]] = None
+        seed_buf = buf
         for i in range(anchor_idx, len(decoded)):
             if (
                 self.progress_reporter is not None
@@ -1743,19 +1747,36 @@ class MinimalFunctionSignatureGenerator:
                     "Function signature search canceled by user"
                 )
 
+            prev_len = len(sig)
             self._append_decoded_to_sig(sig, decoded[i])
 
             if len(sig) > max_len:
                 return None
 
-            unique = SignatureSearcher.is_unique(f"{sig:ida}", buf=buf)
+            if not SIMD_SPEEDUP_AVAILABLE or seed_buf is None:
+                # Non-SIMD builds have no in-memory buffer to refine against,
+                # so fall back to the per-step rescan.
+                count = SignatureSearcher.count_matches(f"{sig:ida}", buf=buf)
+            elif offsets is None:
+                # Seed once against the cached buffer; keep every match offset.
+                offsets, seed_buf = SignatureSearcher.find_all_offsets(
+                    f"{sig:ida}", buf=seed_buf
+                )
+                count = len(offsets)
+            else:
+                # Refine the surviving candidates in memory for each byte
+                # appended this iteration; no rescan of the database.
+                data_mv = seed_buf.data()
+                for j in range(prev_len, len(sig)):
+                    sb = sig[j]
+                    mask = 0x00 if sb.is_wildcard else 0xFF
+                    offsets = _refine_offsets(data_mv, offsets, j, sb.value, mask)
+                count = len(offsets)
+
             if progress is not None:
                 progress.inner_length = len(sig)
-                # is_unique early-bails at the second match, so we cannot
-                # show an exact count here; 1 means unique, 2 means "2 or
-                # more, keep growing".
-                progress.inner_matches = 1 if unique else 2
-            if unique:
+                progress.inner_matches = count
+            if count == 1:
                 sig.trim_signature()
                 return sig
 
@@ -2594,11 +2615,9 @@ class _FunctionSigProgress:
         inner_bounds = f"{anchor:#x} .. {inner_end:#x}"
         if self.inner_matches is None:
             inner_matches_str = "scanning..."
-        elif self.inner_matches >= 2:
-            # Uniqueness is decided with an early-bail scan that stops at the
-            # second match, so the exact count past 1 is unknown: show "2+".
-            inner_matches_str = "2+ matches so far"
         else:
+            # Candidate-refinement tracks the exact surviving candidate count
+            # at every step, so show the real number again (no "2+" cap).
             inner_matches_str = f"{self.inner_matches} matches so far"
         best = f"{self.best_size} bytes" if self.candidates else "-"
         return self._TEMPLATE.format(

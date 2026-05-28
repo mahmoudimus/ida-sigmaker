@@ -2389,7 +2389,7 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
             )
         self.assertEqual(len(self.recorded_dialogs), 1)
         self.assertIn(
-            "Generating signature", self.recorded_dialogs[0].initial_message
+            "Create unique signature", self.recorded_dialogs[0].initial_message
         )
 
     def test_progress_dialog_lifecycle_on_cancel(self):
@@ -2798,7 +2798,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         # the recorded dialogs rather than asserting an exact count.
         messages = [d.initial_message for d in self.recorded_dialogs]
         self.assertTrue(
-            any("Finding shortest function signature" in m for m in messages),
+            any("Find shortest function signature" in m for m in messages),
             f"Expected a function-sig wait box; got {messages}",
         )
 
@@ -3077,16 +3077,8 @@ class TestProgressFormatters(CoveredUnitTest):
         sig = self._make_sig(5)
         fmt = sigmaker._UniqueSigProgress(sig=sig)
         msg = fmt(idx=1, item=None, elapsed=2.5, total=None)
-        self.assertIn("Length: 5 bytes", msg)
-        self.assertIn("Matches: ?", msg)
+        self.assertIn("Length:  5 bytes", msg)
         self.assertIn("Elapsed: 2s", msg)
-
-    def test_unique_progress_reflects_match_count_when_set(self):
-        sig = self._make_sig(8)
-        fmt = sigmaker._UniqueSigProgress(sig=sig, last_match_count=3)
-        msg = fmt(idx=1, item=None, elapsed=0.0, total=None)
-        self.assertIn("Length: 8 bytes", msg)
-        self.assertIn("Matches: 3", msg)
 
     def test_unique_progress_sig_is_live_reference(self):
         sig = self._make_sig(2)
@@ -3094,7 +3086,7 @@ class TestProgressFormatters(CoveredUnitTest):
         sig.append(sigmaker.SignatureByte(0xCC, False))
         sig.append(sigmaker.SignatureByte(0xCC, False))
         msg = fmt(idx=1, item=None, elapsed=0.0, total=None)
-        self.assertIn("Length: 4 bytes", msg)
+        self.assertIn("Length:  4 bytes", msg)
 
     def test_function_progress_renders_all_fields(self):
         candidates: list = []

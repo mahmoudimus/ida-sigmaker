@@ -1442,7 +1442,12 @@ class UniqueSignatureGenerator:
         with _CancelToPartial(policy, build_partial) as cancel:
             for cur_ea, ins, ins_len in ProgressBox(
                 InstructionWalker(ea),
-                initial_message="Generating signature...\n\nPress Cancel to stop",
+                initial_message=(
+                    "Create unique signature (from cursor address)\n\n"
+                    "Growing a pattern from the current address until it "
+                    "matches exactly one place in the binary.\n\n"
+                    "Press Cancel to stop"
+                ),
                 format_message=progress,
             ):
                 # Modal continue-prompt opt-in (issue #18) still goes through
@@ -1615,8 +1620,12 @@ class MinimalFunctionSignatureGenerator:
         for anchor_idx, di in ProgressBox(
             enumerate(decoded),
             total=len(decoded),
-            initial_message="Finding shortest function signature...\n\n"
-                            "Press Cancel to stop",
+            initial_message=(
+                "Find shortest function signature\n\n"
+                "Trying every instruction in the function as a start point; "
+                "growing each until unique and keeping the shortest.\n\n"
+                "Press Cancel to stop"
+            ),
             format_message=progress,
         ):
             if (
@@ -1943,6 +1952,7 @@ class XrefFinder:
                 break
 
             self.progress_dialog.replace_message(
+                f"Find shortest XREF signature\n\n"
                 f"Processing xref {i} of {total} ({(i / total) * 100.0:.1f}%)...\n\n"
                 f"Suitable Signatures: {len(xref_signatures)}\n"
                 f"Shortest Signature: {shortest_len if shortest_len <= cfg.max_xref_signature_length else 0} Bytes"
@@ -2113,7 +2123,11 @@ class SignatureSearcher:
             return SearchResults([], "")
 
         # Wrap the search in a ProgressDialog to allow cancellation
-        with ProgressDialog("Searching for signature...\n\nPress Cancel to stop"):
+        with ProgressDialog(
+            "Search for a signature\n\n"
+            "Scanning the whole database for your pattern.\n\n"
+            "Press Cancel to stop"
+        ):
             matches = self.find_all(sig_str)
 
         return SearchResults(matches, sig_str)
@@ -2392,7 +2406,7 @@ class ProgressBox:
     format_message: typing.Optional[
         typing.Callable[[int, typing.Any, float, typing.Optional[int]], str]
     ] = None
-    throttle_seconds: float = 0.1
+    throttle_seconds: float = 1.0
     clock: typing.Callable[[], float] = dataclasses.field(default=time.monotonic)
     # default_factory (not default=ProgressDialog) so tests that monkey-patch
     # sigmaker.ProgressDialog after class definition are honored: the lambda
@@ -2444,18 +2458,17 @@ class _UniqueSigProgress:
     sig: "Signature"
     last_match_count: typing.Optional[int] = None
     _TEMPLATE: typing.ClassVar[str] = (
-        "Generating signature...\n\n"
-        "Length: {length} bytes\n"
-        "Matches: {matches}\n"
+        "Create unique signature (from cursor address)\n"
+        "Growing a pattern from the current address until it matches\n"
+        "exactly one place in the binary.\n\n"
+        "Length:  {length} bytes\n"
         "Elapsed: {elapsed}s\n\n"
         "Press Cancel to stop"
     )
 
     def __call__(self, idx, item, elapsed, total) -> str:
-        match_str = "?" if self.last_match_count is None else str(self.last_match_count)
         return self._TEMPLATE.format(
             length=len(self.sig),
-            matches=match_str,
             elapsed=int(elapsed),
         )
 
@@ -2480,8 +2493,8 @@ class _FunctionSigProgress:
     inner_length: int = 0
     inner_matches: typing.Optional[int] = None
     _TEMPLATE: typing.ClassVar[str] = (
-        "Finding shortest unique signature for this function.\n"
-        "For each instruction, grow a byte pattern until unique in the binary.\n"
+        "Find shortest function signature\n"
+        "Trying every instruction as a start point; keeping the shortest unique one.\n"
         "\n"
         "Function:     {fn_bounds}  ({fn_size} bytes)\n"
         "Anchor (#{idx}): {anchor:#x}\n"
@@ -2989,7 +3002,10 @@ class SigMakerPlugin(idaapi.plugin_t):
                 start, end = self.get_selected_addresses(idaapi.get_current_viewer())
                 if start and end:
                     with ProgressDialog(
-                        "Generating range signature...\n\nPress Cancel to stop"
+                        "Copy selected code\n\n"
+                        "Building a signature for the selected address "
+                        "range.\n\n"
+                        "Press Cancel to stop"
                     ):
                         signature = SignatureMaker().make_signature(
                             start, config, end=end

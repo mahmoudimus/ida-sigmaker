@@ -2695,6 +2695,76 @@ class TestGeneratedSignatureOrdering(CoveredUnitTest):
         self.assertEqual(sig._wildcard_count(), 2)
 
 
+class TestDecodeFunctionForAnchors(CoveredUnitTest):
+    """The one-shot decode helper used by MinimalFunctionSignatureGenerator.generate."""
+
+    def setUp(self):
+        self.original_user_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.decode_insn = MagicMock(return_value=1)
+        sigmaker.idaapi.get_bytes = MagicMock(
+            side_effect=lambda ea, count: b"\x90" * count
+        )
+
+    def tearDown(self):
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
+
+    def _processor(self):
+        return sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+
+    def _cfg(self, **kw):
+        return sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+            **kw,
+        )
+
+    def _pfn(self, start_ea: int, end_ea: int):
+        pfn = MagicMock()
+        pfn.start_ea = start_ea
+        pfn.end_ea = end_ea
+        return pfn
+
+    def test_empty_function_returns_empty_list(self):
+        pfn = self._pfn(0x1000, 0x1000)
+        decoded = sigmaker._decode_function_for_anchors(
+            pfn, self._processor(), self._cfg()
+        )
+        self.assertEqual(decoded, [])
+
+    def test_single_byte_instructions(self):
+        pfn = self._pfn(0x1000, 0x1005)
+        decoded = sigmaker._decode_function_for_anchors(
+            pfn, self._processor(), self._cfg()
+        )
+        self.assertEqual(len(decoded), 5)
+        for i, di in enumerate(decoded):
+            self.assertEqual(di.ea, 0x1000 + i)
+            self.assertEqual(di.size, 1)
+            self.assertEqual(di.raw_bytes, b"\x90")
+            self.assertEqual(di.operand_offb, 0)
+            self.assertEqual(di.operand_length, 0)
+
+    def test_single_get_bytes_call(self):
+        pfn = self._pfn(0x1000, 0x100A)
+        sigmaker.idaapi.get_bytes.reset_mock()
+        sigmaker._decode_function_for_anchors(pfn, self._processor(), self._cfg())
+        sigmaker.idaapi.get_bytes.assert_called_once_with(0x1000, 10)
+
+    def test_short_read_returns_empty_when_function_bytes_none(self):
+        pfn = self._pfn(0x1000, 0x1005)
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=None)
+        decoded = sigmaker._decode_function_for_anchors(
+            pfn, self._processor(), self._cfg()
+        )
+        self.assertEqual(decoded, [])
+
+
 class TestDecodedInstruction(CoveredUnitTest):
     """The pre-decoded instruction container used by MinimalFunctionSignatureGenerator."""
 

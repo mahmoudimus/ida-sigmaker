@@ -1499,6 +1499,54 @@ class UniqueSignatureGenerator:
         raise Unexpected("Signature not unique (reached end of analysis)")
 
 
+def _decode_function_for_anchors(
+    pfn: "idaapi.func_t",
+    processor: "InstructionProcessor",
+    cfg: "SigMakerConfig",
+) -> list[_DecodedInstruction]:
+    """Decode a function's instructions once and capture per-instruction
+    data for use across all anchor growth loops.
+
+    Reads all function bytes via one idaapi.get_bytes call, then walks
+    instructions via InstructionWalker. The operand wildcard decision is
+    baked in based on cfg.wildcard_operands / cfg.wildcard_optimized;
+    operand_offb / operand_length are both 0 when no operand should be
+    wildcarded.
+    """
+    total = pfn.end_ea - pfn.start_ea
+    if total <= 0:
+        return []
+    func_bytes = idaapi.get_bytes(pfn.start_ea, total)
+    if not func_bytes:
+        return []
+
+    decoded: list[_DecodedInstruction] = []
+    for ea, ins, ins_len in InstructionWalker(pfn.start_ea, pfn.end_ea):
+        offset = ea - pfn.start_ea
+        if offset < 0 or offset + ins_len > len(func_bytes):
+            break
+        raw = bytes(func_bytes[offset:offset + ins_len])
+
+        operand_offb = 0
+        operand_length = 0
+        if cfg.wildcard_operands:
+            off, length = [0], [0]
+            if processor.operand_processor.get_operand(
+                ins, off, length, cfg.wildcard_optimized
+            ):
+                operand_offb = off[0]
+                operand_length = length[0]
+
+        decoded.append(_DecodedInstruction(
+            ea=ea,
+            size=ins_len,
+            raw_bytes=raw,
+            operand_offb=operand_offb,
+            operand_length=operand_length,
+        ))
+    return decoded
+
+
 class MinimalFunctionSignatureGenerator:
     """Find the shortest unique signature anywhere within a function body.
 

@@ -3722,6 +3722,41 @@ class TestProgressBox(CoveredUnitTest):
         self.assertEqual(self.dialogs[0].messages[1], "Processing (2/2) | Elapsed: 2s")
 
 
+class TestBuildByteIndex(CoveredUnitTest):
+    """The Cython 2-byte counting-sort index."""
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_heads_and_positions_shape(self):
+        data = memoryview(bytearray(b"\x01\x02\x01\x02\x03"))
+        heads, positions = sigmaker.simd_scan.build_byte_index(data)
+        self.assertEqual(len(heads), 65537)
+        self.assertEqual(len(positions), len(data) - 1)  # 4 windows
+        self.assertEqual(heads[0], 0)
+        self.assertEqual(heads[65536], len(data) - 1)
+        self.assertTrue(all(heads[i] <= heads[i + 1] for i in range(65536)))
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_bucket_contains_correct_offsets(self):
+        # windows: (0)01 02, (1)02 01, (2)01 02, (3)02 03
+        data = memoryview(bytearray(b"\x01\x02\x01\x02\x03"))
+        heads, positions = sigmaker.simd_scan.build_byte_index(data)
+        key_0102 = (0x01 << 8) | 0x02
+        start, end = heads[key_0102], heads[key_0102 + 1]
+        self.assertEqual(sorted(positions[start:end]), [0, 2])
+        key_0203 = (0x02 << 8) | 0x03
+        s2, e2 = heads[key_0203], heads[key_0203 + 1]
+        self.assertEqual(sorted(positions[s2:e2]), [3])
+        self.assertEqual(end - start, 2)  # bucket_size of 01 02
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_short_buffer_returns_empty_positions(self):
+        heads, positions = sigmaker.simd_scan.build_byte_index(
+            memoryview(bytearray(b"\x01"))
+        )
+        self.assertEqual(len(positions), 0)
+        self.assertEqual(len(heads), 65537)  # safe to look up; all buckets empty
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

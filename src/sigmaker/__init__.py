@@ -94,6 +94,15 @@ if not SIMD_SPEEDUP_AVAILABLE:
         _load_speedups_sibling()
 
 
+# How many matches a scan loop processes between cancellation polls.
+# idaapi.user_cancelled() costs roughly half a microsecond per call; a short,
+# common pattern can match millions of positions, so polling every match makes
+# the poll dominate the scan. Polling every few thousand matches keeps cancel
+# responsive (a few thousand SIMD steps is well under a millisecond) while
+# removing essentially all of the overhead.
+_CANCEL_POLL_STRIDE: int = 8192
+
+
 def configure_logging(
     logger=None,
     logging_name="sigmaker",
@@ -1738,6 +1747,7 @@ class MinimalFunctionSignatureGenerator:
         # SIMD seed-then-refine state (see UniqueSignatureGenerator.generate).
         offsets: typing.Optional[list[int]] = None
         seed_buf = buf
+        min_useful = self.MIN_USEFUL_SIG_BYTES
         for i in range(anchor_idx, len(decoded)):
             if (
                 self.progress_reporter is not None
@@ -1753,12 +1763,33 @@ class MinimalFunctionSignatureGenerator:
             if len(sig) > max_len:
                 return None
 
+            # Below MIN_USEFUL_SIG_BYTES the seed scan would enumerate every
+            # match of a short, common prefix (e.g. a 1-byte instruction that
+            # occurs hundreds of thousands of times) only for the caller to
+            # discard the result for being too short. Probe uniqueness with a
+            # cheap early-bail scan instead, and defer the (now selective)
+            # seed-and-refine until the pattern is long enough to be a valid
+            # answer. The early-bail probe preserves exact behavior: an anchor
+            # that becomes unique below MIN still returns its short signature
+            # here, which the caller discards, so the anchor contributes no
+            # candidate, exactly as before.
+            if len(sig) < min_useful:
+                if progress is not None:
+                    progress.inner_length = len(sig)
+                    progress.inner_matches = None
+                if SignatureSearcher.is_unique(f"{sig:ida}", buf=buf):
+                    sig.trim_signature()
+                    return sig
+                continue
+
             if not SIMD_SPEEDUP_AVAILABLE or seed_buf is None:
                 # Non-SIMD builds have no in-memory buffer to refine against,
                 # so fall back to the per-step rescan.
                 count = SignatureSearcher.count_matches(f"{sig:ida}", buf=buf)
             elif offsets is None:
                 # Seed once against the cached buffer; keep every match offset.
+                # The pattern is now at least MIN_USEFUL_SIG_BYTES, so this is
+                # selective rather than a full-database enumeration.
                 offsets, seed_buf = SignatureSearcher.find_all_offsets(
                     f"{sig:ida}", buf=seed_buf
                 )
@@ -2228,11 +2259,17 @@ class SignatureSearcher:
 
         n = len(data_mv)
         off = 0
+        # Poll cancellation every _CANCEL_POLL_STRIDE matches (see
+        # find_all_offsets) so per-match user_cancelled() overhead does not
+        # dominate a scan over a short, common pattern.
+        since_poll = 0
         while off <= n - k:
-            # Check for user cancellation
-            if idaapi_user_canceled():
-                LOGGER.info("Search canceled by user")
-                break
+            since_poll += 1
+            if since_poll >= _CANCEL_POLL_STRIDE:
+                since_poll = 0
+                if idaapi_user_canceled():
+                    LOGGER.info("Search canceled by user")
+                    break
 
             idx = _simd_scan_bytes(data_mv[off:], sig)
             if idx < 0:
@@ -2266,9 +2303,17 @@ class SignatureSearcher:
             return [0], buf
         n = len(data_mv)
         off = 0
+        # Poll cancellation every _CANCEL_POLL_STRIDE matches rather than on
+        # every match: idaapi.user_cancelled() costs ~0.5us per call and a
+        # short, common seed can produce millions of matches, so per-match
+        # polling alone can dominate the scan (observed: 44s of a 76s seed).
+        since_poll = 0
         while off <= n - k:
-            if idaapi_user_canceled():
-                break
+            since_poll += 1
+            if since_poll >= _CANCEL_POLL_STRIDE:
+                since_poll = 0
+                if idaapi_user_canceled():
+                    break
             idx = _simd_scan_bytes(data_mv[off:], sig)
             if idx < 0:
                 break

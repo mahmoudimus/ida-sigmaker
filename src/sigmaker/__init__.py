@@ -1603,15 +1603,18 @@ class _ByteIndex:
 
 def _select_seed_run(
     sig: "Signature", index: "_ByteIndex"
-) -> typing.Optional[tuple[int, int]]:
-    """Pick the exact (unmasked) 2-byte run in sig whose index bucket is
-    smallest, to minimize the initial candidate set (Dynamic Seed Selection).
+) -> typing.Optional[tuple[int, int, int]]:
+    """Pick the unmasked run (2-byte or single byte) with the smallest index
+    bucket (Dynamic Seed Selection), returning (offset, width, key).
 
-    Returns (relative_offset, key), or None if sig has no run of two
-    consecutive exact bytes.
+    Minimizing over both widths is a superset of the 2-byte-only choice, so
+    the chosen bucket is always <= a 2-byte-only pick: C0 is strictly
+    smaller-or-equal. A rare single byte can beat a common 2-byte run.
+    Returns None only when sig has no exact byte at all.
     """
-    best: typing.Optional[tuple[int, int, int]] = None  # (size, offset, key)
-    for j in range(len(sig) - 1):
+    best: typing.Optional[tuple[int, int, int, int]] = None  # (size, offset, width, key)
+    m = len(sig)
+    for j in range(m - 1):
         a = sig[j]
         b = sig[j + 1]
         if a.is_wildcard or b.is_wildcard:
@@ -1619,10 +1622,17 @@ def _select_seed_run(
         key = (a.value << 8) | b.value
         size = index.bucket_size(key)
         if best is None or size < best[0]:
-            best = (size, j, key)
+            best = (size, j, 2, key)
+    for j in range(m):
+        sb = sig[j]
+        if sb.is_wildcard:
+            continue
+        size = index.bucket_size1(sb.value)
+        if best is None or size < best[0]:
+            best = (size, j, 1, sb.value)
     if best is None:
         return None
-    return best[1], best[2]
+    return best[1], best[2], best[3]
 
 
 def _seed_via_index(
@@ -1632,27 +1642,38 @@ def _seed_via_index(
 ) -> typing.Optional[list[int]]:
     """Seed the candidate set from the byte index instead of scanning.
 
-    Picks the most selective exact 2-byte run (Dynamic Seed Selection), maps
-    its hits back to candidate pattern-starts, and refines against the rest of
-    the pattern so the result equals matches(full pattern). Returns the
-    candidate offsets, or None if the index is unavailable or the pattern has
-    no exact 2-byte run (caller falls back to a scan).
+    Picks the most selective unmasked run (1-byte or 2-byte) via Dynamic Seed
+    Selection, maps its hits back to candidate pattern-starts, and refines
+    against the rest of the pattern so the result equals matches(full pattern).
+    Returns the candidate offsets, or None if the index is unavailable or the
+    pattern has no exact byte at all (caller falls back to a scan).
     """
     if index is None:
         return None
     run = _select_seed_run(sig, index)
     if run is None:
         return None
-    s, key = run
+    s, width, key = run
     data_mv = buf.data()
     n = len(data_mv)
     m = len(sig)
-    # Map each 2-byte hit at offset p back to a pattern start p - s, keeping
-    # only candidates whose full pattern fits in the buffer.
-    cands = [p - s for p in index.candidates(key) if p >= s and (p - s) + m <= n]
-    # Refine against every exact byte except the two seed-run bytes.
+    raw = index.candidates(key) if width == 2 else index.candidates1(key)
+    # Map each hit at offset p back to a pattern start p - s, keeping only
+    # candidates whose full pattern fits in the buffer.
+    cands = [p - s for p in raw if p >= s and (p - s) + m <= n]
+    # n-1 boundary: candidates1 is derived from 2-byte windows, which never see
+    # offset n-1 as a window start, so a 1-byte hit at the final buffer byte is
+    # missing. It can only yield a valid pattern start when the seed byte is the
+    # pattern's last byte (s == m-1, giving start n-m). Add it explicitly and
+    # let _refine_offsets validate.
+    if width == 1 and n >= 1 and data_mv[n - 1] == key:
+        p = n - 1 - s
+        if 0 <= p and p + m <= n:
+            cands.append(p)
+    # Refine against every exact byte except the seed run's byte(s).
+    seed_span = (s, s + 1) if width == 2 else (s,)
     for j in range(m):
-        if j == s or j == s + 1:
+        if j in seed_span:
             continue
         sb = sig[j]
         if sb.is_wildcard:

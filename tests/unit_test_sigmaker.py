@@ -3745,21 +3745,43 @@ class TestSeedViaIndex(CoveredUnitTest):
         )
         idx = MagicMock()
         # 8B 45 is the most selective run, so Dynamic Seed Selection keys on
-        # it; other runs (90 90, 45 90) get a larger bucket so they lose.
+        # it; other runs (90 90, 45 90) and all 1-byte buckets get a larger
+        # bucket so they lose.
         idx.bucket_size.side_effect = lambda key: {(0x8B << 8) | 0x45: 2}.get(key, 10**9)
+        idx.bucket_size1.side_effect = lambda b: 10**9
         idx.candidates.side_effect = (
             lambda key: [0, 6] if key == ((0x8B << 8) | 0x45) else []
         )
+        idx.candidates1.side_effect = lambda b: []
         out = sigmaker._seed_via_index(sig, idx, buf)
         # offset 0 keeps (90 90 90 follow); offset 6 drops (00 00 follow)
         self.assertEqual(out, [0])
 
-    def test_returns_none_when_no_run(self):
+    def test_one_byte_seed_path(self):
+        # buffer: F3 at offsets 0 and 8; no 2-byte run is selectable, so the
+        # single byte F3 is the seed. offset 0 fits a 5-byte pattern; offset 8
+        # does not (8 + 5 > 10) and is dropped by the fit guard.
+        buf = MagicMock()
+        buf.data.return_value = memoryview(
+            bytearray(b"\xf3\x90\x90\x90\x90\x00\x00\x00\xf3\x00")
+        )
+        sig = self._sig(
+            [(0xF3, False), (0x90, True), (0x90, True), (0x90, True), (0x90, True)]
+        )
+        idx = MagicMock()
+        idx.bucket_size.side_effect = lambda key: 10**9   # no 2-byte run chosen
+        idx.bucket_size1.side_effect = lambda b: {0xF3: 2}.get(b, 10**9)
+        idx.candidates1.side_effect = lambda b: [0, 8] if b == 0xF3 else []
+        out = sigmaker._seed_via_index(sig, idx, buf)
+        self.assertEqual(out, [0])
+
+    def test_returns_none_when_all_wildcard(self):
         buf = MagicMock()
         buf.data.return_value = memoryview(bytearray(b"\x90" * 10))
-        sig = self._sig([(0x90, True), (0x91, False), (0x92, True)])
+        sig = self._sig([(0x90, True), (0x91, True)])  # no exact byte at all
         idx = MagicMock()
-        idx.bucket_size.return_value = 0
+        idx.bucket_size.return_value = 10**9
+        idx.bucket_size1.return_value = 10**9
         self.assertIsNone(sigmaker._seed_via_index(sig, idx, buf))
 
     def test_returns_none_when_index_none(self):
@@ -3770,7 +3792,7 @@ class TestSeedViaIndex(CoveredUnitTest):
 
 
 class TestSelectSeedRun(CoveredUnitTest):
-    """Dynamic Seed Selection: pick the smallest-bucket exact 2-byte run."""
+    """Dynamic Seed Selection across 1-byte and 2-byte runs."""
 
     def _sig(self, specs):  # specs: list[(value, is_wildcard)]
         sig = sigmaker.Signature()
@@ -3778,22 +3800,33 @@ class TestSelectSeedRun(CoveredUnitTest):
             sig.append(sigmaker.SignatureByte(v, w))
         return sig
 
-    def _index(self, sizes):
+    def _index(self, two_byte_sizes, one_byte_sizes=None):
+        one_byte_sizes = one_byte_sizes or {}
         idx = MagicMock()
-        idx.bucket_size.side_effect = lambda key: sizes.get(key, 0)
+        idx.bucket_size.side_effect = lambda key: two_byte_sizes.get(key, 10**9)
+        idx.bucket_size1.side_effect = lambda b: one_byte_sizes.get(b, 10**9)
         return idx
 
-    def test_picks_smallest_bucket_run(self):
-        # pattern: ?? 00 00 ?? 8B 45  -> exact runs (1,"00 00") and (4,"8B 45")
+    def test_picks_smallest_two_byte_run(self):
+        # ?? 00 00 ?? 8B 45 ; 8B 45 is the most selective run -> width 2
         sig = self._sig(
             [(0, True), (0, False), (0, False), (0, True), (0x8B, False), (0x45, False)]
         )
-        sizes = {(0x00 << 8) | 0x00: 4_000_000, (0x8B << 8) | 0x45: 12}
-        run = sigmaker._select_seed_run(sig, self._index(sizes))
-        self.assertEqual(run, (4, (0x8B << 8) | 0x45))
+        two = {(0x00 << 8) | 0x00: 4_000_000, (0x8B << 8) | 0x45: 12}
+        run = sigmaker._select_seed_run(sig, self._index(two))
+        self.assertEqual(run, (4, 2, (0x8B << 8) | 0x45))
 
-    def test_returns_none_when_no_two_exact_bytes(self):
-        sig = self._sig([(0, True), (0x8B, False), (0, True), (0x45, False)])
+    def test_rare_one_byte_beats_common_two_byte(self):
+        # 00 00 ?? F3 : the only 2-byte run is 00 00 (common); F3 is a rare
+        # single byte -> selection prefers the 1-byte key (width 1).
+        sig = self._sig([(0x00, False), (0x00, False), (0, True), (0xF3, False)])
+        two = {(0x00 << 8) | 0x00: 1_500_000}
+        one = {0x00: 3_000_000, 0xF3: 800}
+        run = sigmaker._select_seed_run(sig, self._index(two, one))
+        self.assertEqual(run, (3, 1, 0xF3))
+
+    def test_returns_none_when_no_exact_byte(self):
+        sig = self._sig([(0, True), (0, True)])
         self.assertIsNone(sigmaker._select_seed_run(sig, self._index({})))
 
 

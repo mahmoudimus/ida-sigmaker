@@ -3722,6 +3722,34 @@ class TestProgressBox(CoveredUnitTest):
         self.assertEqual(self.dialogs[0].messages[1], "Processing (2/2) | Elapsed: 2s")
 
 
+class TestSelectSeedRun(CoveredUnitTest):
+    """Dynamic Seed Selection: pick the smallest-bucket exact 2-byte run."""
+
+    def _sig(self, specs):  # specs: list[(value, is_wildcard)]
+        sig = sigmaker.Signature()
+        for v, w in specs:
+            sig.append(sigmaker.SignatureByte(v, w))
+        return sig
+
+    def _index(self, sizes):
+        idx = MagicMock()
+        idx.bucket_size.side_effect = lambda key: sizes.get(key, 0)
+        return idx
+
+    def test_picks_smallest_bucket_run(self):
+        # pattern: ?? 00 00 ?? 8B 45  -> exact runs (1,"00 00") and (4,"8B 45")
+        sig = self._sig(
+            [(0, True), (0, False), (0, False), (0, True), (0x8B, False), (0x45, False)]
+        )
+        sizes = {(0x00 << 8) | 0x00: 4_000_000, (0x8B << 8) | 0x45: 12}
+        run = sigmaker._select_seed_run(sig, self._index(sizes))
+        self.assertEqual(run, (4, (0x8B << 8) | 0x45))
+
+    def test_returns_none_when_no_two_exact_bytes(self):
+        sig = self._sig([(0, True), (0x8B, False), (0, True), (0x45, False)])
+        self.assertIsNone(sigmaker._select_seed_run(sig, self._index({})))
+
+
 class TestByteIndex(CoveredUnitTest):
     """The _ByteIndex holder over build_byte_index."""
 

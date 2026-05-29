@@ -1590,6 +1590,30 @@ class _ByteIndex:
         return [pos[i] for i in range(start, end)]
 
 
+def _select_seed_run(
+    sig: "Signature", index: "_ByteIndex"
+) -> typing.Optional[tuple[int, int]]:
+    """Pick the exact (unmasked) 2-byte run in sig whose index bucket is
+    smallest, to minimize the initial candidate set (Dynamic Seed Selection).
+
+    Returns (relative_offset, key), or None if sig has no run of two
+    consecutive exact bytes.
+    """
+    best: typing.Optional[tuple[int, int, int]] = None  # (size, offset, key)
+    for j in range(len(sig) - 1):
+        a = sig[j]
+        b = sig[j + 1]
+        if a.is_wildcard or b.is_wildcard:
+            continue
+        key = (a.value << 8) | b.value
+        size = index.bucket_size(key)
+        if best is None or size < best[0]:
+            best = (size, j, key)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
 def _decode_function_for_anchors(
     pfn: "idaapi.func_t",
     processor: "InstructionProcessor",

@@ -2999,7 +2999,7 @@ class SigMakerPlugin(idaapi.plugin_t):
         # does, and as d810 does for its submenu) is the reliable pattern.
         # The profiling actions live under a "SigMaker/" submenu.
         self._hooks = self._init_hooks(
-            _PopupHook(self.ACTION_SHOW_SIGMAKER),
+            _PopupHook(self.ACTION_SHOW_SIGMAKER, category="SigMaker"),
             _PopupHook(self.ACTION_START_PROFILING, category="SigMaker"),
             _PopupHook(self.ACTION_STOP_PROFILING, category="SigMaker"),
         )
@@ -3029,7 +3029,7 @@ class SigMakerPlugin(idaapi.plugin_t):
         idaapi.register_action(
             idaapi.action_desc_t(
                 self.ACTION_START_PROFILING,
-                "SigMaker: Start profiling",
+                "Start Profiling",
                 _ActionHandler(self._action_start_profiling, always_enabled=True),
                 None,
                 "Start a cProfile session capturing subsequent SigMaker activity.",
@@ -3038,7 +3038,7 @@ class SigMakerPlugin(idaapi.plugin_t):
         idaapi.register_action(
             idaapi.action_desc_t(
                 self.ACTION_STOP_PROFILING,
-                "SigMaker: Stop profiling and dump",
+                "Stop Profiling",
                 _ActionHandler(self._action_stop_profiling, always_enabled=True),
                 None,
                 "Stop the active cProfile session and write the dump to the user IDA dir.",

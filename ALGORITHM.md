@@ -108,7 +108,7 @@ We store every window start grouped by key in one flat array `positions`, with a
 
 - `heads[k]` is the start of bucket $k$ inside `positions`;
 - bucket $k$ is the slice `positions[heads[k] : heads[k+1]]`;
-- $|B_k| = $ `heads[k+1] - heads[k]`, available in $O(1)$.
+- the bucket size $|B_k|$ is `heads[k+1] - heads[k]`, available in $O(1)$ time.
 
 Construction is a textbook **counting sort** over the $N-1$ adjacent-byte windows,
 two passes over $D$:

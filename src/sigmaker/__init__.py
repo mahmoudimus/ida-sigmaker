@@ -1586,6 +1586,7 @@ def _refine_offsets_into(
     return w
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
 class _ByteIndex:
     """A 2-byte bucket position index over the segment buffer.
 
@@ -1594,11 +1595,8 @@ class _ByteIndex:
     anchors in that one search.
     """
 
-    __slots__ = ("heads", "positions")
-
-    def __init__(self, heads, positions):
-        self.heads = heads
-        self.positions = positions
+    heads: "array.array"
+    positions: "array.array"
 
     @classmethod
     def build(cls, data_mv: memoryview) -> typing.Optional["_ByteIndex"]:

@@ -3816,6 +3816,48 @@ class TestByteIndex(CoveredUnitTest):
         )
 
 
+class TestIndexSeedEquivalence(CoveredUnitTest):
+    """Index-seeded candidates must equal a brute-force masked rescan."""
+
+    def _brute(self, data: bytes, sig) -> list[int]:
+        n, m = len(data), len(sig)
+        out = []
+        for c in range(n - m + 1):
+            ok = True
+            for j in range(m):
+                sb = sig[j]
+                if sb.is_wildcard:
+                    continue
+                if data[c + j] != sb.value:
+                    ok = False
+                    break
+            if ok:
+                out.append(c)
+        return out
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_index_seed_equals_brute_force(self):
+        import random
+        rng = random.Random(99)
+        data = bytes(rng.randrange(256) for _ in range(8192))
+        mv = memoryview(bytearray(data))
+        idx = sigmaker._ByteIndex.build(mv)
+        buf = MagicMock()
+        buf.data.return_value = mv
+        for anchor in (10, 100, 500, 4000):
+            sig = sigmaker.Signature()
+            for j in range(7):
+                is_wc = (j % 4 == 0)
+                sig.append(sigmaker.SignatureByte(data[anchor + j], is_wc))
+            seeded = sigmaker._seed_via_index(sig, idx, buf)
+            expected = self._brute(data, sig)
+            self.assertEqual(
+                sorted(seeded), sorted(expected),
+                f"anchor {anchor}: index seed != brute force",
+            )
+            self.assertIn(anchor, seeded)
+
+
 class TestBuildByteIndex(CoveredUnitTest):
     """The Cython 2-byte counting-sort index."""
 

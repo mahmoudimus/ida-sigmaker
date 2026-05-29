@@ -3959,6 +3959,68 @@ class TestIndexSeedEquivalence(CoveredUnitTest):
         self.assertIn(anchor, seeded)
 
 
+class TestRefineOffsetsCython(CoveredUnitTest):
+    """The in-place Cython candidate-refinement compactor."""
+
+    def _arr(self, items):
+        import array
+        return array.array("I", items)
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_exact_byte_compacts_in_place(self):
+        data = memoryview(bytearray(b"\x90\x48\x90\x48\x90"))
+        cands = self._arr([0, 1, 2, 3])
+        n = sigmaker.simd_scan.refine_offsets(data, cands, 4, 1, 0x48, 0xFF)
+        self.assertEqual(n, 2)
+        self.assertEqual(list(cands[:n]), [0, 2])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_full_wildcard_keeps_all(self):
+        data = memoryview(bytearray(b"\x01\x02\x03\x04"))
+        cands = self._arr([0, 1, 2])
+        n = sigmaker.simd_scan.refine_offsets(data, cands, 3, 1, 0x00, 0x00)
+        self.assertEqual(n, 3)
+        self.assertEqual(list(cands[:n]), [0, 1, 2])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_nibble_mask(self):
+        data = memoryview(bytearray(b"\x4A\x4B\x9C"))
+        cands = self._arr([0, 1, 2])
+        n = sigmaker.simd_scan.refine_offsets(data, cands, 3, 0, 0x40, 0xF0)
+        self.assertEqual(n, 2)
+        self.assertEqual(list(cands[:n]), [0, 1])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_out_of_bounds_dropped(self):
+        data = memoryview(bytearray(b"\x90\x90"))
+        cands = self._arr([0, 1])
+        n = sigmaker.simd_scan.refine_offsets(data, cands, 2, 2, 0x90, 0xFF)
+        self.assertEqual(n, 0)
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_empty(self):
+        data = memoryview(bytearray(b"\x90"))
+        cands = self._arr([])
+        n = sigmaker.simd_scan.refine_offsets(data, cands, 0, 0, 0x90, 0xFF)
+        self.assertEqual(n, 0)
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_matches_python_refine(self):
+        import array, random
+        rng = random.Random(11)
+        data = bytes(rng.randrange(256) for _ in range(2048))
+        mv = memoryview(bytearray(data))
+        for _ in range(50):
+            cand_list = sorted(rng.sample(range(2000), 64))
+            j = rng.randrange(8)
+            value = rng.randrange(256)
+            mask = rng.choice([0x00, 0x0F, 0xF0, 0xFF])
+            py = sigmaker._refine_offsets(mv, list(cand_list), j, value, mask)
+            arr = array.array("I", cand_list)
+            n = sigmaker.simd_scan.refine_offsets(mv, arr, len(cand_list), j, value, mask)
+            self.assertEqual(sorted(arr[:n]), sorted(py))
+
+
 class TestBuildByteIndex(CoveredUnitTest):
     """The Cython 2-byte counting-sort index."""
 

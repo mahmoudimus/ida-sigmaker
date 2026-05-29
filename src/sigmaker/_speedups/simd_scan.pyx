@@ -759,3 +759,28 @@ def build_byte_index(const unsigned char[:] data_view):
     finally:
         free(wh)
     return heads, positions
+
+
+def refine_offsets(const unsigned char[:] data_view,
+                   unsigned int[:] cands,
+                   Py_ssize_t count,
+                   Py_ssize_t j,
+                   unsigned int value,
+                   unsigned int mask):
+    """Keep cands[0:count] entries c where (data_view[c+j] & mask) ==
+    (value & mask) and c + j < n, compacting survivors to the front of cands
+    in place. Returns the new count. nogil; no allocation.
+    """
+    cdef Py_ssize_t n = data_view.shape[0]
+    cdef unsigned int target = value & mask
+    cdef Py_ssize_t r = 0
+    cdef Py_ssize_t w = 0
+    cdef Py_ssize_t c
+    with nogil:
+        while r < count:
+            c = <Py_ssize_t>cands[r]
+            if c + j < n and (data_view[c + j] & mask) == target:
+                cands[w] = cands[r]
+                w += 1
+            r += 1
+    return w

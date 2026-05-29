@@ -3753,9 +3753,9 @@ class TestSeedViaIndex(CoveredUnitTest):
             lambda key: [0, 6] if key == ((0x8B << 8) | 0x45) else []
         )
         idx.candidates1.side_effect = lambda b: []
-        out = sigmaker._seed_via_index(sig, idx, buf)
+        arr, cnt = sigmaker._seed_via_index(sig, idx, buf)
         # offset 0 keeps (90 90 90 follow); offset 6 drops (00 00 follow)
-        self.assertEqual(out, [0])
+        self.assertEqual(list(arr[:cnt]), [0])
 
     def test_one_byte_seed_path(self):
         # buffer: F3 at offsets 0 and 8; no 2-byte run is selectable, so the
@@ -3772,8 +3772,8 @@ class TestSeedViaIndex(CoveredUnitTest):
         idx.bucket_size.side_effect = lambda key: 10**9   # no 2-byte run chosen
         idx.bucket_size1.side_effect = lambda b: {0xF3: 2}.get(b, 10**9)
         idx.candidates1.side_effect = lambda b: [0, 8] if b == 0xF3 else []
-        out = sigmaker._seed_via_index(sig, idx, buf)
-        self.assertEqual(out, [0])
+        arr, cnt = sigmaker._seed_via_index(sig, idx, buf)
+        self.assertEqual(list(arr[:cnt]), [0])
 
     def test_returns_none_when_all_wildcard(self):
         buf = MagicMock()
@@ -3842,7 +3842,7 @@ class TestByteIndexOneByte(CoveredUnitTest):
         self.assertEqual(sorted(idx.candidates1(0x90)), [0, 2, 4])
         self.assertEqual(idx.bucket_size1(0x90), 3)
         self.assertEqual(idx.bucket_size1(0xEE), 0)
-        self.assertEqual(idx.candidates1(0xEE), [])
+        self.assertEqual(list(idx.candidates1(0xEE)), [])
 
     @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
     def test_bucket_size1_equals_sum_of_two_byte_buckets(self):
@@ -3907,7 +3907,8 @@ class TestIndexSeedEquivalence(CoveredUnitTest):
             for j in range(7):
                 is_wc = (j % 4 == 0)
                 sig.append(sigmaker.SignatureByte(data[anchor + j], is_wc))
-            seeded = sigmaker._seed_via_index(sig, idx, buf)
+            _arr, _cnt = sigmaker._seed_via_index(sig, idx, buf)
+            seeded = list(_arr[:_cnt])
             expected = self._brute(data, sig)
             self.assertEqual(
                 sorted(seeded), sorted(expected),
@@ -3931,7 +3932,8 @@ class TestIndexSeedEquivalence(CoveredUnitTest):
             for j in range(7):
                 is_wc = (j % 2 == 1)
                 sig.append(sigmaker.SignatureByte(data[anchor + j], is_wc))
-            seeded = sigmaker._seed_via_index(sig, idx, buf)
+            _arr, _cnt = sigmaker._seed_via_index(sig, idx, buf)
+            seeded = list(_arr[:_cnt])
             expected = self._brute(data, sig)
             self.assertEqual(sorted(seeded), sorted(expected),
                              f"anchor {anchor}: 1-byte path != brute force")
@@ -3953,7 +3955,8 @@ class TestIndexSeedEquivalence(CoveredUnitTest):
         for j in range(m):
             is_wc = (j != m - 1)  # only the last byte exact -> seed at s == m-1
             sig.append(sigmaker.SignatureByte(data[anchor + j], is_wc))
-        seeded = sigmaker._seed_via_index(sig, idx, buf)
+        _arr, _cnt = sigmaker._seed_via_index(sig, idx, buf)
+        seeded = list(_arr[:_cnt])
         expected = self._brute(data, sig)
         self.assertEqual(sorted(seeded), sorted(expected))
         self.assertIn(anchor, seeded)

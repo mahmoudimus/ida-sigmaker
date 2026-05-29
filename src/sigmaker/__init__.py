@@ -7,6 +7,7 @@ by @mahmoudimus (Mahmoud Abdelkader)
 
 from __future__ import annotations
 
+import array
 import contextlib
 import contextvars
 import dataclasses
@@ -1559,6 +1560,32 @@ def _refine_offsets(
     return [c for c in offsets if c + j < n and (data_mv[c + j] & mask) == target]
 
 
+def _refine_offsets_into(
+    data_mv: memoryview,
+    cands: "array.array",
+    count: int,
+    j: int,
+    value: int,
+    mask: int,
+) -> int:
+    """Refine the first ``count`` entries of the uint32 array ``cands`` in
+    place (Cython when available), returning the new count. The function-sig
+    path only reaches this on the SIMD path; the Python branch is a defensive
+    fallback that mirrors _refine_offsets.
+    """
+    if SIMD_SPEEDUP_AVAILABLE:
+        return simd_scan.refine_offsets(data_mv, cands, count, j, value, mask)
+    n = len(data_mv)
+    target = value & mask
+    w = 0
+    for r in range(count):
+        c = cands[r]
+        if c + j < n and (data_mv[c + j] & mask) == target:
+            cands[w] = cands[r]
+            w += 1
+    return w
+
+
 class _ByteIndex:
     """A 2-byte bucket position index over the segment buffer.
 
@@ -1583,22 +1610,17 @@ class _ByteIndex:
     def bucket_size(self, key: int) -> int:
         return self.heads[key + 1] - self.heads[key]
 
-    def candidates(self, key: int) -> list[int]:
-        start = self.heads[key]
-        end = self.heads[key + 1]
-        pos = self.positions
-        return [pos[i] for i in range(start, end)]
+    def candidates(self, key: int) -> "array.array":
+        # positions is array.array('I'), so slicing yields array.array('I').
+        return self.positions[self.heads[key]:self.heads[key + 1]]
 
     def bucket_size1(self, b: int) -> int:
         # 1-byte bucket for b: all 2-byte keys (b<<8)..((b+1)<<8 - 1) telescope
         # into one contiguous range, so its size is heads[(b+1)<<8]-heads[b<<8].
         return self.heads[(b + 1) << 8] - self.heads[b << 8]
 
-    def candidates1(self, b: int) -> list[int]:
-        start = self.heads[b << 8]
-        end = self.heads[(b + 1) << 8]
-        pos = self.positions
-        return [pos[i] for i in range(start, end)]
+    def candidates1(self, b: int) -> "array.array":
+        return self.positions[self.heads[b << 8]:self.heads[(b + 1) << 8]]
 
 
 def _select_seed_run(
@@ -1639,14 +1661,14 @@ def _seed_via_index(
     sig: "Signature",
     index: typing.Optional["_ByteIndex"],
     buf: "InMemoryBuffer",
-) -> typing.Optional[list[int]]:
+) -> typing.Optional[tuple["array.array", int]]:
     """Seed the candidate set from the byte index instead of scanning.
 
     Picks the most selective unmasked run (1-byte or 2-byte) via Dynamic Seed
     Selection, maps its hits back to candidate pattern-starts, and refines
     against the rest of the pattern so the result equals matches(full pattern).
-    Returns the candidate offsets, or None if the index is unavailable or the
-    pattern has no exact byte at all (caller falls back to a scan).
+    Returns (candidates_array, count), or None if the index is unavailable or
+    the pattern has no exact byte at all (caller falls back to a scan).
     """
     if index is None:
         return None
@@ -1660,16 +1682,17 @@ def _seed_via_index(
     raw = index.candidates(key) if width == 2 else index.candidates1(key)
     # Map each hit at offset p back to a pattern start p - s, keeping only
     # candidates whose full pattern fits in the buffer.
-    cands = [p - s for p in raw if p >= s and (p - s) + m <= n]
+    cands = array.array("I", (p - s for p in raw if p >= s and (p - s) + m <= n))
     # n-1 boundary: candidates1 is derived from 2-byte windows, which never see
     # offset n-1 as a window start, so a 1-byte hit at the final buffer byte is
     # missing. It can only yield a valid pattern start when the seed byte is the
     # pattern's last byte (s == m-1, giving start n-m). Add it explicitly and
-    # let _refine_offsets validate.
+    # let the refine validate.
     if width == 1 and n >= 1 and data_mv[n - 1] == key:
         p = n - 1 - s
         if 0 <= p and p + m <= n:
             cands.append(p)
+    count = len(cands)
     # Refine against every exact byte except the seed run's byte(s).
     seed_span = (s, s + 1) if width == 2 else (s,)
     for j in range(m):
@@ -1678,8 +1701,8 @@ def _seed_via_index(
         sb = sig[j]
         if sb.is_wildcard:
             continue
-        cands = _refine_offsets(data_mv, cands, j, sb.value, 0xFF)
-    return cands
+        count = _refine_offsets_into(data_mv, cands, count, j, sb.value, 0xFF)
+    return cands, count
 
 
 def _decode_function_for_anchors(
@@ -1874,8 +1897,10 @@ class MinimalFunctionSignatureGenerator:
         fields for the live wait-box display.
         """
         sig = Signature()
-        # SIMD seed-then-refine state (see UniqueSignatureGenerator.generate).
-        offsets: typing.Optional[list[int]] = None
+        # SIMD seed-then-refine state: candidates as a uint32 array.array plus a
+        # live count, refined in place by the Cython refine_offsets.
+        offsets: typing.Optional["array.array"] = None
+        ocount = 0
         seed_buf = buf
         min_useful = self.MIN_USEFUL_SIG_BYTES
         for i in range(anchor_idx, len(decoded)):
@@ -1917,26 +1942,30 @@ class MinimalFunctionSignatureGenerator:
                 # so fall back to the per-step rescan.
                 count = SignatureSearcher.count_matches(f"{sig:ida}", buf=buf)
             elif offsets is None:
-                # Seed once. Prefer the byte index (O(1) lookup via Dynamic
-                # Seed Selection); fall back to a full scan if the index is
-                # unavailable or the pattern has no exact 2-byte run to key on.
+                # Seed once. Prefer the byte index (Dynamic Seed Selection);
+                # fall back to a full scan only when the pattern has no exact
+                # byte to key on.
                 seeded = _seed_via_index(sig, index, seed_buf)
                 if seeded is None:
-                    offsets, seed_buf = SignatureSearcher.find_all_offsets(
+                    lst, seed_buf = SignatureSearcher.find_all_offsets(
                         f"{sig:ida}", buf=seed_buf
                     )
+                    offsets = array.array("I", lst)
+                    ocount = len(offsets)
                 else:
-                    offsets = seeded
-                count = len(offsets)
+                    offsets, ocount = seeded
+                count = ocount
             else:
-                # Refine the surviving candidates in memory for each byte
+                # Refine the surviving candidates in place for each byte
                 # appended this iteration; no rescan of the database.
                 data_mv = seed_buf.data()
                 for j in range(prev_len, len(sig)):
                     sb = sig[j]
                     mask = 0x00 if sb.is_wildcard else 0xFF
-                    offsets = _refine_offsets(data_mv, offsets, j, sb.value, mask)
-                count = len(offsets)
+                    ocount = _refine_offsets_into(
+                        data_mv, offsets, ocount, j, sb.value, mask
+                    )
+                count = ocount
 
             if progress is not None:
                 progress.inner_length = len(sig)

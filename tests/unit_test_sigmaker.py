@@ -3112,9 +3112,10 @@ class TestMinimalFunctionSignatureGeneratorSeedThenRefine(CoveredUnitTest):
         gen = sigmaker.MinimalFunctionSignatureGenerator(processor)
         pfn = self._make_pfn(0x1000, 0x100A)  # 10 single-byte 0x90 instructions
 
-        # Spy on the real find_all_offsets to confirm the seed scan is deferred
-        # until the pattern reaches MIN_USEFUL_SIG_BYTES (never seeded on a
-        # short, common prefix) and still runs the genuine SIMD seed + refine.
+        # Force the Phase 1 scan-seed fallback (disable the byte index) so this
+        # test exercises the find_all_offsets seed path it spies on. The
+        # index-backed seed path has its own equivalence coverage
+        # (TestIndexSeedEquivalence).
         real_find_all_offsets = sigmaker.SignatureSearcher.find_all_offsets
         seed_sig_byte_lens: list[int] = []
 
@@ -3124,6 +3125,8 @@ class TestMinimalFunctionSignatureGeneratorSeedThenRefine(CoveredUnitTest):
             return real_find_all_offsets(ida_signature, buf=buf)
 
         with patch.object(
+            sigmaker._ByteIndex, "build", return_value=None
+        ), patch.object(
             sigmaker.SignatureSearcher, "find_all_offsets", side_effect=spy
         ):
             result = gen.generate(pfn, self._make_cfg(max_len=50))
@@ -3720,6 +3723,50 @@ class TestProgressBox(CoveredUnitTest):
         ))
         self.assertEqual(self.dialogs[0].messages[0], "Processing (1/2) | Elapsed: 1s")
         self.assertEqual(self.dialogs[0].messages[1], "Processing (2/2) | Elapsed: 2s")
+
+
+class TestSeedViaIndex(CoveredUnitTest):
+    """Index-backed seeding maps hits to pattern starts and refines."""
+
+    def _sig(self, specs):
+        sig = sigmaker.Signature()
+        for v, w in specs:
+            sig.append(sigmaker.SignatureByte(v, w))
+        return sig
+
+    def test_index_seed_matches_buffer(self):
+        buf = MagicMock()
+        buf.data.return_value = memoryview(
+            bytearray(b"\x8b\x45\x90\x90\x90\x00\x8b\x45\x00\x00")
+        )
+        # pattern "8B 45 90 90 90" (all exact), 5 bytes
+        sig = self._sig(
+            [(0x8B, False), (0x45, False), (0x90, False), (0x90, False), (0x90, False)]
+        )
+        idx = MagicMock()
+        # 8B 45 is the most selective run, so Dynamic Seed Selection keys on
+        # it; other runs (90 90, 45 90) get a larger bucket so they lose.
+        idx.bucket_size.side_effect = lambda key: {(0x8B << 8) | 0x45: 2}.get(key, 10**9)
+        idx.candidates.side_effect = (
+            lambda key: [0, 6] if key == ((0x8B << 8) | 0x45) else []
+        )
+        out = sigmaker._seed_via_index(sig, idx, buf)
+        # offset 0 keeps (90 90 90 follow); offset 6 drops (00 00 follow)
+        self.assertEqual(out, [0])
+
+    def test_returns_none_when_no_run(self):
+        buf = MagicMock()
+        buf.data.return_value = memoryview(bytearray(b"\x90" * 10))
+        sig = self._sig([(0x90, True), (0x91, False), (0x92, True)])
+        idx = MagicMock()
+        idx.bucket_size.return_value = 0
+        self.assertIsNone(sigmaker._seed_via_index(sig, idx, buf))
+
+    def test_returns_none_when_index_none(self):
+        buf = MagicMock()
+        buf.data.return_value = memoryview(bytearray(b"\x90" * 10))
+        sig = self._sig([(0x90, False), (0x91, False)])
+        self.assertIsNone(sigmaker._seed_via_index(sig, None, buf))
 
 
 class TestSelectSeedRun(CoveredUnitTest):

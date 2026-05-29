@@ -2989,11 +2989,20 @@ class SigMakerPlugin(idaapi.plugin_t):
     ACTION_SHOW_SIGMAKER: str = "pysigmaker:show"
     ACTION_START_PROFILING: str = "pysigmaker:start_profiling"
     ACTION_STOP_PROFILING: str = "pysigmaker:stop_profiling"
-    PROFILING_MENU_PATH: str = "Edit/Plugins/"
 
     def init(self) -> int:
-        self._hooks = self._init_hooks(_PopupHook(self.ACTION_SHOW_SIGMAKER))
         self._register_actions()
+        # Attach actions to the disassembly right-click popup via live UI
+        # hooks rather than a one-shot attach_action_to_menu at init. The
+        # static menu attach runs before IDA's menus are built and silently
+        # no-ops; populating the popup on demand (as the main action already
+        # does, and as d810 does for its submenu) is the reliable pattern.
+        # The profiling actions live under a "SigMaker/" submenu.
+        self._hooks = self._init_hooks(
+            _PopupHook(self.ACTION_SHOW_SIGMAKER),
+            _PopupHook(self.ACTION_START_PROFILING, category="SigMaker"),
+            _PopupHook(self.ACTION_STOP_PROFILING, category="SigMaker"),
+        )
         return idaapi.PLUGIN_KEEP
 
     def _init_hooks(self, *hooks) -> typing.Tuple[idaapi.UI_Hooks, ...]:
@@ -3034,12 +3043,6 @@ class SigMakerPlugin(idaapi.plugin_t):
                 None,
                 "Stop the active cProfile session and write the dump to the user IDA dir.",
             )
-        )
-        idaapi.attach_action_to_menu(
-            self.PROFILING_MENU_PATH, self.ACTION_START_PROFILING, idaapi.SETMENU_APP
-        )
-        idaapi.attach_action_to_menu(
-            self.PROFILING_MENU_PATH, self.ACTION_STOP_PROFILING, idaapi.SETMENU_APP
         )
 
     def _deregister_actions(self) -> None:

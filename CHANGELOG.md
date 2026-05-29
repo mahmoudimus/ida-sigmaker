@@ -2,6 +2,25 @@
 
 All notable user-visible changes to this plugin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.3] - 2026-05-28
+
+### Changed
+
+- **`Find shortest unique signature for current function` is dramatically faster on large databases.** The search now scans the database once per starting point to seed a set of candidate match offsets, then refines that set in memory as the signature grows, instead of re-scanning the whole database on every byte. A function that previously took minutes now finishes in seconds. ([#33](https://github.com/mahmoudimus/ida-sigmaker/pull/33))
+- **The live `Matches:` count is back, and exact.** Candidate refinement tracks the surviving match count for free at every step, so the `Create unique signature` wait box shows the real count again and the function-search wait box shows an exact inner count instead of the temporary `2+` placeholder. ([#27](https://github.com/mahmoudimus/ida-sigmaker/issues/27), [#33](https://github.com/mahmoudimus/ida-sigmaker/pull/33))
+
+### Fixed
+
+- **The `Start Profiling` / `Stop Profiling` menu items now appear.** They were attached at plugin init, before IDA builds its menus, so they silently never showed. They are now attached through the disassembly right-click popup, grouped with the main action under a `SigMaker` submenu. ([#33](https://github.com/mahmoudimus/ida-sigmaker/pull/33))
+
+### Internal
+
+- New `SignatureSearcher.find_all_offsets` (seed scan returning raw buffer offsets) and `_refine_offsets` (in-memory candidate refinement). Uniqueness checks below `MIN_USEFUL_SIG_BYTES` use a cheap early-bail probe so the enumerating seed scan is deferred until the pattern is long enough to be selective. ([#33](https://github.com/mahmoudimus/ida-sigmaker/pull/33))
+- Cancellation polling in the scan loops is throttled (every 65536 matches) so `idaapi.user_cancelled()`, which pumps the UI event loop, does not dominate a scan over a common pattern. ([#33](https://github.com/mahmoudimus/ida-sigmaker/pull/33))
+- Signatures produced are byte-identical to 1.7.2; the change is purely how quickly they are found and that exact match counts are restored. ([#33](https://github.com/mahmoudimus/ida-sigmaker/pull/33))
+
+[1.7.3]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.7.2...v1.7.3
+
 ## [1.7.2] - 2026-05-28
 
 ### Added

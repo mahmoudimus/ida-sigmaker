@@ -288,12 +288,12 @@ In `simd_scan.pyx` you will see both, sharing the name `array`:
 
 ```cython
 from cpython cimport array       # compile-time: C-level array.array type + array.clone
-import array as py_arr_mod        # run-time: the Python array module (constructor)
+import array as py_stdlib_arr_mod        # run-time: the Python array module (constructor)
 ```
 
 This is **not** a collision or a bug; it is the documented Cython idiom for
 working with `array.array` efficiently, and the two lines do different jobs. We
-give the run-time module the alias `py_arr_mod` to make the split obvious at
+give the run-time module the alias `py_stdlib_arr_mod` to make the split obvious at
 every call site:
 
 - `from cpython cimport array` is **compile-time only**. It pulls in the C-level
@@ -303,12 +303,12 @@ every call site:
   going through the Python constructor). A `cimport` creates **no runtime name
   binding**.
 
-- `import array as py_arr_mod` is the ordinary **run-time** import of the Python
-  `array` module. It is what makes the *constructor call* `py_arr_mod.array('I')`
+- `import array as py_stdlib_arr_mod` is the ordinary **run-time** import of the Python
+  `array` module. It is what makes the *constructor call* `py_stdlib_arr_mod.array('I')`
   resolve at run time (for example, the template argument to `array.clone`).
 
 So every use is unambiguous by name: `array.*` (`cdef array.array`,
-`array.clone(...)`) is the cimported C-level API, and `py_arr_mod.array(...)` is
+`array.clone(...)`) is the cimported C-level API, and `py_stdlib_arr_mod.array(...)` is
 the run-time Python constructor. They no longer share a name, so there is nothing
 to "override". (The canonical Cython array tutorial shows both lines sharing the
 name `array`; aliasing one side is the same idiom, just spelled out.)

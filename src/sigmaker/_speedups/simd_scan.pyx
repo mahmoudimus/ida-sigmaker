@@ -5,7 +5,7 @@ from libc.stdlib cimport malloc, free
 from libc.string cimport memcmp, memchr
 
 from cpython cimport array       # compile-time: C-level array.array type + array.clone
-import array as py_arr_mod        # run-time: the Python array module (constructor)
+import array as py_stdlib_arr_mod        # run-time: the Python array module (constructor)
 
 from sigmaker._speedups.simd_scan cimport Signature, SimdLevel, simd_support_best_level
 
@@ -723,12 +723,12 @@ def build_byte_index(const unsigned char[:] data_view):
     during the build. Buffers use array.clone (no oversized temporaries).
     """
     cdef Py_ssize_t n = data_view.shape[0]
-    cdef array.array heads = array.clone(py_arr_mod.array('I'), 65537, zero=True)
-    cdef array.array positions = array.clone(py_arr_mod.array('I'), 0, zero=False)
+    cdef array.array heads = array.clone(py_stdlib_arr_mod.array('I'), 65537, zero=True)
+    cdef array.array positions = array.clone(py_stdlib_arr_mod.array('I'), 0, zero=False)
     if n < 2:
         return heads, positions
 
-    positions = array.clone(py_arr_mod.array('I'), n - 1, zero=False)
+    positions = array.clone(py_stdlib_arr_mod.array('I'), n - 1, zero=False)
     cdef unsigned int[:] h = heads
     cdef unsigned int[:] pos = positions
     cdef const unsigned char* d = &data_view[0]

@@ -3915,6 +3915,49 @@ class TestIndexSeedEquivalence(CoveredUnitTest):
             )
             self.assertIn(anchor, seeded)
 
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_wildcard_heavy_one_byte_path_equals_brute_force(self):
+        import random
+        rng = random.Random(2026)
+        data = bytes(rng.randrange(256) for _ in range(8192))
+        mv = memoryview(bytearray(data))
+        idx = sigmaker._ByteIndex.build(mv)
+        buf = MagicMock()
+        buf.data.return_value = mv
+        for anchor in (33, 777, 5000):
+            sig = sigmaker.Signature()
+            # heavy wildcarding so no 2 consecutive exact bytes: every other
+            # byte is a wildcard -> forces the 1-byte seed path.
+            for j in range(7):
+                is_wc = (j % 2 == 1)
+                sig.append(sigmaker.SignatureByte(data[anchor + j], is_wc))
+            seeded = sigmaker._seed_via_index(sig, idx, buf)
+            expected = self._brute(data, sig)
+            self.assertEqual(sorted(seeded), sorted(expected),
+                             f"anchor {anchor}: 1-byte path != brute force")
+            self.assertIn(anchor, seeded)
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_end_of_buffer_pattern_found(self):
+        # Pattern at the very end of the buffer, with its only exact byte as
+        # the last pattern byte -> exercises the n-1 boundary handling.
+        data = bytes(range(256)) * 32  # 8192 bytes, last byte 0xFF
+        mv = memoryview(bytearray(data))
+        idx = sigmaker._ByteIndex.build(mv)
+        buf = MagicMock()
+        buf.data.return_value = mv
+        n = len(data)
+        m = 5
+        anchor = n - m  # pattern occupies the final 5 bytes
+        sig = sigmaker.Signature()
+        for j in range(m):
+            is_wc = (j != m - 1)  # only the last byte exact -> seed at s == m-1
+            sig.append(sigmaker.SignatureByte(data[anchor + j], is_wc))
+        seeded = sigmaker._seed_via_index(sig, idx, buf)
+        expected = self._brute(data, sig)
+        self.assertEqual(sorted(seeded), sorted(expected))
+        self.assertIn(anchor, seeded)
+
 
 class TestBuildByteIndex(CoveredUnitTest):
     """The Cython 2-byte counting-sort index."""

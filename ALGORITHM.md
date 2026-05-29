@@ -287,12 +287,14 @@ plugin still works, just without the speedups.
 In `simd_scan.pyx` you will see both, sharing the name `array`:
 
 ```cython
-from cpython cimport array   # compile-time: C declarations
-import array                 # run-time: the Python module
+from cpython cimport array       # compile-time: C-level array.array type + array.clone
+import array as py_arr_mod        # run-time: the Python array module (constructor)
 ```
 
 This is **not** a collision or a bug; it is the documented Cython idiom for
-working with `array.array` efficiently, and the two lines do different jobs:
+working with `array.array` efficiently, and the two lines do different jobs. We
+give the run-time module the alias `py_arr_mod` to make the split obvious at
+every call site:
 
 - `from cpython cimport array` is **compile-time only**. It pulls in the C-level
   declarations from Cython's bundled `cpython/array.pxd`: the `array.array`
@@ -301,13 +303,12 @@ working with `array.array` efficiently, and the two lines do different jobs:
   going through the Python constructor). A `cimport` creates **no runtime name
   binding**.
 
-- `import array` is the ordinary **run-time** import of the Python `array`
-  module. It is what makes the *constructor call* `array.array('I')` resolve at
-  run time (for example, the template argument to `array.clone`).
+- `import array as py_arr_mod` is the ordinary **run-time** import of the Python
+  `array` module. It is what makes the *constructor call* `py_arr_mod.array('I')`
+  resolve at run time (for example, the template argument to `array.clone`).
 
-Cython resolves each use of `array` in the right namespace: in a `cdef` type
-position or a C-function call (`array.clone(...)`) it uses the cimported C
-declarations; in a run-time expression (`array.array('I')`) it uses the imported
-module. Because the cimport contributes no runtime binding, there is nothing for
-the import to "override", they coexist by design. This is exactly the pattern
-shown in the Cython array tutorial.
+So every use is unambiguous by name: `array.*` (`cdef array.array`,
+`array.clone(...)`) is the cimported C-level API, and `py_arr_mod.array(...)` is
+the run-time Python constructor. They no longer share a name, so there is nothing
+to "override". (The canonical Cython array tutorial shows both lines sharing the
+name `array`; aliasing one side is the same idiom, just spelled out.)

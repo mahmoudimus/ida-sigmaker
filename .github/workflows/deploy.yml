@@ -23,12 +23,14 @@ jobs:
             matrix:
                 include:
                     - os: linux-intel
-                      runs-on: ubuntu-latest
+                      runs-on: ubuntu-24.04
+                    - os: linux-arm
+                      runs-on: ubuntu-24.04-arm
                     - os: windows-intel
                       runs-on: windows-latest
                     - os: macos-intel
-                      # macos-13 was the last x86_64 runner
-                      runs-on: macos-13
+                      # macos-15-intel is the current x86_64 runner (macos-13 retired Dec 2025)
+                      runs-on: macos-15-intel
                     - os: macos-arm
                       # macos-14+ (including latest) are ARM64 runners
                       runs-on: macos-latest

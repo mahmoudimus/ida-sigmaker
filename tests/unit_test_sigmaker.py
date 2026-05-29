@@ -3112,9 +3112,10 @@ class TestMinimalFunctionSignatureGeneratorSeedThenRefine(CoveredUnitTest):
         gen = sigmaker.MinimalFunctionSignatureGenerator(processor)
         pfn = self._make_pfn(0x1000, 0x100A)  # 10 single-byte 0x90 instructions
 
-        # Spy on the real find_all_offsets to confirm the seed scan is deferred
-        # until the pattern reaches MIN_USEFUL_SIG_BYTES (never seeded on a
-        # short, common prefix) and still runs the genuine SIMD seed + refine.
+        # Force the Phase 1 scan-seed fallback (disable the byte index) so this
+        # test exercises the find_all_offsets seed path it spies on. The
+        # index-backed seed path has its own equivalence coverage
+        # (TestIndexSeedEquivalence).
         real_find_all_offsets = sigmaker.SignatureSearcher.find_all_offsets
         seed_sig_byte_lens: list[int] = []
 
@@ -3124,6 +3125,8 @@ class TestMinimalFunctionSignatureGeneratorSeedThenRefine(CoveredUnitTest):
             return real_find_all_offsets(ida_signature, buf=buf)
 
         with patch.object(
+            sigmaker._ByteIndex, "build", return_value=None
+        ), patch.object(
             sigmaker.SignatureSearcher, "find_all_offsets", side_effect=spy
         ):
             result = gen.generate(pfn, self._make_cfg(max_len=50))
@@ -3720,6 +3723,174 @@ class TestProgressBox(CoveredUnitTest):
         ))
         self.assertEqual(self.dialogs[0].messages[0], "Processing (1/2) | Elapsed: 1s")
         self.assertEqual(self.dialogs[0].messages[1], "Processing (2/2) | Elapsed: 2s")
+
+
+class TestSeedViaIndex(CoveredUnitTest):
+    """Index-backed seeding maps hits to pattern starts and refines."""
+
+    def _sig(self, specs):
+        sig = sigmaker.Signature()
+        for v, w in specs:
+            sig.append(sigmaker.SignatureByte(v, w))
+        return sig
+
+    def test_index_seed_matches_buffer(self):
+        buf = MagicMock()
+        buf.data.return_value = memoryview(
+            bytearray(b"\x8b\x45\x90\x90\x90\x00\x8b\x45\x00\x00")
+        )
+        # pattern "8B 45 90 90 90" (all exact), 5 bytes
+        sig = self._sig(
+            [(0x8B, False), (0x45, False), (0x90, False), (0x90, False), (0x90, False)]
+        )
+        idx = MagicMock()
+        # 8B 45 is the most selective run, so Dynamic Seed Selection keys on
+        # it; other runs (90 90, 45 90) get a larger bucket so they lose.
+        idx.bucket_size.side_effect = lambda key: {(0x8B << 8) | 0x45: 2}.get(key, 10**9)
+        idx.candidates.side_effect = (
+            lambda key: [0, 6] if key == ((0x8B << 8) | 0x45) else []
+        )
+        out = sigmaker._seed_via_index(sig, idx, buf)
+        # offset 0 keeps (90 90 90 follow); offset 6 drops (00 00 follow)
+        self.assertEqual(out, [0])
+
+    def test_returns_none_when_no_run(self):
+        buf = MagicMock()
+        buf.data.return_value = memoryview(bytearray(b"\x90" * 10))
+        sig = self._sig([(0x90, True), (0x91, False), (0x92, True)])
+        idx = MagicMock()
+        idx.bucket_size.return_value = 0
+        self.assertIsNone(sigmaker._seed_via_index(sig, idx, buf))
+
+    def test_returns_none_when_index_none(self):
+        buf = MagicMock()
+        buf.data.return_value = memoryview(bytearray(b"\x90" * 10))
+        sig = self._sig([(0x90, False), (0x91, False)])
+        self.assertIsNone(sigmaker._seed_via_index(sig, None, buf))
+
+
+class TestSelectSeedRun(CoveredUnitTest):
+    """Dynamic Seed Selection: pick the smallest-bucket exact 2-byte run."""
+
+    def _sig(self, specs):  # specs: list[(value, is_wildcard)]
+        sig = sigmaker.Signature()
+        for v, w in specs:
+            sig.append(sigmaker.SignatureByte(v, w))
+        return sig
+
+    def _index(self, sizes):
+        idx = MagicMock()
+        idx.bucket_size.side_effect = lambda key: sizes.get(key, 0)
+        return idx
+
+    def test_picks_smallest_bucket_run(self):
+        # pattern: ?? 00 00 ?? 8B 45  -> exact runs (1,"00 00") and (4,"8B 45")
+        sig = self._sig(
+            [(0, True), (0, False), (0, False), (0, True), (0x8B, False), (0x45, False)]
+        )
+        sizes = {(0x00 << 8) | 0x00: 4_000_000, (0x8B << 8) | 0x45: 12}
+        run = sigmaker._select_seed_run(sig, self._index(sizes))
+        self.assertEqual(run, (4, (0x8B << 8) | 0x45))
+
+    def test_returns_none_when_no_two_exact_bytes(self):
+        sig = self._sig([(0, True), (0x8B, False), (0, True), (0x45, False)])
+        self.assertIsNone(sigmaker._select_seed_run(sig, self._index({})))
+
+
+class TestByteIndex(CoveredUnitTest):
+    """The _ByteIndex holder over build_byte_index."""
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_build_and_lookup(self):
+        data = memoryview(bytearray(b"\x01\x02\x01\x02\x03"))
+        idx = sigmaker._ByteIndex.build(data)
+        self.assertIsNotNone(idx)
+        key = (0x01 << 8) | 0x02
+        self.assertEqual(idx.bucket_size(key), 2)
+        self.assertEqual(sorted(idx.candidates(key)), [0, 2])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_build_returns_none_for_short_buffer(self):
+        self.assertIsNone(
+            sigmaker._ByteIndex.build(memoryview(bytearray(b"\x01")))
+        )
+
+
+class TestIndexSeedEquivalence(CoveredUnitTest):
+    """Index-seeded candidates must equal a brute-force masked rescan."""
+
+    def _brute(self, data: bytes, sig) -> list[int]:
+        n, m = len(data), len(sig)
+        out = []
+        for c in range(n - m + 1):
+            ok = True
+            for j in range(m):
+                sb = sig[j]
+                if sb.is_wildcard:
+                    continue
+                if data[c + j] != sb.value:
+                    ok = False
+                    break
+            if ok:
+                out.append(c)
+        return out
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_index_seed_equals_brute_force(self):
+        import random
+        rng = random.Random(99)
+        data = bytes(rng.randrange(256) for _ in range(8192))
+        mv = memoryview(bytearray(data))
+        idx = sigmaker._ByteIndex.build(mv)
+        buf = MagicMock()
+        buf.data.return_value = mv
+        for anchor in (10, 100, 500, 4000):
+            sig = sigmaker.Signature()
+            for j in range(7):
+                is_wc = (j % 4 == 0)
+                sig.append(sigmaker.SignatureByte(data[anchor + j], is_wc))
+            seeded = sigmaker._seed_via_index(sig, idx, buf)
+            expected = self._brute(data, sig)
+            self.assertEqual(
+                sorted(seeded), sorted(expected),
+                f"anchor {anchor}: index seed != brute force",
+            )
+            self.assertIn(anchor, seeded)
+
+
+class TestBuildByteIndex(CoveredUnitTest):
+    """The Cython 2-byte counting-sort index."""
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_heads_and_positions_shape(self):
+        data = memoryview(bytearray(b"\x01\x02\x01\x02\x03"))
+        heads, positions = sigmaker.simd_scan.build_byte_index(data)
+        self.assertEqual(len(heads), 65537)
+        self.assertEqual(len(positions), len(data) - 1)  # 4 windows
+        self.assertEqual(heads[0], 0)
+        self.assertEqual(heads[65536], len(data) - 1)
+        self.assertTrue(all(heads[i] <= heads[i + 1] for i in range(65536)))
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_bucket_contains_correct_offsets(self):
+        # windows: (0)01 02, (1)02 01, (2)01 02, (3)02 03
+        data = memoryview(bytearray(b"\x01\x02\x01\x02\x03"))
+        heads, positions = sigmaker.simd_scan.build_byte_index(data)
+        key_0102 = (0x01 << 8) | 0x02
+        start, end = heads[key_0102], heads[key_0102 + 1]
+        self.assertEqual(sorted(positions[start:end]), [0, 2])
+        key_0203 = (0x02 << 8) | 0x03
+        s2, e2 = heads[key_0203], heads[key_0203 + 1]
+        self.assertEqual(sorted(positions[s2:e2]), [3])
+        self.assertEqual(end - start, 2)  # bucket_size of 01 02
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_short_buffer_returns_empty_positions(self):
+        heads, positions = sigmaker.simd_scan.build_byte_index(
+            memoryview(bytearray(b"\x01"))
+        )
+        self.assertEqual(len(positions), 0)
+        self.assertEqual(len(heads), 65537)  # safe to look up; all buckets empty
 
 
 if __name__ == "__main__":

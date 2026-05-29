@@ -4,6 +4,9 @@ from libc.stdint cimport uint8_t
 from libc.stdlib cimport malloc, free
 from libc.string cimport memcmp, memchr
 
+from cpython cimport array
+import array
+
 from sigmaker._speedups.simd_scan cimport Signature, SimdLevel, simd_support_best_level
 
 cdef extern from "simd_support.hpp":
@@ -705,3 +708,54 @@ def scan_bytes(const unsigned char[:] data_view, Signature sig) -> int:
     if hit == e:
         return -1
     return <int>(hit - s)
+
+def build_byte_index(const unsigned char[:] data_view):
+    """Build a 2-byte bucket position index of data_view.
+
+    Returns (heads, positions), both array.array('I') (uint32):
+      heads: length 65537. The start offsets of bucket V are
+             positions[heads[V] : heads[V+1]]; bucket size is
+             heads[V+1] - heads[V]. heads[65536] == number of windows.
+      positions: length max(0, n-1); the start offset of each 2-byte
+             window, grouped by key. Empty when n < 2.
+
+    The counting sort runs under nogil so the IDA UI stays responsive
+    during the build. Buffers use array.clone (no oversized temporaries).
+    """
+    cdef Py_ssize_t n = data_view.shape[0]
+    cdef array.array heads = array.clone(array.array('I'), 65537, zero=True)
+    cdef array.array positions = array.clone(array.array('I'), 0, zero=False)
+    if n < 2:
+        return heads, positions
+
+    positions = array.clone(array.array('I'), n - 1, zero=False)
+    cdef unsigned int[:] h = heads
+    cdef unsigned int[:] pos = positions
+    cdef const unsigned char* d = &data_view[0]
+    cdef Py_ssize_t i
+    cdef unsigned int key
+    cdef unsigned int* wh = <unsigned int*>malloc(65537 * sizeof(unsigned int))
+    if wh == NULL:
+        raise MemoryError("build_byte_index: write-head allocation failed")
+    try:
+        with nogil:
+            for i in range(65537):
+                h[i] = 0
+            # pass 1: count occurrences of each key into h[key + 1]
+            for i in range(n - 1):
+                key = (<unsigned int>d[i] << 8) | <unsigned int>d[i + 1]
+                h[key + 1] += 1
+            # prefix sum: h[V] becomes the start index of bucket V
+            for i in range(1, 65537):
+                h[i] += h[i - 1]
+            # write heads start as bucket starts
+            for i in range(65537):
+                wh[i] = h[i]
+            # pass 2: place each window offset into its bucket
+            for i in range(n - 1):
+                key = (<unsigned int>d[i] << 8) | <unsigned int>d[i + 1]
+                pos[wh[key]] = <unsigned int>i
+                wh[key] += 1
+    finally:
+        free(wh)
+    return heads, positions

@@ -1559,6 +1559,97 @@ def _refine_offsets(
     return [c for c in offsets if c + j < n and (data_mv[c + j] & mask) == target]
 
 
+class _ByteIndex:
+    """A 2-byte bucket position index over the segment buffer.
+
+    Wraps simd_scan.build_byte_index. bucket_size is O(1) and candidates is
+    O(bucket). Built once per generate() and discarded; reused across all
+    anchors in that one search.
+    """
+
+    __slots__ = ("heads", "positions")
+
+    def __init__(self, heads, positions):
+        self.heads = heads
+        self.positions = positions
+
+    @classmethod
+    def build(cls, data_mv: memoryview) -> typing.Optional["_ByteIndex"]:
+        if not SIMD_SPEEDUP_AVAILABLE or len(data_mv) < 2:
+            return None
+        heads, positions = simd_scan.build_byte_index(data_mv)
+        return cls(heads, positions)
+
+    def bucket_size(self, key: int) -> int:
+        return self.heads[key + 1] - self.heads[key]
+
+    def candidates(self, key: int) -> list[int]:
+        start = self.heads[key]
+        end = self.heads[key + 1]
+        pos = self.positions
+        return [pos[i] for i in range(start, end)]
+
+
+def _select_seed_run(
+    sig: "Signature", index: "_ByteIndex"
+) -> typing.Optional[tuple[int, int]]:
+    """Pick the exact (unmasked) 2-byte run in sig whose index bucket is
+    smallest, to minimize the initial candidate set (Dynamic Seed Selection).
+
+    Returns (relative_offset, key), or None if sig has no run of two
+    consecutive exact bytes.
+    """
+    best: typing.Optional[tuple[int, int, int]] = None  # (size, offset, key)
+    for j in range(len(sig) - 1):
+        a = sig[j]
+        b = sig[j + 1]
+        if a.is_wildcard or b.is_wildcard:
+            continue
+        key = (a.value << 8) | b.value
+        size = index.bucket_size(key)
+        if best is None or size < best[0]:
+            best = (size, j, key)
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
+def _seed_via_index(
+    sig: "Signature",
+    index: typing.Optional["_ByteIndex"],
+    buf: "InMemoryBuffer",
+) -> typing.Optional[list[int]]:
+    """Seed the candidate set from the byte index instead of scanning.
+
+    Picks the most selective exact 2-byte run (Dynamic Seed Selection), maps
+    its hits back to candidate pattern-starts, and refines against the rest of
+    the pattern so the result equals matches(full pattern). Returns the
+    candidate offsets, or None if the index is unavailable or the pattern has
+    no exact 2-byte run (caller falls back to a scan).
+    """
+    if index is None:
+        return None
+    run = _select_seed_run(sig, index)
+    if run is None:
+        return None
+    s, key = run
+    data_mv = buf.data()
+    n = len(data_mv)
+    m = len(sig)
+    # Map each 2-byte hit at offset p back to a pattern start p - s, keeping
+    # only candidates whose full pattern fits in the buffer.
+    cands = [p - s for p in index.candidates(key) if p >= s and (p - s) + m <= n]
+    # Refine against every exact byte except the two seed-run bytes.
+    for j in range(m):
+        if j == s or j == s + 1:
+            continue
+        sb = sig[j]
+        if sb.is_wildcard:
+            continue
+        cands = _refine_offsets(data_mv, cands, j, sb.value, 0xFF)
+    return cands
+
+
 def _decode_function_for_anchors(
     pfn: "idaapi.func_t",
     processor: "InstructionProcessor",
@@ -1665,9 +1756,13 @@ class MinimalFunctionSignatureGenerator:
         # call. Profiling against a real binary showed _load_segments was
         # 84% of generate() wall time when called per-is_unique.
         buf: typing.Optional["InMemoryBuffer"] = None
+        index: typing.Optional["_ByteIndex"] = None
         if SIMD_SPEEDUP_AVAILABLE:
             with ProgressDialog("Please stand by, copying segments..."):
                 buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
+            # Build the 2-byte position index once for the whole search so each
+            # anchor seeds with an O(1) lookup instead of a full-buffer scan.
+            index = _ByteIndex.build(buf.data())
 
         # Iterate the pre-decoded anchors inside a ProgressBox so the wait
         # box shows live progress (issue #27). enumerate() keeps the index
@@ -1701,7 +1796,7 @@ class MinimalFunctionSignatureGenerator:
 
             sig = self._grow_unique_from_decoded(
                 decoded, anchor_idx, progress.best_size, cfg,
-                buf=buf, progress=progress,
+                buf=buf, progress=progress, index=index,
             )
             if sig is None:
                 continue
@@ -1730,6 +1825,7 @@ class MinimalFunctionSignatureGenerator:
         cfg: SigMakerConfig,
         buf: typing.Optional["InMemoryBuffer"] = None,
         progress: typing.Optional["_FunctionSigProgress"] = None,
+        index: typing.Optional["_ByteIndex"] = None,
     ) -> typing.Optional[Signature]:
         """Grow a signature from ``decoded[anchor_idx]`` forward until unique.
 
@@ -1789,12 +1885,16 @@ class MinimalFunctionSignatureGenerator:
                 # so fall back to the per-step rescan.
                 count = SignatureSearcher.count_matches(f"{sig:ida}", buf=buf)
             elif offsets is None:
-                # Seed once against the cached buffer; keep every match offset.
-                # The pattern is now at least MIN_USEFUL_SIG_BYTES, so this is
-                # selective rather than a full-database enumeration.
-                offsets, seed_buf = SignatureSearcher.find_all_offsets(
-                    f"{sig:ida}", buf=seed_buf
-                )
+                # Seed once. Prefer the byte index (O(1) lookup via Dynamic
+                # Seed Selection); fall back to a full scan if the index is
+                # unavailable or the pattern has no exact 2-byte run to key on.
+                seeded = _seed_via_index(sig, index, seed_buf)
+                if seeded is None:
+                    offsets, seed_buf = SignatureSearcher.find_all_offsets(
+                        f"{sig:ida}", buf=seed_buf
+                    )
+                else:
+                    offsets = seeded
                 count = len(offsets)
             else:
                 # Refine the surviving candidates in memory for each byte

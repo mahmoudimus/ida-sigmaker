@@ -398,6 +398,59 @@ class TestBenchmarkPerformance(unittest.TestCase):
             "times": times,
         }
 
+    def benchmark_index_vs_scan_seed(self, iterations: int = 3) -> dict:
+        """Time the function search with the byte index vs the Phase 1 scan
+        fallback (forced by disabling the index), on the largest function."""
+        import time as _time
+        from unittest.mock import patch as _patch
+
+        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
+            self.skipTest("SIMD speedup not available")
+        func_qty = idaapi.get_func_qty()
+        best, best_size = None, 0
+        for i in range(func_qty):
+            pfn = idaapi.getn_func(i)
+            if pfn is None:
+                continue
+            if (pfn.end_ea - pfn.start_ea) > best_size:
+                best_size = pfn.end_ea - pfn.start_ea
+                best = pfn
+        if best is None:
+            self.skipTest("no function")
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA, wildcard_operands=True,
+            continue_outside_of_function=False, wildcard_optimized=True,
+            ask_longer_signature=False, max_single_signature_length=100,
+        )
+        gen = sigmaker.MinimalFunctionSignatureGenerator(
+            sigmaker.InstructionProcessor(sigmaker.OperandProcessor()))
+
+        def median(iters):
+            ts = []
+            for _ in range(iters):
+                t0 = _time.perf_counter()
+                try:
+                    gen.generate(best, cfg)
+                except sigmaker.Unexpected:
+                    pass
+                ts.append(_time.perf_counter() - t0)
+            ts.sort()
+            return ts[len(ts) // 2]
+
+        with_index = median(iterations)
+        with _patch.object(sigmaker._ByteIndex, "build", return_value=None):
+            scan_only = median(iterations)
+        print("\n--- benchmark_index_vs_scan_seed ---")
+        print(f"function bytes: {best_size}")
+        print(f"index median:   {with_index:.4f}s")
+        print(f"scan median:    {scan_only:.4f}s")
+        return {
+            "operation": "index_vs_scan_seed",
+            "function_bytes": best_size,
+            "index_s": with_index,
+            "scan_s": scan_only,
+        }
+
     def test_performance_benchmarks(self):
         """Run all performance benchmarks and display results."""
         print("\n" + "=" * 80)

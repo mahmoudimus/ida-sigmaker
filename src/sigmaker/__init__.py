@@ -1559,6 +1559,37 @@ def _refine_offsets(
     return [c for c in offsets if c + j < n and (data_mv[c + j] & mask) == target]
 
 
+class _ByteIndex:
+    """A 2-byte bucket position index over the segment buffer.
+
+    Wraps simd_scan.build_byte_index. bucket_size is O(1) and candidates is
+    O(bucket). Built once per generate() and discarded; reused across all
+    anchors in that one search.
+    """
+
+    __slots__ = ("heads", "positions")
+
+    def __init__(self, heads, positions):
+        self.heads = heads
+        self.positions = positions
+
+    @classmethod
+    def build(cls, data_mv: memoryview) -> typing.Optional["_ByteIndex"]:
+        if not SIMD_SPEEDUP_AVAILABLE or len(data_mv) < 2:
+            return None
+        heads, positions = simd_scan.build_byte_index(data_mv)
+        return cls(heads, positions)
+
+    def bucket_size(self, key: int) -> int:
+        return self.heads[key + 1] - self.heads[key]
+
+    def candidates(self, key: int) -> list[int]:
+        start = self.heads[key]
+        end = self.heads[key + 1]
+        pos = self.positions
+        return [pos[i] for i in range(start, end)]
+
+
 def _decode_function_for_anchors(
     pfn: "idaapi.func_t",
     processor: "InstructionProcessor",

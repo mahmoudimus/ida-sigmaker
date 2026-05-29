@@ -3722,6 +3722,25 @@ class TestProgressBox(CoveredUnitTest):
         self.assertEqual(self.dialogs[0].messages[1], "Processing (2/2) | Elapsed: 2s")
 
 
+class TestByteIndex(CoveredUnitTest):
+    """The _ByteIndex holder over build_byte_index."""
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_build_and_lookup(self):
+        data = memoryview(bytearray(b"\x01\x02\x01\x02\x03"))
+        idx = sigmaker._ByteIndex.build(data)
+        self.assertIsNotNone(idx)
+        key = (0x01 << 8) | 0x02
+        self.assertEqual(idx.bucket_size(key), 2)
+        self.assertEqual(sorted(idx.candidates(key)), [0, 2])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_build_returns_none_for_short_buffer(self):
+        self.assertIsNone(
+            sigmaker._ByteIndex.build(memoryview(bytearray(b"\x01")))
+        )
+
+
 class TestBuildByteIndex(CoveredUnitTest):
     """The Cython 2-byte counting-sort index."""
 

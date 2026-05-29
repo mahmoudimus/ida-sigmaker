@@ -95,12 +95,14 @@ if not SIMD_SPEEDUP_AVAILABLE:
 
 
 # How many matches a scan loop processes between cancellation polls.
-# idaapi.user_cancelled() costs roughly half a microsecond per call; a short,
-# common pattern can match millions of positions, so polling every match makes
-# the poll dominate the scan. Polling every few thousand matches keeps cancel
-# responsive (a few thousand SIMD steps is well under a millisecond) while
-# removing essentially all of the overhead.
-_CANCEL_POLL_STRIDE: int = 8192
+# idaapi.user_cancelled() is not a cheap predicate: it pumps the UI event
+# loop, so each call costs on the order of a millisecond. A short, common
+# pattern can match tens of millions of positions, so polling too often makes
+# the poll itself a multi-second cost (observed: 4,755 polls = 6.7s at an 8192
+# stride). Polling every 65536 matches keeps that overhead near a second while
+# leaving cancel responsive: the inter-poll scan work is only tens of
+# milliseconds.
+_CANCEL_POLL_STRIDE: int = 65536
 
 
 def configure_logging(

@@ -23,6 +23,7 @@ An IDA Pro 9.0+ zero-dependency cross-platform signature maker plugin with optio
   - [How it works](#how-it-works)
 - [Using SigMaker as a library](#using-sigmaker-as-a-library)
   - [Stability contract](#stability-contract)
+  - [Used by](#used-by)
 - [Acknowledgements](#acknowledgements)
 - [Development & Releases](#development--releases)
   - [Contributing](#contributing)
@@ -216,6 +217,15 @@ If you embed `sigmaker`, you can rely on the following. These are treated as a c
 3. **Stable method signatures.** `SignatureMaker.make_signature(ea, cfg, end=None, *, progress_reporter=None, policy=GenerationPolicy.strict())`, `XrefFinder.find_xrefs(ea, cfg)`, `XrefFinder.count_code_xrefs_to(ea)`, and `XrefFinder.iter_code_xrefs_to(ea)`.
 4. **Stable format specs.** `f"{sig:ida}"`, `f"{sig:x64dbg}"`, `f"{sig:mask}"`, and `f"{sig:bitmask}"` keep producing their current output exactly.
 5. **Byte-identical defaults.** Production defaults are unchanged across optimizations: a script that does not opt into a new flag gets byte-identical signatures to previous versions.
+
+### Used by
+
+Projects that build on or embed the `sigmaker` library:
+
+- [mrexodia/ida-pro-mcp](https://github.com/mrexodia/ida-pro-mcp), an AI reverse-engineering MCP server (8.9k+ stars), vendors a stripped, engine-only copy of `sigmaker` and exposes signature tools through `SigMakerConfig`, `SignatureType`, `SignatureMaker().make_signature`, and `XrefFinder().find_xrefs`.
+- [koyzdev/sigdrift](https://github.com/koyzdev/sigdrift) is a batch signature-generation script that imports the library and calls `SignatureMaker().make_signature(ea, SigMakerConfig(...))` and `XrefFinder()`, formatting results via `f"{sig:ida}"` and `f"{sig:mask}"`.
+
+Building something on top of `sigmaker`? Open a PR or an issue and I will add it here.
 
 ## Acknowledgements
 

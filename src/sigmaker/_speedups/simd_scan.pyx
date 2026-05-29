@@ -4,8 +4,8 @@ from libc.stdint cimport uint8_t
 from libc.stdlib cimport malloc, free
 from libc.string cimport memcmp, memchr
 
-from cpython cimport array
-import array
+from cpython cimport array       # compile-time: C-level array.array type + array.clone
+import array as py_stdlib_arr_mod        # run-time: the Python array module (constructor)
 
 from sigmaker._speedups.simd_scan cimport Signature, SimdLevel, simd_support_best_level
 
@@ -723,12 +723,12 @@ def build_byte_index(const unsigned char[:] data_view):
     during the build. Buffers use array.clone (no oversized temporaries).
     """
     cdef Py_ssize_t n = data_view.shape[0]
-    cdef array.array heads = array.clone(array.array('I'), 65537, zero=True)
-    cdef array.array positions = array.clone(array.array('I'), 0, zero=False)
+    cdef array.array heads = array.clone(py_stdlib_arr_mod.array('I'), 65537, zero=True)
+    cdef array.array positions = array.clone(py_stdlib_arr_mod.array('I'), 0, zero=False)
     if n < 2:
         return heads, positions
 
-    positions = array.clone(array.array('I'), n - 1, zero=False)
+    positions = array.clone(py_stdlib_arr_mod.array('I'), n - 1, zero=False)
     cdef unsigned int[:] h = heads
     cdef unsigned int[:] pos = positions
     cdef const unsigned char* d = &data_view[0]
@@ -759,3 +759,28 @@ def build_byte_index(const unsigned char[:] data_view):
     finally:
         free(wh)
     return heads, positions
+
+
+def refine_offsets(const unsigned char[:] data_view,
+                   unsigned int[:] cands,
+                   Py_ssize_t count,
+                   Py_ssize_t j,
+                   unsigned int value,
+                   unsigned int mask):
+    """Keep cands[0:count] entries c where (data_view[c+j] & mask) ==
+    (value & mask) and c + j < n, compacting survivors to the front of cands
+    in place. Returns the new count. nogil; no allocation.
+    """
+    cdef Py_ssize_t n = data_view.shape[0]
+    cdef unsigned int target = value & mask
+    cdef Py_ssize_t r = 0
+    cdef Py_ssize_t w = 0
+    cdef Py_ssize_t c
+    with nogil:
+        while r < count:
+            c = <Py_ssize_t>cands[r]
+            if c + j < n and (data_view[c + j] & mask) == target:
+                cands[w] = cands[r]
+                w += 1
+            r += 1
+    return w

@@ -20,13 +20,13 @@ either an exact byte (value $v_j$, mask $m_j = \text{0xFF}$) or a wildcard
 $p$ when
 
 $$
-\forall j \in [0, \ell): \quad (D[p + j] \mathbin{\&} m_j) = (v_j \mathbin{\&} m_j).
+\forall j \in [0, \ell): \quad (D[p + j] \wedge m_j) = (v_j \wedge m_j).
 $$
 
-Let the match set be
+(Here $\wedge$ denotes bitwise AND.) Let the match set be
 
 $$
-M(P) = \{\, p \in [0,\, N - \ell] : P \text{ matches } D \text{ at } p \,\}.
+M(P) = \lbrace p \in [0, N - \ell] : P \text{ matches } D \text{ at } p \rbrace.
 $$
 
 For a function at address $a$, we decode its instructions, turn operands into
@@ -35,7 +35,7 @@ $P_\ell$ (the first $\ell$ tokens). We want the **shortest** $\ell$ such that
 $P_\ell$ is unique:
 
 $$
-\ell^* = \min \{\, \ell : |M(P_\ell)| = 1 \,\}.
+\ell^* = \min \lbrace \ell : |M(P_\ell)| = 1 \rbrace.
 $$
 
 ## 2. The naive cost, and where 462 seconds went
@@ -68,7 +68,7 @@ So there is no reason to recompute $M(P_{\ell+1})$ from scratch. Given $M(P_\ell
 the next set is just a **filter** of the previous one:
 
 $$
-M(P_{\ell+1}) = \{\, p \in M(P_\ell) : (D[p + \ell] \mathbin{\&} m_\ell) = (v_\ell \mathbin{\&} m_\ell) \,\}.
+M(P_{\ell+1}) = \lbrace p \in M(P_\ell) : (D[p + \ell] \wedge m_\ell) = (v_\ell \wedge m_\ell) \rbrace.
 $$
 
 This is the *seed-then-refine* recurrence. We pay for **one** initial match set
@@ -100,7 +100,7 @@ size.
 For each 2-byte key $k \in [0, 2^{16})$ define its bucket
 
 $$
-B_k = \{\, p \in [0,\, N-1) : D[p] = (k \gg 8) \ \wedge\ D[p+1] = (k \mathbin{\&} \text{0xFF}) \,\}.
+B_k = \lbrace p \in [0, N-1) : D[p] = \lfloor k / 256 \rfloor \ \text{ and } \ D[p+1] = k \bmod 256 \rbrace.
 $$
 
 We store every window start grouped by key in one flat array `positions`, with a
@@ -126,7 +126,7 @@ Built once, amortized across **all** anchors. With the index in hand, seeding a
 pattern that contains an exact 2-byte run at offset $s$ with key $k$ costs only
 
 $$
-O(|B_k|): \quad M_{\text{seed}} = \{\, p - s : p \in B_k,\ \text{pattern fits} \,\},
+O(|B_k|): \quad M_{\text{seed}} = \lbrace p - s : p \in B_k, \ \text{pattern fits} \rbrace,
 $$
 
 and then we refine against the remaining tokens (Section 3). The full $O(N)$ seed
@@ -148,7 +148,7 @@ high byte is $b$ occupy a **contiguous** block of `positions`. Hence the 1-byte
 bucket is a telescoping sum that collapses to a single subtraction:
 
 $$
-\bigl|B^{(1)}_b\bigr| = \sum_{c=0}^{255} \bigl|B_{(b \ll 8)\,\mid\, c}\bigr|
+\bigl|B^{(1)}_b\bigr| = \sum_{c=0}^{255} \bigl|B_{(b \ll 8)\mid c}\bigr|
 = \texttt{heads}[(b{+}1)\ll 8] - \texttt{heads}[b \ll 8],
 $$
 
@@ -161,7 +161,7 @@ valid pattern start.)
 Seed selection then minimizes selectivity over the union of both widths:
 
 $$
-(s^*, w^*) = \arg\min_{(s,\, w) \in \text{exact runs}} \bigl|B^{(w)}_{\text{key}(s,w)}\bigr|.
+(s^*, w^*) = \arg\min_{(s, w) \in \text{exact runs}} \bigl|B^{(w)}_{\text{key}(s,w)}\bigr|.
 $$
 
 Since the 1-byte options are a *superset* of the candidate seeds, the chosen seed
@@ -185,7 +185,7 @@ pattern.
 Each refine step (Section 3) is a filter over the candidate array. We represent
 candidates as a typed `uint32` buffer and compact survivors **in place** with a
 two-pointer scan. With read index $r$, write index $w \le r$, target
-$\tau = v \mathbin{\&} m$:
+$\tau = v \wedge m$:
 
 ```
 for r in 0 .. count-1:

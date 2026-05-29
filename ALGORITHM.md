@@ -42,8 +42,8 @@ $$
 
 The obvious method: for $\ell = \ell_{\min}, \ell_{\min}+1, \dots$, scan all of
 $D$ and count matches of $P_\ell$, stop when the count reaches 1. Even with a
-SIMD-accelerated scan that costs $O(N)$ per length, this performs $L = \ell^\ast -
-\ell_{\min} + 1$ **independent full scans**:
+SIMD-accelerated scan that costs $O(N)$ per length, this performs
+$L = \ell^\ast - \ell_{\min} + 1$ **independent full scans**:
 
 $$
 T_{\text{naive}} = O(L \cdot N).
@@ -79,7 +79,7 @@ O(|M(P_\ell)|)
 $$
 
 work, proportional to the *current candidate count*, not $N$. Candidate counts
-collapse fast (each added exact byte divides the set by roughly $256$ for random
+collapse fast (each added exact byte divides the set by roughly 256 for random
 data), so the entire refine chain telescopes:
 
 $$

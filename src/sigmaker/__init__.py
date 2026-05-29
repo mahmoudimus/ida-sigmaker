@@ -1589,6 +1589,17 @@ class _ByteIndex:
         pos = self.positions
         return [pos[i] for i in range(start, end)]
 
+    def bucket_size1(self, b: int) -> int:
+        # 1-byte bucket for b: all 2-byte keys (b<<8)..((b+1)<<8 - 1) telescope
+        # into one contiguous range, so its size is heads[(b+1)<<8]-heads[b<<8].
+        return self.heads[(b + 1) << 8] - self.heads[b << 8]
+
+    def candidates1(self, b: int) -> list[int]:
+        start = self.heads[b << 8]
+        end = self.heads[(b + 1) << 8]
+        pos = self.positions
+        return [pos[i] for i in range(start, end)]
+
 
 def _select_seed_run(
     sig: "Signature", index: "_ByteIndex"

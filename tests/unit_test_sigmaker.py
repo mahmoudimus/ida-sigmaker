@@ -3797,6 +3797,31 @@ class TestSelectSeedRun(CoveredUnitTest):
         self.assertIsNone(sigmaker._select_seed_run(sig, self._index({})))
 
 
+class TestByteIndexOneByte(CoveredUnitTest):
+    """1-byte bucket accessors derived from the 2-byte index."""
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_bucket_size1_and_candidates1(self):
+        # 0x90 appears at offsets 0,2,4,6 but only 0,2,4 are 2-byte-window
+        # starts (offset 6 is the last byte, n-1, not a window start).
+        data = memoryview(bytearray(b"\x90\x01\x90\x02\x90\x03\x90"))
+        idx = sigmaker._ByteIndex.build(data)
+        self.assertEqual(sorted(idx.candidates1(0x90)), [0, 2, 4])
+        self.assertEqual(idx.bucket_size1(0x90), 3)
+        self.assertEqual(idx.bucket_size1(0xEE), 0)
+        self.assertEqual(idx.candidates1(0xEE), [])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_bucket_size1_equals_sum_of_two_byte_buckets(self):
+        import random
+        rng = random.Random(7)
+        data = memoryview(bytearray(rng.randrange(256) for _ in range(4096)))
+        idx = sigmaker._ByteIndex.build(data)
+        for b in (0x00, 0x41, 0xFF):
+            two_byte_sum = sum(idx.bucket_size((b << 8) | x) for x in range(256))
+            self.assertEqual(idx.bucket_size1(b), two_byte_sum)
+
+
 class TestByteIndex(CoveredUnitTest):
     """The _ByteIndex holder over build_byte_index."""
 

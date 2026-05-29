@@ -4,6 +4,30 @@
 
 An IDA Pro 9.0+ zero-dependency cross-platform signature maker plugin with optional SIMD (e.g. AVX2/NEON/SSE2) speedups that works on MacOS/Linux/Windows. The primary goal of this plugin is to work with future versions of IDA without needing to compile against the IDA SDK as well as to allow for easier community contributions.
 
+## Table of contents
+
+- [Installation](#installation)
+  - [Quick Install](#quick-install)
+  - [From Releases](#from-releases)
+  - [Need to find your plugin directory?](#need-to-find-your-plugin-directory)
+  - [Where and what is my default user directory?](#where-and-what-is-my-default-user-directory)
+- [SIMD Speedups](#simd-speedups)
+- [Requirements](#requirements)
+- [What is a "sigmaker"?](#what-is-a-sigmaker)
+- [Usage](#usage)
+  - [Finding XREFs](#finding-xrefs)
+  - [Signature searching](#signature-searching)
+  - [Signature Configuration](#signature-configuration)
+- [Performance](#performance)
+  - [Benchmarks](#benchmarks)
+  - [How it works](#how-it-works)
+- [Using SigMaker as a library](#using-sigmaker-as-a-library)
+  - [Stability contract](#stability-contract)
+- [Acknowledgements](#acknowledgements)
+- [Development & Releases](#development--releases)
+  - [Contributing](#contributing)
+- [Contact](#contact)
+
 ## Installation
 
 sigmaker's main value proposition is its cross-platform (Windows, macOS, Linux) Python 3 support. It uses zero third party dependencies, making the code both portable and easy to install.
@@ -131,6 +155,67 @@ If the matched address is not a function name or has no function name, it falls 
 There are also various options that be configured via the `Other options` button:
 
 ![](./assets/optional_configuration.png)
+
+## Performance
+
+SigMaker's "find the shortest unique signature for the current function" search has been heavily optimized. On a real 16 MB module, a single worst-case function search once took **462 seconds (7.7 minutes)**. A stack of four optimizations brought the heaviest searches down to the tens-of-seconds range and typical ones to near-instant. One user [reported](https://github.com/mahmoudimus/ida-sigmaker/issues/27#issuecomment-4577775008) the progress wait-box now "barely show[s] up for a 26 byte signature."
+
+The full derivation, including the match-set math, the counting-sort index, the selectivity proof, and what is novel about the approach, is written up in **[ALGORITHM.md](./ALGORITHM.md)**.
+
+### Benchmarks
+
+Measured on the largest function (8486 bytes) of a 16 MB module via native idalib on Apple Silicon. The effects are cumulative across the four phases:
+
+| Optimization | Effect | PR |
+| --- | --- | --- |
+| Phase 1: seed-then-refine candidate refinement | ~13x faster function search | [#33](https://github.com/mahmoudimus/ida-sigmaker/pull/33) |
+| Phase 2: 2-byte bucket position index | additional ~2.48x on large databases, widening as the database grows | [#35](https://github.com/mahmoudimus/ida-sigmaker/pull/35) |
+| Phase 3: dynamic seed selection (1- or 2-byte) | per-anchor seed scans cut from 206 to 2 | [#36](https://github.com/mahmoudimus/ida-sigmaker/pull/36) |
+| Phase 4: Cython in-place refinement | per-byte refinement ~14 s to ~0.28 s (~50x); function total ~24 s to ~15.6 s | [#36](https://github.com/mahmoudimus/ida-sigmaker/pull/36) |
+
+Signature output is byte-identical before and after every optimization. The test suite cross-checks each fast path against a brute-force oracle and diffs the generated signatures across the entire test binary.
+
+### How it works
+
+A short tour (see [ALGORITHM.md](./ALGORITHM.md) for the math):
+
+- **Seed, then refine.** The set of database matches can only shrink as a signature grows, so instead of rescanning the whole database for every candidate length, SigMaker scans once to seed a candidate set and then filters that set in place as each byte is appended.
+- **Index the database once.** A counting-sort index over every adjacent byte pair lets the seed be drawn from the *rarest* exact run in the pattern, in time proportional to that run's frequency rather than to the database size. The same index serves both 1-byte and 2-byte runs for free, so the most selective anchor is always chosen.
+- **Push the hot loops into C.** With the optional `pip install sigmaker` SIMD wheel, the index build and the per-byte refinement run as `nogil` C over typed buffers with zero per-call allocation, and the raw byte scan uses AVX2/NEON/SSE2. Without the wheel, pure-Python fallbacks produce identical results.
+
+## Using SigMaker as a library
+
+Beyond the IDA plugin, `sigmaker` is imported directly as a Python library by other tools (for example, batch signature-generation pipelines). The core types are usable from any IDAPython or idalib context:
+
+```python
+import sigmaker
+
+cfg = sigmaker.SigMakerConfig(
+    output_format=sigmaker.SignatureType.IDA,
+    wildcard_operands=True,
+    continue_outside_of_function=False,
+    wildcard_optimized=True,
+    ask_longer_signature=False,
+)
+result = sigmaker.SignatureMaker().make_signature(ea, cfg)
+print(f"{result.signature:ida}")   # IDA-style string
+print(len(result.signature))       # byte length
+
+# Cross-references:
+xrefs = sigmaker.XrefFinder().find_xrefs(ea, cfg)
+for gen in xrefs.signatures:
+    print(str(gen.address), f"{gen.signature:ida}")
+```
+
+### Stability contract
+
+If you embed `sigmaker`, you can rely on the following. These are treated as a contract and are checked before any change to the public surface:
+
+1. **Append-only config.** `SigMakerConfig` fields are never reordered or removed. New behavior arrives as new fields with safe defaults, so existing constructions keep working.
+2. **Stable public names.** These names and their documented attributes are not renamed or removed: `SignatureMaker`, `SigMakerConfig`, `SignatureType` (`IDA`, `x64Dbg`, `Mask`, `BitMask`), `XrefFinder`, `GeneratedSignature` (`signature`, `address`, `status`, `match_count`), `XrefGeneratedSignature` (`signatures`), `Match` (`__str__` returns the hex address), `Signature` (`__len__`, `__format__`), `GenerationPolicy`, `GenerationStatus`.
+3. **Stable method signatures.** `SignatureMaker.make_signature(ea, cfg, end=None, *, progress_reporter=None, policy=GenerationPolicy.strict())`, `XrefFinder.find_xrefs(ea, cfg)`, `XrefFinder.count_code_xrefs_to(ea)`, and `XrefFinder.iter_code_xrefs_to(ea)`.
+4. **Stable format specs.** `f"{sig:ida}"`, `f"{sig:x64dbg}"`, `f"{sig:mask}"`, and `f"{sig:bitmask}"` keep producing their current output exactly.
+5. **Byte-identical defaults.** Production defaults are unchanged across optimizations: a script that does not opt into a new flag gets byte-identical signatures to previous versions.
 
 ## Acknowledgements
 

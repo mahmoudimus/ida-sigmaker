@@ -35,14 +35,14 @@ $P_\ell$ (the first $\ell$ tokens). We want the **shortest** $\ell$ such that
 $P_\ell$ is unique:
 
 $$
-\ell^* = \min \lbrace \ell : |M(P_\ell)| = 1 \rbrace.
+\ell^\ast = \min \lbrace \ell : |M(P_\ell)| = 1 \rbrace.
 $$
 
 ## 2. The naive cost, and where 462 seconds went
 
 The obvious method: for $\ell = \ell_{\min}, \ell_{\min}+1, \dots$, scan all of
 $D$ and count matches of $P_\ell$, stop when the count reaches 1. Even with a
-SIMD-accelerated scan that costs $O(N)$ per length, this performs $L = \ell^* -
+SIMD-accelerated scan that costs $O(N)$ per length, this performs $L = \ell^\ast -
 \ell_{\min} + 1$ **independent full scans**:
 
 $$
@@ -161,14 +161,14 @@ valid pattern start.)
 Seed selection then minimizes selectivity over the union of both widths:
 
 $$
-(s^*, w^*) = \arg\min_{(s, w) \in \text{exact runs}} \bigl|B^{(w)}_{\text{key}(s,w)}\bigr|.
+(s^\ast, w^\ast) = \arg\min_{(s, w) \in \text{exact runs}} \bigl|B^{(w)}_{\text{key}(s,w)}\bigr|.
 $$
 
 Since the 1-byte options are a *superset* of the candidate seeds, the chosen seed
 bucket is never worse than a 2-byte-only choice:
 
 $$
-C_0 = \bigl|B^{(w^*)}\bigr| \le \min_{\text{2-byte runs}} |B_k|.
+C_0 = \bigl|B^{(w^\ast)}\bigr| \le \min_{\text{2-byte runs}} |B_k|.
 $$
 
 A smaller seed means fewer candidates entering the refine chain, which (Section 3)

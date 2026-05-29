@@ -94,6 +94,17 @@ if not SIMD_SPEEDUP_AVAILABLE:
         _load_speedups_sibling()
 
 
+# How many matches a scan loop processes between cancellation polls.
+# idaapi.user_cancelled() is not a cheap predicate: it pumps the UI event
+# loop, so each call costs on the order of a millisecond. A short, common
+# pattern can match tens of millions of positions, so polling too often makes
+# the poll itself a multi-second cost (observed: 4,755 polls = 6.7s at an 8192
+# stride). Polling every 65536 matches keeps that overhead near a second while
+# leaving cancel responsive: the inter-poll scan work is only tens of
+# milliseconds.
+_CANCEL_POLL_STRIDE: int = 65536
+
+
 def configure_logging(
     logger=None,
     logging_name="sigmaker",
@@ -1427,6 +1438,13 @@ class UniqueSignatureGenerator:
         bytes_since_last_check = 0
         progress = _UniqueSigProgress(sig=sig)
 
+        # SIMD path: scan the database once to seed a candidate-offset set,
+        # then refine that set in memory as the pattern grows instead of
+        # re-scanning per appended instruction. offsets is None until the
+        # first scan; buf holds the segment buffer the offsets index into.
+        offsets: typing.Optional[list[int]] = None
+        buf: typing.Optional["InMemoryBuffer"] = None
+
         def build_partial() -> GeneratedSignature:
             # Trim trailing wildcards, mirror the success path.
             sig.trim_signature()
@@ -1480,18 +1498,37 @@ class UniqueSignatureGenerator:
                 ):
                     raise Unexpected("Signature left function scope without being unique")
 
+                prev_len = len(sig)
                 self.processor.append_instruction_to_sig(
                     sig, cur_ea, ins, cfg.wildcard_operands, cfg.wildcard_optimized
                 )
                 bytes_since_last_check += ins_len
 
-                count = SignatureSearcher.count_matches(f"{sig:ida}")
-                # SignatureSearcher.find_all polls idaapi_user_canceled inside
-                # its scan loop and bails when set, returning whatever partial
-                # count it had so far (often 0). When the call was interrupted,
-                # keep last_match_count at its prior trustworthy value (issue
-                # #22): the reported number is an upper bound on the partial's
-                # actual match count rather than a meaningless 0.
+                if not SIMD_SPEEDUP_AVAILABLE:
+                    # Non-SIMD builds have no in-memory buffer to refine
+                    # against, so fall back to the per-step rescan.
+                    count = SignatureSearcher.count_matches(f"{sig:ida}")
+                elif offsets is None:
+                    # Seed once: scan the whole database, keep every match
+                    # offset. The candidate count is the exact match count.
+                    offsets, buf = SignatureSearcher.find_all_offsets(f"{sig:ida}")
+                    count = len(offsets)
+                else:
+                    # Refine the surviving candidates in memory for each byte
+                    # appended this iteration; no rescan of the database.
+                    data_mv = buf.data()
+                    for j in range(prev_len, len(sig)):
+                        sb = sig[j]
+                        mask = 0x00 if sb.is_wildcard else 0xFF
+                        offsets = _refine_offsets(data_mv, offsets, j, sb.value, mask)
+                    count = len(offsets)
+                # find_all_offsets polls idaapi_user_canceled inside its scan
+                # loop and bails when set, returning whatever partial offsets
+                # it had so far (often 0). When the call was interrupted, keep
+                # last_match_count at its prior trustworthy value (issue #22):
+                # the reported number is an upper bound on the partial's actual
+                # match count rather than a meaningless 0. Refinement never
+                # bails mid-pass, so its count is always trustworthy.
                 if not idaapi_user_canceled():
                     progress.last_match_count = count
                     if count == 1:
@@ -1501,6 +1538,25 @@ class UniqueSignatureGenerator:
         if cancel.partial is not None:
             return cancel.partial
         raise Unexpected("Signature not unique (reached end of analysis)")
+
+
+def _refine_offsets(
+    data_mv: memoryview,
+    offsets: list[int],
+    j: int,
+    value: int,
+    mask: int,
+) -> list[int]:
+    """Keep offsets c where (data_mv[c + j] & mask) == (value & mask).
+
+    j is the pattern-relative index of the byte being checked; c is a match
+    start offset into data_mv. Candidates whose c + j runs past the buffer
+    cannot match and are dropped. Used to refine a shrinking candidate set
+    as a signature grows, instead of re-scanning the whole database.
+    """
+    n = len(data_mv)
+    target = value & mask
+    return [c for c in offsets if c + j < n and (data_mv[c + j] & mask) == target]
 
 
 def _decode_function_for_anchors(
@@ -1678,17 +1734,22 @@ class MinimalFunctionSignatureGenerator:
         """Grow a signature from ``decoded[anchor_idx]`` forward until unique.
 
         Reads all instruction data from the pre-decoded list. The ``buf``
-        argument is forwarded to the searcher so the segment buffer is
-        reused across all uniqueness checks inside one generate() session.
+        argument is the segment buffer loaded once in generate(); on the SIMD
+        path it seeds an in-memory candidate-offset set that is refined per
+        appended byte, so the database is scanned once per anchor rather than
+        once per growth step. On non-SIMD builds (no in-memory buffer) it
+        falls back to a per-step count_matches scan.
 
-        Uniqueness is decided with an early-bail scan (bail at the second
-        match) rather than a full match count, so short common signatures
-        do not enumerate every hit. If ``progress`` is supplied, the
-        per-iteration sig length and the (capped) match count are written
-        into its ``inner_length`` / ``inner_matches`` fields for the live
-        wait-box display; ``inner_matches`` of 2 means "two or more".
+        The surviving candidate count is the exact match count, so if
+        ``progress`` is supplied the per-iteration sig length and the exact
+        match count are written into its ``inner_length`` / ``inner_matches``
+        fields for the live wait-box display.
         """
         sig = Signature()
+        # SIMD seed-then-refine state (see UniqueSignatureGenerator.generate).
+        offsets: typing.Optional[list[int]] = None
+        seed_buf = buf
+        min_useful = self.MIN_USEFUL_SIG_BYTES
         for i in range(anchor_idx, len(decoded)):
             if (
                 self.progress_reporter is not None
@@ -1698,19 +1759,57 @@ class MinimalFunctionSignatureGenerator:
                     "Function signature search canceled by user"
                 )
 
+            prev_len = len(sig)
             self._append_decoded_to_sig(sig, decoded[i])
 
             if len(sig) > max_len:
                 return None
 
-            unique = SignatureSearcher.is_unique(f"{sig:ida}", buf=buf)
+            # Below MIN_USEFUL_SIG_BYTES the seed scan would enumerate every
+            # match of a short, common prefix (e.g. a 1-byte instruction that
+            # occurs hundreds of thousands of times) only for the caller to
+            # discard the result for being too short. Probe uniqueness with a
+            # cheap early-bail scan instead, and defer the (now selective)
+            # seed-and-refine until the pattern is long enough to be a valid
+            # answer. The early-bail probe preserves exact behavior: an anchor
+            # that becomes unique below MIN still returns its short signature
+            # here, which the caller discards, so the anchor contributes no
+            # candidate, exactly as before.
+            if len(sig) < min_useful:
+                if progress is not None:
+                    progress.inner_length = len(sig)
+                    progress.inner_matches = None
+                if SignatureSearcher.is_unique(f"{sig:ida}", buf=buf):
+                    sig.trim_signature()
+                    return sig
+                continue
+
+            if not SIMD_SPEEDUP_AVAILABLE or seed_buf is None:
+                # Non-SIMD builds have no in-memory buffer to refine against,
+                # so fall back to the per-step rescan.
+                count = SignatureSearcher.count_matches(f"{sig:ida}", buf=buf)
+            elif offsets is None:
+                # Seed once against the cached buffer; keep every match offset.
+                # The pattern is now at least MIN_USEFUL_SIG_BYTES, so this is
+                # selective rather than a full-database enumeration.
+                offsets, seed_buf = SignatureSearcher.find_all_offsets(
+                    f"{sig:ida}", buf=seed_buf
+                )
+                count = len(offsets)
+            else:
+                # Refine the surviving candidates in memory for each byte
+                # appended this iteration; no rescan of the database.
+                data_mv = seed_buf.data()
+                for j in range(prev_len, len(sig)):
+                    sb = sig[j]
+                    mask = 0x00 if sb.is_wildcard else 0xFF
+                    offsets = _refine_offsets(data_mv, offsets, j, sb.value, mask)
+                count = len(offsets)
+
             if progress is not None:
                 progress.inner_length = len(sig)
-                # is_unique early-bails at the second match, so we cannot
-                # show an exact count here; 1 means unique, 2 means "2 or
-                # more, keep growing".
-                progress.inner_matches = 1 if unique else 2
-            if unique:
+                progress.inner_matches = count
+            if count == 1:
                 sig.trim_signature()
                 return sig
 
@@ -2162,11 +2261,17 @@ class SignatureSearcher:
 
         n = len(data_mv)
         off = 0
+        # Poll cancellation every _CANCEL_POLL_STRIDE matches (see
+        # find_all_offsets) so per-match user_cancelled() overhead does not
+        # dominate a scan over a short, common pattern.
+        since_poll = 0
         while off <= n - k:
-            # Check for user cancellation
-            if idaapi_user_canceled():
-                LOGGER.info("Search canceled by user")
-                break
+            since_poll += 1
+            if since_poll >= _CANCEL_POLL_STRIDE:
+                since_poll = 0
+                if idaapi_user_canceled():
+                    LOGGER.info("Search canceled by user")
+                    break
 
             idx = _simd_scan_bytes(data_mv[off:], sig)
             if idx < 0:
@@ -2177,6 +2282,46 @@ class SignatureSearcher:
                 break
             off += idx + 1
         return results
+
+    @staticmethod
+    def find_all_offsets(
+        ida_signature: str,
+        buf: typing.Optional["InMemoryBuffer"] = None,
+    ) -> tuple[list[int], "InMemoryBuffer"]:
+        """Return (offsets, buf): every match as a 0-based offset into
+        buf.data(), plus the buffer used. The offsets seed an in-memory
+        refinement; reusing the returned buf keeps subsequent refinement on
+        the same bytes. SIMD path only.
+        """
+        simd_signature, _ = SigText.normalize(ida_signature)
+        if buf is None:
+            with ProgressDialog("Please stand by, copying segments..."):
+                buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
+        data_mv = buf.data()
+        sig = _SimdSignature(simd_signature)
+        offsets: list[int] = []
+        k = sig.size_bytes
+        if k == 0:
+            return [0], buf
+        n = len(data_mv)
+        off = 0
+        # Poll cancellation every _CANCEL_POLL_STRIDE matches rather than on
+        # every match: idaapi.user_cancelled() costs ~0.5us per call and a
+        # short, common seed can produce millions of matches, so per-match
+        # polling alone can dominate the scan (observed: 44s of a 76s seed).
+        since_poll = 0
+        while off <= n - k:
+            since_poll += 1
+            if since_poll >= _CANCEL_POLL_STRIDE:
+                since_poll = 0
+                if idaapi_user_canceled():
+                    break
+            idx = _simd_scan_bytes(data_mv[off:], sig)
+            if idx < 0:
+                break
+            offsets.append(off + idx)
+            off += idx + 1
+        return offsets, buf
 
     @staticmethod
     def find_all(
@@ -2462,13 +2607,16 @@ class _UniqueSigProgress:
         "Growing a pattern from the current address until it matches\n"
         "exactly one place in the binary.\n\n"
         "Length:  {length} bytes\n"
+        "Matches: {matches}\n"
         "Elapsed: {elapsed}s\n\n"
         "Press Cancel to stop"
     )
 
     def __call__(self, idx, item, elapsed, total) -> str:
+        match_str = "?" if self.last_match_count is None else str(self.last_match_count)
         return self._TEMPLATE.format(
             length=len(self.sig),
+            matches=match_str,
             elapsed=int(elapsed),
         )
 
@@ -2514,11 +2662,9 @@ class _FunctionSigProgress:
         inner_bounds = f"{anchor:#x} .. {inner_end:#x}"
         if self.inner_matches is None:
             inner_matches_str = "scanning..."
-        elif self.inner_matches >= 2:
-            # Uniqueness is decided with an early-bail scan that stops at the
-            # second match, so the exact count past 1 is unknown: show "2+".
-            inner_matches_str = "2+ matches so far"
         else:
+            # Candidate-refinement tracks the exact surviving candidate count
+            # at every step, so show the real number again (no "2+" cap).
             inner_matches_str = f"{self.inner_matches} matches so far"
         best = f"{self.best_size} bytes" if self.candidates else "-"
         return self._TEMPLATE.format(
@@ -2890,11 +3036,20 @@ class SigMakerPlugin(idaapi.plugin_t):
     ACTION_SHOW_SIGMAKER: str = "pysigmaker:show"
     ACTION_START_PROFILING: str = "pysigmaker:start_profiling"
     ACTION_STOP_PROFILING: str = "pysigmaker:stop_profiling"
-    PROFILING_MENU_PATH: str = "Edit/Plugins/"
 
     def init(self) -> int:
-        self._hooks = self._init_hooks(_PopupHook(self.ACTION_SHOW_SIGMAKER))
         self._register_actions()
+        # Attach actions to the disassembly right-click popup via live UI
+        # hooks rather than a one-shot attach_action_to_menu at init. The
+        # static menu attach runs before IDA's menus are built and silently
+        # no-ops; populating the popup on demand (as the main action already
+        # does, and as d810 does for its submenu) is the reliable pattern.
+        # The profiling actions live under a "SigMaker/" submenu.
+        self._hooks = self._init_hooks(
+            _PopupHook(self.ACTION_SHOW_SIGMAKER, category="SigMaker"),
+            _PopupHook(self.ACTION_START_PROFILING, category="SigMaker"),
+            _PopupHook(self.ACTION_STOP_PROFILING, category="SigMaker"),
+        )
         return idaapi.PLUGIN_KEEP
 
     def _init_hooks(self, *hooks) -> typing.Tuple[idaapi.UI_Hooks, ...]:
@@ -2921,7 +3076,7 @@ class SigMakerPlugin(idaapi.plugin_t):
         idaapi.register_action(
             idaapi.action_desc_t(
                 self.ACTION_START_PROFILING,
-                "SigMaker: Start profiling",
+                "Start Profiling",
                 _ActionHandler(self._action_start_profiling, always_enabled=True),
                 None,
                 "Start a cProfile session capturing subsequent SigMaker activity.",
@@ -2930,17 +3085,11 @@ class SigMakerPlugin(idaapi.plugin_t):
         idaapi.register_action(
             idaapi.action_desc_t(
                 self.ACTION_STOP_PROFILING,
-                "SigMaker: Stop profiling and dump",
+                "Stop Profiling",
                 _ActionHandler(self._action_stop_profiling, always_enabled=True),
                 None,
                 "Stop the active cProfile session and write the dump to the user IDA dir.",
             )
-        )
-        idaapi.attach_action_to_menu(
-            self.PROFILING_MENU_PATH, self.ACTION_START_PROFILING, idaapi.SETMENU_APP
-        )
-        idaapi.attach_action_to_menu(
-            self.PROFILING_MENU_PATH, self.ACTION_STOP_PROFILING, idaapi.SETMENU_APP
         )
 
     def _deregister_actions(self) -> None:

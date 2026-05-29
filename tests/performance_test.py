@@ -302,6 +302,102 @@ class TestBenchmarkPerformance(unittest.TestCase):
             "times": times,
         }
 
+    def benchmark_candidate_refinement(self, iterations: int = 3) -> dict:
+        """Time FIND_FUNCTION_SIG with candidate refinement on a real function.
+
+        Picks the largest function in the test binary, runs generate() N
+        times, reports median wall time, and counts how often the database is
+        scanned. With candidate refinement the segment buffer is loaded once
+        per generate() (InMemoryBuffer.load) and the per-anchor seed scan
+        (SignatureSearcher.find_all_offsets) replaces the old per-growth-step
+        count_matches rescan, so the load count stays small and bounded by the
+        number of anchors, not the number of appended bytes.
+        """
+        if not self.ida_available:
+            self.skipTest("IDA Pro API not available for benchmarking")
+        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
+            self.skipTest("SIMD speedup not available")
+
+        func_qty = idaapi.get_func_qty()
+        if func_qty == 0:
+            self.skipTest("No functions in test binary")
+
+        best_pfn = None
+        best_size = 0
+        for i in range(func_qty):
+            pfn = idaapi.getn_func(i)
+            if pfn is None:
+                continue
+            size = pfn.end_ea - pfn.start_ea
+            if size > best_size:
+                best_size = size
+                best_pfn = pfn
+
+        if best_pfn is None or best_size < 10:
+            self.skipTest("No suitable function found for benchmarking")
+
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=True,
+            continue_outside_of_function=False,
+            wildcard_optimized=True,
+            ask_longer_signature=False,
+            max_single_signature_length=100,
+        )
+        processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        gen = sigmaker.MinimalFunctionSignatureGenerator(processor)
+
+        load_counts = []
+        seed_counts = []
+        times = []
+        real_load = sigmaker.InMemoryBuffer.load
+        real_seed = sigmaker.SignatureSearcher.find_all_offsets
+
+        for _ in range(iterations):
+            counters = {"loads": 0, "seeds": 0}
+
+            def counting_load(*args, _orig=real_load, _c=counters, **kwargs):
+                _c["loads"] += 1
+                return _orig(*args, **kwargs)
+
+            def counting_seed(*args, _orig=real_seed, _c=counters, **kwargs):
+                _c["seeds"] += 1
+                return _orig(*args, **kwargs)
+
+            with unittest.mock.patch.object(
+                sigmaker.InMemoryBuffer, "load", side_effect=counting_load
+            ), unittest.mock.patch.object(
+                sigmaker.SignatureSearcher, "find_all_offsets",
+                side_effect=counting_seed,
+            ):
+                t0 = time.perf_counter()
+                try:
+                    gen.generate(best_pfn, cfg)
+                except sigmaker.Unexpected:
+                    pass
+                times.append(time.perf_counter() - t0)
+            load_counts.append(counters["loads"])
+            seed_counts.append(counters["seeds"])
+
+        times.sort()
+        median = times[len(times) // 2]
+
+        print("\n--- benchmark_candidate_refinement ---")
+        print(f"function bytes: {best_size}")
+        print(f"iterations: {iterations}")
+        print(f"median wall: {median:.4f}s   buffer loads: {load_counts}")
+        print(f"per-anchor seed scans (find_all_offsets): {seed_counts}")
+
+        return {
+            "operation": "candidate_refinement",
+            "function_bytes": best_size,
+            "iterations": iterations,
+            "median_wall_seconds": median,
+            "buffer_loads": load_counts,
+            "seed_scans": seed_counts,
+            "times": times,
+        }
+
     def test_performance_benchmarks(self):
         """Run all performance benchmarks and display results."""
         print("\n" + "=" * 80)

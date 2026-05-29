@@ -2,6 +2,26 @@
 
 All notable user-visible changes to this plugin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] - 2026-05-29
+
+### Changed
+
+- **`Find shortest unique signature for current function` is faster again on large databases, and the gap widens as the database grows.** The per-starting-point seed scan is replaced by a two-byte position index built once per search, so each starting point is seeded from the rarest byte run in its pattern in time proportional to that run's frequency, not the database size. About 2.48x over 1.7.3 on a 16 MB module. ([#35](https://github.com/mahmoudimus/ida-sigmaker/pull/35))
+- **The seed is now chosen from the most selective run, one byte or two.** A single rare byte can be more selective than a common two-byte pair, so the search picks whichever run has the smallest index bucket. ([#36](https://github.com/mahmoudimus/ida-sigmaker/pull/36))
+
+### Internal
+
+- Two-byte bucket position index built in the Cython `_speedups` extension as a `nogil` counting sort; one-byte buckets telescope from it for free (a range view, no second index). ([#35](https://github.com/mahmoudimus/ida-sigmaker/pull/35), [#36](https://github.com/mahmoudimus/ida-sigmaker/pull/36))
+- Per-byte candidate refinement moved into the Cython extension (`refine_offsets`): in-place `nogil` compaction over a typed uint32 buffer with zero per-call allocation. Refinement on the largest function of a 16 MB module dropped from ~14 s to ~0.28 s; that function's total search fell from ~24 s to ~15.6 s. ([#36](https://github.com/mahmoudimus/ida-sigmaker/pull/36))
+- `_ByteIndex` is a frozen slots dataclass; the runtime array module is aliased as `py_stdlib_arr_mod` to keep it distinct from the cimported C-level API. ([#36](https://github.com/mahmoudimus/ida-sigmaker/pull/36))
+- Signatures produced are byte-identical to 1.7.3; only the speed of finding them changed. ([#36](https://github.com/mahmoudimus/ida-sigmaker/pull/36))
+
+### Documentation
+
+- New [`ALGORITHM.md`](./ALGORITHM.md) deriving the match-set math, the counting-sort index, the selectivity proof, and what is novel about the approach. README gains a table of contents, a Performance section with benchmarks, and a library stability contract for downstream embedders. ([#36](https://github.com/mahmoudimus/ida-sigmaker/pull/36))
+
+[1.8.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.7.3...v1.8.0
+
 ## [1.7.3] - 2026-05-28
 
 ### Changed

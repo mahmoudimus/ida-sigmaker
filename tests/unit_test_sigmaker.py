@@ -3749,10 +3749,13 @@ class TestSeedViaIndex(CoveredUnitTest):
         # bucket so they lose.
         idx.bucket_size.side_effect = lambda key: {(0x8B << 8) | 0x45: 2}.get(key, 10**9)
         idx.bucket_size1.side_effect = lambda b: 10**9
+        # Real _ByteIndex.candidates returns array.array('I') slices; mirror that.
         idx.candidates.side_effect = (
-            lambda key: [0, 6] if key == ((0x8B << 8) | 0x45) else []
+            lambda key: array.array("I", [0, 6])
+            if key == ((0x8B << 8) | 0x45)
+            else array.array("I", [])
         )
-        idx.candidates1.side_effect = lambda b: []
+        idx.candidates1.side_effect = lambda b: array.array("I", [])
         arr, cnt = sigmaker._seed_via_index(sig, idx, buf)
         # offset 0 keeps (90 90 90 follow); offset 6 drops (00 00 follow)
         self.assertEqual(list(arr[:cnt]), [0])
@@ -3771,7 +3774,9 @@ class TestSeedViaIndex(CoveredUnitTest):
         idx = MagicMock()
         idx.bucket_size.side_effect = lambda key: 10**9   # no 2-byte run chosen
         idx.bucket_size1.side_effect = lambda b: {0xF3: 2}.get(b, 10**9)
-        idx.candidates1.side_effect = lambda b: [0, 8] if b == 0xF3 else []
+        idx.candidates1.side_effect = (
+            lambda b: array.array("I", [0, 8]) if b == 0xF3 else array.array("I", [])
+        )
         arr, cnt = sigmaker._seed_via_index(sig, idx, buf)
         self.assertEqual(list(arr[:cnt]), [0])
 

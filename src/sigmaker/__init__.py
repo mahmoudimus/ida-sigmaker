@@ -1679,18 +1679,29 @@ def _seed_via_index(
     m = len(sig)
     raw = index.candidates(key) if width == 2 else index.candidates1(key)
     # Map each hit at offset p back to a pattern start p - s, keeping only
-    # candidates whose full pattern fits in the buffer.
-    cands = array.array("I", (p - s for p in raw if p >= s and (p - s) + m <= n))
+    # candidates whose full pattern fits in the buffer. The Cython kernel does
+    # this in one nogil pass; the genexp is the defensive fallback (unreachable
+    # in practice, since index is None without SIMD).
+    if SIMD_SPEEDUP_AVAILABLE:
+        cands, count = simd_scan.seed_offsets(raw, s, m, n)
+    else:
+        cands = array.array(
+            "I", (p - s for p in raw if p >= s and (p - s) + m <= n)
+        )
+        count = len(cands)
     # n-1 boundary: candidates1 is derived from 2-byte windows, which never see
     # offset n-1 as a window start, so a 1-byte hit at the final buffer byte is
     # missing. It can only yield a valid pattern start when the seed byte is the
     # pattern's last byte (s == m-1, giving start n-m). Add it explicitly and
-    # let the refine validate.
+    # let the refine validate. The kernel reserves one slot for it.
     if width == 1 and n >= 1 and data_mv[n - 1] == key:
         p = n - 1 - s
         if 0 <= p and p + m <= n:
-            cands.append(p)
-    count = len(cands)
+            if count < len(cands):
+                cands[count] = p
+            else:
+                cands.append(p)
+            count += 1
     # Refine against every exact byte except the seed run's byte(s).
     seed_span = (s, s + 1) if width == 2 else (s,)
     for j in range(m):

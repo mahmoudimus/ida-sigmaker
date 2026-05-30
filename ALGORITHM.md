@@ -306,10 +306,18 @@ are known before the search.
 
 ## 9. What is novel here
 
-The contribution is a practical composition, not a new theory of shortest unique
-substrings or wildcard matching. The pieces (inverted byte buckets, seed/filter/
-verify, monotone candidate filtering) are individually standard. What is useful is
-how cheaply they combine for masked function signatures in an interactive session:
+This is a **novel application**. The literature has the individual primitives, but
+the composition that solves *this* problem, growing the shortest masked byte
+signature that is unique in a live database, does not come pre-packaged anywhere
+we found. The **key use case** is concrete and load-bearing for reverse engineers:
+relocating a specific function or routine across rebuilds of a binary,
+interactively, inside the disassembler. That is what turns a 7.7-minute search
+into seconds (Section 2) and is what makes the feature usable at all.
+
+What we do **not** claim is a new general theory of shortest unique substrings or
+wildcard matching; the primitives (inverted byte buckets, seed/filter/verify,
+monotone candidate filtering) are individually standard. The contribution is the
+specialization, and how cheaply the pieces combine for masked function signatures:
 
 1. **The 1-byte index is free.** This is the one genuinely non-obvious trick. A
    single counting-sort layout over adjacent byte *pairs* yields the exact 2-byte

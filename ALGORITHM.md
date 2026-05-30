@@ -1,9 +1,10 @@
 # The shortest-unique-signature algorithm
 
 This document explains the math behind the "find shortest unique signature for
-the current function" search, why the approach is novel, and how the Cython
-`_speedups` extension is what makes it practical. It is written for someone who
-wants to understand *why* the search is fast, not just *what* the code does.
+the current function" search, where the approach fits relative to known string
+algorithms, and how the Cython `_speedups` extension is what makes it practical.
+It is written for someone who wants to understand *why* the search is fast, not
+just *what* the code does.
 
 GitHub renders LaTeX in Markdown, so the math below is in `$...$` (inline) and
 `$$...$$` (block) form.
@@ -29,6 +30,12 @@ $$
 M(P) = \lbrace p \in [0, N - \ell] : P \text{ matches } D \text{ at } p \rbrace.
 $$
 
+This algorithm operates on full exact bytes and full-byte wildcards only: every
+token mask $m_j$ is either `0xFF` or `0x00`. The lower-level SIMD scanner can
+represent partial nibble masks for the separate signature *search* feature, but
+the signature *generator* and the index-backed search described here neither
+produce nor rely on them, and the seed selector anchors only on fully exact bytes.
+
 For a function at address $a$, we decode its instructions, turn operands into
 wildcards according to the wildcard policy, and obtain a growing pattern
 $P_\ell$ (the first $\ell$ tokens). We want the **shortest** $\ell$ such that
@@ -37,6 +44,13 @@ $P_\ell$ is unique:
 $$
 \ell^\ast = \min \lbrace \ell : |M(P_\ell)| = 1 \rbrace.
 $$
+
+**Scope.** This document is about one problem: finding the shortest signature
+that is *unique* in the current database under a *fixed* wildcard policy. A
+separate and harder question, which bytes should be left exact so a signature
+survives a recompile (cross-build robustness), is a different optimization and is
+deliberately out of scope. The wildcard policy is an input to this algorithm, not
+something it chooses.
 
 ## 2. The naive cost, and where 462 seconds went
 
@@ -78,17 +92,40 @@ $$
 O(|M(P_\ell)|)
 $$
 
-work, proportional to the *current candidate count*, not $N$. Candidate counts
-collapse fast (each added exact byte divides the set by roughly 256 for random
-data), so the entire refine chain telescopes:
+work, proportional to the *current candidate count*, not $N$.
+
+That monotonicity is the reason the algorithm is fast in practice, but it does
+not by itself give an unconditional telescoping bound. If the seed set has size
+$C_0$ and there are $R$ refinement steps after the seed, monotonicity only gives
 
 $$
-\sum_{\ell} |M(P_\ell)| = O(|M(P_{\ell_{\min}})|) = O(C_0),
+\sum_{r=0}^{R-1} |M_r| \le R \cdot C_0.
 $$
 
-where $C_0$ is the seed size. The total per-anchor cost is now
-$O(\text{seed} + C_0)$. The remaining question is: **how cheaply can we build the
-seed?**
+The stronger "almost $O(C_0)$" behavior is an empirical or average-case claim.
+For example, if each informative exact byte keeps at most an $\alpha < 1$
+fraction of candidates in expectation, then the expected refinement sum is
+geometric:
+
+$$
+\mathbb{E}\!\left[\sum_{r=0}^{R-1} |M_r|\right]
+    \le C_0 \sum_{r=0}^{R-1} \alpha^r
+    < \frac{C_0}{1-\alpha}.
+$$
+
+Wildcard bytes have $\alpha = 1$ for selectivity: they never shrink the set,
+except for dropping candidates that no longer fit at the right edge of the
+database. So only exact bytes are *informative* refinement steps, and the
+expensive post-seed filtering skips wildcards entirely. The incremental growth
+loop does still pass a newly appended wildcard through the same in-place kernel,
+but only to maintain the right-edge boundary after the candidate set has already
+collapsed; those calls are cheap and not worth optimizing away. Wildcard-heavy
+patterns simply have fewer informative steps $R$.
+
+With that qualification, the total per-anchor cost is
+$O(\text{seed} + \sum_r |M_r|)$, worst-case $O(\text{seed} + R C_0)$ and usually
+much smaller on real code bytes. The remaining question is: **how cheaply can we
+build the seed?**
 
 ## 4. The 2-byte position index (counting sort)
 
@@ -164,15 +201,27 @@ $$
 (s^\ast, w^\ast) = \arg\min_{(s, w) \in \text{exact runs}} \bigl|B^{(w)}_{\text{key}(s,w)}\bigr|.
 $$
 
-Since the 1-byte options are a *superset* of the candidate seeds, the chosen seed
-bucket is never worse than a 2-byte-only choice:
+This is a deliberately small contiguous-seed family: fully exact 1-byte and
+2-byte anchors. Since the 1-byte options are a *superset* of the candidate seeds,
+the chosen seed bucket is never worse than a 2-byte-only choice:
 
 $$
 C_0 = \bigl|B^{(w^\ast)}\bigr| \le \min_{\text{2-byte runs}} |B_k|.
 $$
 
-A smaller seed means fewer candidates entering the refine chain, which (Section 3)
-bounds the whole per-anchor cost.
+A smaller seed means fewer candidates entering the refine chain, which improves
+both the worst-case $R C_0$ bound and the expected-case candidate decay described
+in Section 3.
+
+The selector deliberately uses only contiguous, fully exact 1-byte and 2-byte
+anchors. Richer seed families (longer runs, spaced or gapped seeds, multi-context
+seeds) are intentionally *not* used: those techniques pay off in read mapping
+because the mismatch positions are unknown at search time, whereas here the
+wildcard positions are fixed by the policy before the search begins. The seed is
+only an anchor; every other exact byte is already exploited by refinement, so a
+richer seed family would add index complexity without new selectivity. It is
+worth revisiting only if profiling ever shows seed enumeration, not refinement,
+to be the bottleneck (see Section 10).
 
 **Deferred seeding.** For a pattern shorter than `MIN_USEFUL_SIG_BYTES` $= 5$, even
 the rarest run is too common (the seed would enumerate a large fraction of $D$),
@@ -207,46 +256,109 @@ calls of a large function perform **zero allocation**.
 | Index build (counting sort) | $O(N)$ | once per search |
 | Seed selection | $O(\ell)$ over tokens | per anchor |
 | Seed enumeration | $O(C_0)$ | per anchor |
-| Refine, all lengths | $O(C_0)$ (telescoping) | per anchor |
+| Refine, all informative steps | $O(\sum_r |M_r|) \subseteq O(RC_0)$ | per anchor |
 
 Per search:
 
 $$
-T = \underbrace{O(N)}_{\text{one index build}} + \sum_{\text{anchors}} O\bigl(\ell + C_0\bigr)
+T = \underbrace{O(N)}_{\text{one index build}} +
+    \sum_{\text{anchors}} O\bigl(\ell + C_0 + \sum_r |M_r|\bigr)
 $$
 
 versus the naive $O(A \cdot L \cdot N)$. The $N$ term is paid **once** and shared;
-all per-anchor work is proportional to the chosen seed bucket $C_0$, which the
-selection step drives toward the rarest run in the pattern.
+all per-anchor database-wide work is replaced by work over the chosen seed bucket
+and its surviving candidates. In the worst case refinement can still be
+$O(RC_0)$, but real runs are expected to be close to geometric decay when exact
+bytes are selective.
 
-## 8. What is novel here
+## 8. Relationship to known string algorithms
 
-Signature scanners typically do one of two things: rescan the whole database for
-each candidate length, or build a heavy general-purpose substring index (suffix
-automaton / suffix array / large $q$-gram table). This algorithm instead exploits
-the *specific* structure of the masked-signature problem:
+The space is not empty; this design sits near several well-studied ones.
 
-1. **Wildcards mean we never need general substring search.** We only need to
-   anchor on the rarest *exact* run and then verify the rest token-by-token. That
-   turns "find the shortest unique pattern" into "pick the most selective seed,
-   then refine."
+The exact, unmasked version of the problem is essentially **left-bounded shortest
+unique substring** (LSUS): for a fixed start position, find the shortest substring
+beginning there that occurs once. Recent LSUS work gives linear-time
+suffix-array/LCP baselines, and shortest-unique/absent-substring (SUS/SAS)
+algorithms remain active, especially on packed small-alphabet strings. Those are
+the right reference points for the wildcard-free case and for an answer-length
+sanity check.
 
-2. **One counting-sort index serves both 1-byte and 2-byte selectivity.** The
-   key-ordered bucket layout makes the 1-byte index a *range view* of the 2-byte
-   index (a single subtraction for size, a single slice for contents). Dynamic
-   Seed Selection compares mixed-width runs with a closed-form selectivity
-   measure from one structure, with no extra memory.
+The masked case connects to **wildcard pattern matching** and **longest common
+extensions with wildcards**, whose recurring lesson is exactly ours: anchor on
+informative non-wildcard positions instead of treating all positions uniformly.
+**Internal pattern matching** queries are the natural primitive if one ever wants
+sublinear repeated-substring queries inside a fixed text rather than a per-search
+rebuilt index.
 
-3. **Monotone shrinkage turns length growth into in-place filtering.** Because
-   $M(P_{\ell+1}) \subseteq M(P_\ell)$, the candidate set is a single buffer that
-   only ever shrinks; after the seed we never touch the database again, only the
-   handful of bytes at the growing frontier of the surviving candidates.
+The closest practical neighbor is in the same domain. **YARA**'s atom-based
+scanning picks a short, rare, non-wildcard substring of a rule, finds its
+occurrences (classically via **Aho-Corasick** multi-pattern matching), and then
+verifies the full masked pattern at each hit. That is seed-then-refine for binary
+signatures. The algorithm here is the inverse-direction relative: instead of
+matching a known pattern, it *grows* the shortest pattern that is unique, using a
+byte-window index as the atom oracle and monotone in-place refinement as the
+verifier.
 
-The combination, a rarest-run seed chosen from a dual-width counting-sort index,
-feeding a monotone in-place refine, is what collapses $O(L \cdot N)$ per anchor
-into $O(C_0)$ per anchor on top of a single shared $O(N)$ build.
+The bioinformatics seed-design literature (spaced, gapped, sampled, and
+multi-context seeds) does **not** transfer cleanly, for the reason in Section 5:
+it hedges against *unknown* mismatch positions, while here the wildcard positions
+are known before the search.
 
-## 9. How Cython makes it work
+## 9. What is novel here
+
+This is a **novel application**. The literature has the individual primitives, but
+the composition that solves *this* problem, growing the shortest masked byte
+signature that is unique in a live database, does not come pre-packaged anywhere
+we found. The **key use case** is concrete and load-bearing for reverse engineers:
+relocating a specific function or routine across rebuilds of a binary,
+interactively, inside the disassembler. That is what turns a 7.7-minute search
+into seconds (Section 2) and is what makes the feature usable at all.
+
+What we do **not** claim is a new general theory of shortest unique substrings or
+wildcard matching; the primitives (inverted byte buckets, seed/filter/verify,
+monotone candidate filtering) are individually standard. The contribution is the
+specialization, and how cheaply the pieces combine for masked function signatures:
+
+1. **The 1-byte index is free.** This is the one genuinely non-obvious trick. A
+   single counting-sort layout over adjacent byte *pairs* yields the exact 2-byte
+   buckets, and because the buckets are stored in key order, every 1-byte bucket
+   is just a contiguous *marginal* of that same `heads` array: a range view, with
+   no second index and no extra memory.
+
+2. **Mixed-width seed selection from that one structure.** Dynamic Seed Selection
+   compares fully exact 1-byte and 2-byte anchors by bucket size and picks the
+   most selective seed currently available, so the candidate set entering
+   refinement is as small as the pattern allows.
+
+3. **Monotone in-place refinement.** Once seeded, candidate offsets live in one
+   `uint32` buffer that only shrinks; refinement touches surviving candidates
+   instead of rescanning the database for every length.
+
+4. **A reverse-engineering-specific fit.** The index is far cheaper to build and
+   discard per search than a suffix-family structure, and far faster than repeated
+   full rescans, which is what an interactive IDA workflow actually needs.
+
+## 10. Future algorithmic directions
+
+The current implementation is intentionally conservative. In priority order:
+
+1. **Empirical instrumentation first.** Before any new algorithm, runtime reports
+   should record the seed bucket size $C_0$, the number of *informative*
+   refinement steps $R$, the wildcard density, and the empirical candidate-decay
+   curve. Those measurements separate the contributions of the index, the seed
+   selector, the wildcard policy, and the Cython kernels, and they decide whether
+   the directions below are worth pursuing at all.
+
+2. **Richer seeds only if seeding dominates.** If, and only if, the instrumentation
+   shows seed enumeration (not refinement) is the bottleneck, longer contiguous
+   exact-run indexes or spaced/gapped seeds become worth their added structure.
+   Until then the contiguous 1-byte/2-byte seed is sufficient (Section 5).
+
+3. **Exact LSUS baseline.** When wildcarding is disabled, or a long exact region
+   dominates the signature, a suffix-array/LCP LSUS baseline is a useful reference
+   for both answer length and runtime.
+
+## 11. How Cython makes it work
 
 The math above is correct in pure Python too, but it would not be *fast* in pure
 Python. The two hot kernels, the index build and the per-step refine, are
@@ -312,3 +424,26 @@ So every use is unambiguous by name: `array.*` (`cdef array.array`,
 the run-time Python constructor. They no longer share a name, so there is nothing
 to "override". (The canonical Cython array tutorial shows both lines sharing the
 name `array`; aliasing one side is the same idiom, just spelled out.)
+
+## 12. References
+
+- Larissa L. M. Aguiar and Felipe A. Louza, ["Faster computation of
+  left-bounded shortest unique substrings"](https://doi.org/10.1186/s13015-025-00287-5),
+  *Algorithms for Molecular Biology*, 2025.
+- Panagiotis Charalampopoulos, Manal Mohamed, Solon P. Pissis, Hilde Verbeek,
+  and Wiktor Zuba, ["Faster Algorithms for Shortest Unique or Absent
+  Substrings"](https://arxiv.org/abs/2605.04826), arXiv, 2026.
+- Gabriel Bathie, Panagiotis Charalampopoulos, and Tatiana Starikovskaya,
+  ["Pattern Matching with Mismatches and
+  Wildcards"](https://doi.org/10.4230/LIPIcs.ESA.2024.20), ESA 2024.
+- Gabriel Bathie, Panagiotis Charalampopoulos, and Tatiana Starikovskaya,
+  ["Longest Common Extensions with Wildcards: Trade-Off and
+  Applications"](https://doi.org/10.4230/LIPIcs.ESA.2024.19), ESA 2024.
+- Tomasz Kociumaka, Jakub Radoszewski, Wojciech Rytter, and Tomasz Waleń,
+  ["Internal Pattern Matching Queries in a Text and
+  Applications"](https://doi.org/10.1137/1.9781611973730.36), SODA 2015.
+- Alfred V. Aho and Margaret J. Corasick, ["Efficient string matching: an aid to
+  bibliographic search"](https://doi.org/10.1145/360825.360855),
+  *Communications of the ACM*, 1975.
+- VirusTotal, [YARA: The pattern matching swiss
+  knife](https://github.com/VirusTotal/yara).

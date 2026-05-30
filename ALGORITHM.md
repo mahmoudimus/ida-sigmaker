@@ -11,6 +11,22 @@ GitHub renders LaTeX in Markdown, so the math below is in `$...$` (inline) and
 
 ---
 
+## Contents
+
+- [1. The problem](#1-the-problem)
+- [2. The naive cost, and where 462 seconds went](#2-the-naive-cost-and-where-462-seconds-went)
+- [3. Monotonic shrinkage: seed once, then refine](#3-monotonic-shrinkage-seed-once-then-refine)
+- [4. The 2-byte position index (counting sort)](#4-the-2-byte-position-index-counting-sort)
+- [5. Dynamic Seed Selection (1-byte or 2-byte) from one index](#5-dynamic-seed-selection-1-byte-or-2-byte-from-one-index)
+- [6. In-place refinement on a typed buffer](#6-in-place-refinement-on-a-typed-buffer)
+- [7. Complexity summary](#7-complexity-summary)
+- [8. Relationship to known string algorithms](#8-relationship-to-known-string-algorithms)
+- [9. What is novel here](#9-what-is-novel-here)
+- [10. Future algorithmic directions](#10-future-algorithmic-directions)
+- [11. Rejected optimizations](#11-rejected-optimizations)
+- [12. How Cython makes it work](#12-how-cython-makes-it-work)
+- [13. References](#13-references)
+
 ## 1. The problem
 
 A database $D$ is the concatenation of the analyzed program's segment bytes,
@@ -223,11 +239,13 @@ richer seed family would add index complexity without new selectivity. It is
 worth revisiting only if profiling ever shows seed enumeration, not refinement,
 to be the bottleneck (see Section 10).
 
-**Deferred seeding.** For a pattern shorter than `MIN_USEFUL_SIG_BYTES` $= 5$, even
-the rarest run is too common (the seed would enumerate a large fraction of $D$),
-so seeding is deferred and a direct scan is used until the pattern is long enough
-to be selective. This avoids materializing a multi-million-entry seed for a 2-byte
-pattern.
+**Deferred seeding.** Two cases skip the index seed and wait. First, for a pattern
+shorter than `MIN_USEFUL_SIG_BYTES` $= 5$, even the rarest run is too common (the
+seed would enumerate a large fraction of $D$), so seeding waits until the pattern
+is long enough to be selective. Second, when the seedable prefix is all wildcards
+there is no exact byte to key the index on at all; rather than fall back to a full
+$O(N)$ masked scan, seeding is deferred until an exact byte appears. Both avoid
+materializing, or scanning for, a seed that cannot be selective yet.
 
 ## 6. In-place refinement on a typed buffer
 
@@ -340,32 +358,70 @@ specialization, and how cheaply the pieces combine for masked function signature
 
 ## 10. Future algorithmic directions
 
-The current implementation is intentionally conservative. In priority order:
+The current implementation is intentionally conservative. The instrumentation this
+section used to call for has since been done: seed bucket size $C_0$, informative
+refinement steps $R$, wildcard density, and the candidate-decay curve. It
+redirected the effort. The real costs were a Python seed-enumeration loop (now in
+C, Section 12) and a needless full scan on all-wildcard prefixes (now deferred,
+Section 5), not a fancier seed. Richer seed families (longer contiguous, spaced,
+or multi-context seeds) were measured and shelved; see Section 11. The one open
+direction that remains:
 
-1. **Empirical instrumentation first.** Before any new algorithm, runtime reports
-   should record the seed bucket size $C_0$, the number of *informative*
-   refinement steps $R$, the wildcard density, and the empirical candidate-decay
-   curve. Those measurements separate the contributions of the index, the seed
-   selector, the wildcard policy, and the Cython kernels, and they decide whether
-   the directions below are worth pursuing at all.
-
-2. **Richer seeds only if seeding dominates.** If, and only if, the instrumentation
-   shows seed enumeration (not refinement) is the bottleneck, longer contiguous
-   exact-run indexes or spaced/gapped seeds become worth their added structure.
-   Until then the contiguous 1-byte/2-byte seed is sufficient (Section 5).
-
-3. **Exact LSUS baseline.** When wildcarding is disabled, or a long exact region
+1. **Exact LSUS baseline.** When wildcarding is disabled, or a long exact region
    dominates the signature, a suffix-array/LCP LSUS baseline is a useful reference
    for both answer length and runtime.
 
-## 11. How Cython makes it work
+## 11. Rejected optimizations
+
+A couple of ideas looked good on paper, and the reasoning for skipping them is more
+useful than the verdict, so it is worth writing down.
+
+Both got the same treatment: profile the worst functions, then build a small
+adversarial benchmark that deliberately constructs each idea's best case and check
+whether it actually wins. Neither did, because the profile kept pointing somewhere
+else. Not the index build (~0.05 s), and after the seed map was moved into C, not
+the refine kernel either (~0.1 s), but two boring things we had left on the table:
+an $O(C_0)$ loop still mapping seed candidates in pure Python one boxed integer at
+a time, and a full $O(N)$ scan that fired whenever a pattern began with nothing but
+wildcards. Fixing those is what moved the numbers. Everything below is what we
+talked ourselves out of along the way.
+
+**Block refinement.** The obvious next idea is to group the exact bytes into runs
+and compare a whole run at once with a wide `uint64` or SIMD load, skipping the
+wildcard gaps, on the theory that fewer instructions means less time. The benchmark
+says otherwise: refinement is bound by memory bandwidth, not instruction count. It
+is already a tight, linear, stride-1 sweep, which is the access pattern a CPU
+streams fastest, so wider-but-fewer compares do nothing for a loop that is waiting
+on memory rather than on the ALU. The premise was also weaker than it looked, since
+the expensive filtering pass already skips wildcards (Section 3). With refinement
+sitting around 0.1 s, there was simply nothing here worth chasing.
+
+**Spaced-seed intersection.** The index has a tempting property: each bucket's
+positions come out already sorted, because we fill them in one left-to-right pass
+over the database. So for a spaced pattern like `8B ?? ?? 45` you could grab both
+byte buckets and intersect them with a two-pointer merge. The problem is that we
+already do exactly this, just more cheaply: seeding from the rarest byte and
+refining against the rest *is* that intersection, and it only ever touches the
+smaller bucket. An explicit merge has to read both buckets end to end, which is
+strictly more work the moment one of them is a common byte with millions of
+entries. And once deferred seeding keeps the starting set small, the merge is pure
+overhead; no input in the benchmark ever reached the point where it paid off.
+
+The honest summary is that the wins were never algorithmic. They were "stop running
+this loop in Python" and "don't scan the whole database for a prefix that can't
+anchor anything", the kind of thing you only find by measuring, not by reaching for
+a cleverer data structure. The microbenchmark stays in the tree with a `--check`
+mode, so if some later change pushes the bottleneck back onto refinement, it will
+fail loudly and these two ideas get a fresh hearing.
+
+## 12. How Cython makes it work
 
 The math above is correct in pure Python too, but it would not be *fast* in pure
-Python. The two hot kernels, the index build and the per-step refine, are
-memory-bound, branchy loops over millions of bytes. That is precisely the
-workload where CPython's per-element overhead (boxed integers, attribute lookups,
-interpreter dispatch, dynamic bounds checks) costs 50-100x. The `_speedups`
-extension compiles them to tight C:
+Python. The hot kernels, the index build, the seed-candidate map, and the per-step
+refine, are memory-bound, branchy loops over millions of bytes. That is precisely
+the workload where CPython's per-element overhead (boxed integers, attribute
+lookups, interpreter dispatch, dynamic bounds checks) costs 50-100x. The
+`_speedups` extension compiles them to tight C:
 
 - **`build_byte_index`** is the counting sort of Section 4, written as C loops
   over a `const unsigned char[:]` typed memoryview, running under `nogil` so the
@@ -377,6 +433,14 @@ extension compiles them to tight C:
   function into Cython dropped the refinement time on the largest test module
   from **~14 s** (a Python list comprehension called ~165k times) to **~0.28 s**,
   roughly **50x**.
+
+- **`seed_offsets`** is the candidate-mapping kernel of Section 5: a `nogil` loop
+  that turns a seed bucket into the `array.array('I')` of pattern starts (the
+  `p - s` shift, the fit guard, the $N-1$ boundary case) in C. This was the last
+  `O(C_0)` loop left in Python, a generator expression that boxed and walked the
+  entire bucket; moving it into Cython cut the worst observed function search from
+  **~12 s** to **~1 s**, the same playbook as `refine_offsets`, cross-checked
+  against the Python version for byte-identical output.
 
 - **`array.array('I')` is the bridge.** A candidate set is simultaneously a
   first-class Python object the orchestration layer can slice and return, *and*
@@ -425,7 +489,7 @@ the run-time Python constructor. They no longer share a name, so there is nothin
 to "override". (The canonical Cython array tutorial shows both lines sharing the
 name `array`; aliasing one side is the same idiom, just spelled out.)
 
-## 12. References
+## 13. References
 
 - Larissa L. M. Aguiar and Felipe A. Louza, ["Faster computation of
   left-bounded shortest unique substrings"](https://doi.org/10.1186/s13015-025-00287-5),

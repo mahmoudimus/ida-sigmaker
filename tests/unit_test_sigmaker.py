@@ -4114,6 +4114,73 @@ class TestSeedOffsetsKernel(unittest.TestCase):
             self._check(bucket, s, m, n)
 
 
+class TestSeedDeferredWhenAllWildcard(unittest.TestCase):
+    """Phase 6: an all-wildcard prefix defers seeding (no find_all_offsets full
+    scan) until an exact byte appears, then seeds via the index."""
+
+    def setUp(self):
+        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
+            self.skipTest("SIMD speedup not available")
+        self._orig_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+
+    def tearDown(self):
+        sigmaker.idaapi_user_canceled = self._orig_canceled
+
+    def test_all_wildcard_prefix_defers_seed(self):
+        buf_bytes = b"\xAA\xAA\xAA\xAA\xAA\x8B\x45\x08\xCC\xCC\xCC\xCC"
+        mv = memoryview(bytearray(buf_bytes))
+        seed_buf = MagicMock()
+        seed_buf.data.return_value = mv
+        idx = sigmaker._ByteIndex.build(mv)
+        self.assertIsNotNone(idx)
+
+        decoded = [
+            sigmaker._DecodedInstruction(
+                ea=0x1000, size=5, raw_bytes=buf_bytes[0:5],
+                operand_offb=0, operand_length=5,   # entire instruction wildcarded
+            ),
+            sigmaker._DecodedInstruction(
+                ea=0x1005, size=3, raw_bytes=b"\x8B\x45\x08",
+                operand_offb=0, operand_length=0,    # all exact
+            ),
+        ]
+        gen = sigmaker.MinimalFunctionSignatureGenerator(
+            sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        )
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA, wildcard_operands=True,
+            continue_outside_of_function=False, wildcard_optimized=True,
+            ask_longer_signature=False, max_single_signature_length=50,
+        )
+
+        calls = {"n": 0}
+
+        def spy(ida_sig, buf=None):
+            calls["n"] += 1
+            return [], buf
+
+        with patch.object(
+            sigmaker.SignatureSearcher, "find_all_offsets", side_effect=spy
+        ):
+            sig = gen._grow_unique_from_decoded(
+                decoded, 0, cfg.max_single_signature_length, cfg,
+                buf=seed_buf, index=idx,
+            )
+
+        self.assertEqual(
+            calls["n"], 0,
+            "find_all_offsets must not run for an all-wildcard prefix when the "
+            "index is available",
+        )
+        self.assertIsNotNone(sig)
+        self.assertEqual(len(sig), 8)               # 5 wildcard + 8B 45 08
+        self.assertTrue(all(sig[i].is_wildcard for i in range(5)))
+        self.assertEqual([sig[i].value for i in range(5, 8)], [0x8B, 0x45, 0x08])
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

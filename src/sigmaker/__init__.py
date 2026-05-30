@@ -1951,19 +1951,30 @@ class MinimalFunctionSignatureGenerator:
                 # so fall back to the per-step rescan.
                 count = SignatureSearcher.count_matches(f"{sig:ida}", buf=buf)
             elif offsets is None:
-                # Seed once. Prefer the byte index (Dynamic Seed Selection);
-                # fall back to a full scan only when the pattern has no exact
-                # byte to key on.
+                # Seed once. Prefer the byte index (Dynamic Seed Selection).
                 seeded = _seed_via_index(sig, index, seed_buf)
-                if seeded is None:
+                if seeded is not None:
+                    offsets, ocount = seeded
+                    count = ocount
+                elif index is not None:
+                    # No exact byte yet: an all-wildcard pattern matches at
+                    # ~every position, so it cannot be unique. Defer the seed
+                    # (skip the O(N) full scan) until an exact byte appears on a
+                    # later iteration, then seed via the index. The first length
+                    # that can be unique is unchanged, so the signature is too.
+                    if progress is not None:
+                        progress.inner_length = len(sig)
+                        progress.inner_matches = None
+                    continue
+                else:
+                    # Index genuinely unavailable (e.g. buffer < 2 bytes): keep
+                    # the scan fallback so no anchor is silently skipped.
                     lst, seed_buf = SignatureSearcher.find_all_offsets(
                         f"{sig:ida}", buf=seed_buf
                     )
                     offsets = array.array("I", lst)
                     ocount = len(offsets)
-                else:
-                    offsets, ocount = seeded
-                count = ocount
+                    count = ocount
             else:
                 # Refine the surviving candidates in place for each byte
                 # appended this iteration; no rescan of the database.

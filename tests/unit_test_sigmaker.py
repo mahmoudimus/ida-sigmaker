@@ -4059,6 +4059,56 @@ class TestBuildByteIndex(CoveredUnitTest):
         self.assertEqual(len(heads), 65537)  # safe to look up; all buckets empty
 
 
+class TestSeedOffsetsKernel(unittest.TestCase):
+    """simd_scan.seed_offsets maps index-bucket hits to pattern starts,
+    identically to the pure-Python genexp in _seed_via_index it replaces."""
+
+    @staticmethod
+    def _genexp(bucket, s, m, n):
+        return [p - s for p in bucket if p >= s and (p - s) + m <= n]
+
+    def setUp(self):
+        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
+            self.skipTest("SIMD speedup not available")
+
+    def _check(self, bucket, s, m, n):
+        import array as _arr
+        arr, count = sigmaker.simd_scan.seed_offsets(
+            _arr.array("I", bucket), s, m, n
+        )
+        self.assertEqual(len(arr), len(bucket) + 1)   # capacity = bucket+1
+        self.assertLessEqual(count, len(bucket))
+        self.assertEqual(list(arr[:count]), self._genexp(bucket, s, m, n))
+
+    def test_empty_bucket(self):
+        self._check([], 0, 4, 100)
+
+    def test_s_zero_all_fit(self):
+        self._check([0, 10, 20, 30], 0, 5, 100)
+
+    def test_s_positive_drops_small_p(self):
+        self._check([0, 1, 2, 5, 9, 50], 3, 4, 100)
+
+    def test_boundary_inclusive_vs_exclusive(self):
+        # (p - s) + m == n is kept; == n + 1 is dropped
+        self._check([96, 97], 0, 4, 100)
+
+    def test_single_element(self):
+        self._check([42], 5, 3, 100)
+
+    def test_randomized(self):
+        import random
+        rng = random.Random(1234)
+        for _ in range(200):
+            n = rng.randint(1, 5000)
+            m = rng.randint(1, 32)
+            s = rng.randint(0, m - 1)
+            bucket = sorted(
+                rng.randint(0, n + 50) for _ in range(rng.randint(0, 300))
+            )
+            self._check(bucket, s, m, n)
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

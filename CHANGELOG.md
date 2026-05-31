@@ -2,6 +2,14 @@
 
 All notable user-visible changes to this plugin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.9.1] - 2026-05-30
+
+### Added
+
+- **Signature output now labels addresses with the containing function name.** `GeneratedSignature.display`, `XrefGeneratedSignature.display`, and the function-signature action append ` (funcname)` to printed addresses when the address lies in a named function, falling back to the bare address otherwise. The address is always kept, so distinct anchors in the same function stay distinguishable. ([#47](https://github.com/mahmoudimus/ida-sigmaker/pull/47))
+
+[1.9.1]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.9.0...v1.9.1
+
 ## [1.9.0] - 2026-05-30
 
 ### Changed

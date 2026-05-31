@@ -2,6 +2,25 @@
 
 All notable user-visible changes to this plugin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.9.0] - 2026-05-30
+
+### Changed
+
+- **`Find shortest unique signature for current function` worst case drops from ~12 s to ~1 s on large databases.** Profiling on 200 MB+ modules found the remaining cost was not the index or the refinement kernel but two leftovers, both now fixed: the seed-candidate map ran in a pure-Python loop over the whole seed bucket, and patterns whose seedable prefix was all wildcards fell back to a full-buffer scan. ([#45](https://github.com/mahmoudimus/ida-sigmaker/pull/45))
+
+### Internal
+
+- New `seed_offsets` Cython kernel maps a seed bucket to the candidate start array (the `p - s` shift, the fit guard, the n-1 boundary) under `nogil`, the same pattern as `refine_offsets`. This was the last `O(C0)` loop left in Python; moving it to C cut the worst observed function search from ~12 s to ~1 s. ([#45](https://github.com/mahmoudimus/ida-sigmaker/pull/45))
+- Seeding is deferred for all-wildcard prefixes instead of running an `O(N)` masked scan when no exact byte is available to key the index. ([#45](https://github.com/mahmoudimus/ida-sigmaker/pull/45))
+- Adversarial refinement microbenchmark (`tests/perf/adversarial_refine.py`, with a `--check` regression guard) plus cross-check tests pinning the Cython kernels to their Python fallbacks. Block refinement and sorted-bucket spaced-seed intersection were measured and shelved. ([#45](https://github.com/mahmoudimus/ida-sigmaker/pull/45))
+- Signatures produced are byte-identical to 1.8.0; only the speed of finding them changed. ([#45](https://github.com/mahmoudimus/ida-sigmaker/pull/45))
+
+### Documentation
+
+- `ALGORITHM.md` gains a table of contents, a "Rejected optimizations" section explaining why the two upgrades above were shelved, and notes on the `seed_offsets` kernel and deferred seeding. ([#45](https://github.com/mahmoudimus/ida-sigmaker/pull/45))
+
+[1.9.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.8.0...v1.9.0
+
 ## [1.8.0] - 2026-05-29
 
 ### Changed

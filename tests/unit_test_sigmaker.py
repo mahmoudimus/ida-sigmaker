@@ -3316,15 +3316,24 @@ class TestStartStopProfiling(CoveredUnitTest):
             return_value=tempfile.mkdtemp()
         )
         # Ensure no stale session leaks between tests.
-        sigmaker._ACTIVE_PROFILE = None
+        sigmaker._PROFILER.reset()
 
     def tearDown(self):
-        sigmaker._ACTIVE_PROFILE = None
+        sigmaker._PROFILER.reset()
 
     def test_stop_without_start_returns_none(self):
         result = sigmaker.stop_profiling()
         self.assertIsNone(result)
         sigmaker.idaapi.msg.assert_called()
+
+    def test_active_query_reflects_session(self):
+        self.assertFalse(sigmaker._PROFILER.active)
+        sigmaker.start_profiling()
+        self.assertTrue(sigmaker._PROFILER.active)
+        sigmaker.stop_profiling(
+            output_path=tempfile.NamedTemporaryFile(suffix=".prof", delete=False).name
+        )
+        self.assertFalse(sigmaker._PROFILER.active)
 
     def test_start_then_stop_writes_files(self):
         out = tempfile.NamedTemporaryFile(suffix=".prof", delete=False).name
@@ -3339,10 +3348,10 @@ class TestStartStopProfiling(CoveredUnitTest):
 
     def test_start_twice_discards_previous(self):
         sigmaker.start_profiling()
-        first = sigmaker._ACTIVE_PROFILE
+        first = sigmaker._PROFILER._profile
         sigmaker.start_profiling()
-        self.assertIsNotNone(sigmaker._ACTIVE_PROFILE)
-        self.assertIsNot(sigmaker._ACTIVE_PROFILE, first)
+        self.assertTrue(sigmaker._PROFILER.active)
+        self.assertIsNot(sigmaker._PROFILER._profile, first)
         sigmaker.stop_profiling(output_path=tempfile.NamedTemporaryFile(suffix=".prof", delete=False).name)
 
 

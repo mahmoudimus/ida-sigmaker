@@ -4247,6 +4247,90 @@ class TestFunctionNameInDisplay(unittest.TestCase):
         self.assertNotIn("(", combined)  # no name parenthetical
 
 
+class TestEngineExtraction(CoveredUnitTest):
+    """Guards the engine/plugin seam and the generated sigmaker_engine.py."""
+
+    SRC = TEST_DIR.parent / "src" / "sigmaker" / "__init__.py"
+    TOOL = TEST_DIR.parent / "tools" / "extract_engine.py"
+    SEAM = "ENGINE / PLUGIN SEAM"
+
+    def _load_extractor(self):
+        import importlib.util
+
+        spec = importlib.util.spec_from_file_location("extract_engine_tool", self.TOOL)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_seam_marker_present_once(self):
+        text = self.SRC.read_text(encoding="utf-8")
+        self.assertEqual(text.count(self.SEAM), 1, "seam marker must appear exactly once")
+
+    def test_no_above_references_below(self):
+        import ast
+
+        text = self.SRC.read_text(encoding="utf-8")
+        seam_line = next(
+            i for i, ln in enumerate(text.splitlines(), start=1) if self.SEAM in ln
+        )
+        tree = ast.parse(text)
+        below = {
+            node.name
+            for node in tree.body
+            if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.lineno > seam_line
+        }
+        self.assertTrue(below, "expected plugin-shell symbols defined below the seam")
+        offenders = [
+            (node.id, node.lineno)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Name)
+            and isinstance(node.ctx, ast.Load)
+            and node.id in below
+            and node.lineno < seam_line
+        ]
+        self.assertEqual(
+            offenders, [], f"engine references plugin-shell symbols: {offenders}"
+        )
+
+    def test_engine_extracts_imports_and_smokes(self):
+        import importlib.util
+
+        extractor = self._load_extractor()
+        with tempfile.TemporaryDirectory() as d:
+            out = pathlib.Path(d) / "sigmaker_engine.py"
+            extractor.extract_engine(out_path=out)
+            spec = importlib.util.spec_from_file_location(
+                "sigmaker_engine_under_test", out
+            )
+            mod = importlib.util.module_from_spec(spec)
+            with patch.dict(
+                "sys.modules",
+                {
+                    "idaapi": MagicMock(),
+                    "idc": MagicMock(),
+                    # Register before exec so dataclass type-resolution (which looks
+                    # the module up in sys.modules under PEP 563 annotations) works.
+                    "sigmaker_engine_under_test": mod,
+                },
+            ):
+                spec.loader.exec_module(mod)
+                for name in ("SigMakerConfig", "SignatureParser", "SignatureMaker"):
+                    self.assertTrue(hasattr(mod, name), f"engine missing {name}")
+                self.assertTrue(hasattr(mod, "SIMD_SPEEDUP_AVAILABLE"))
+                for name in (
+                    "SigMakerPlugin",
+                    "ConfigureOptionsForm",
+                    "SignatureMakerForm",
+                    "ConfigureOperandWildcardBitmaskForm",
+                ):
+                    self.assertFalse(hasattr(mod, name), f"engine leaked shell {name}")
+                self.assertEqual(
+                    mod.SignatureParser.parse("E8 ? ? ? ? 45 33 F6"),
+                    "E8 ? ? ? ? 45 33 F6",
+                )
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

@@ -26,7 +26,7 @@ import idaapi
 import idc
 
 __author__ = "mahmoudimus"
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 
 PLUGIN_NAME: str = "Signature Maker (py)"
 PLUGIN_VERSION: str = __version__
@@ -1034,6 +1034,21 @@ class WildcardPolicy:
         return cls._Use(policy, cls)
 
 
+def _func_name_suffix(ea: int) -> str:
+    """Return ' (funcname)' when ``ea`` lies inside a named function, else ''.
+
+    Labels addresses in human-facing output with the containing function name
+    when one is available, falling back to the bare address. The isinstance
+    guard keeps the suffix empty when idaapi.get_func_name returns a non-string
+    (e.g. under a mocked idaapi in tests) or nothing.
+    """
+    with contextlib.suppress(BaseException):
+        name = idaapi.get_func_name(ea)
+        if isinstance(name, str) and name:
+            return f" ({name})"
+    return ""
+
+
 @dataclasses.dataclass(slots=True, frozen=True)
 class GeneratedSignature:
     """Result container for signature generation operations."""
@@ -1063,16 +1078,21 @@ class GeneratedSignature:
                 if self.match_count is not None
                 else "match count unavailable"
             )
-            prefix = (
-                f"Partial signature (NOT unique, {count_str}) for {self.address}"
-                if self.address is not None
-                else f"Partial signature (NOT unique, {count_str})"
-            )
+            if self.address is not None:
+                prefix = (
+                    f"Partial signature (NOT unique, {count_str}) for "
+                    f"{self.address}{_func_name_suffix(int(self.address))}"
+                )
+            else:
+                prefix = f"Partial signature (NOT unique, {count_str})"
             idaapi.msg(f"{prefix}: {fmted}\n")
             return
 
         if self.address is not None:
-            idaapi.msg(f"Signature for {self.address}: {fmted}\n")
+            idaapi.msg(
+                f"Signature for {self.address}"
+                f"{_func_name_suffix(int(self.address))}: {fmted}\n"
+            )
         else:
             idaapi.msg(f"Signature: {fmted}\n")
 
@@ -1112,7 +1132,10 @@ class XrefGeneratedSignature:
             address = generated_signature.address
             signature = generated_signature.signature
             fmted = format(signature, t)
-            idaapi.msg(f"XREF Signature #{i} @ {address}: {fmted}\n")
+            idaapi.msg(
+                f"XREF Signature #{i} @ {address}"
+                f"{_func_name_suffix(int(address))}: {fmted}\n"
+            )
             if i == 0:
                 Clipboard.set_text(fmted)
 
@@ -3385,7 +3408,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             offset = int(result.address) - int(pfn.start_ea)
             idaapi.msg(
                 f"Function signature (offset +{hex(offset)} into function "
-                f"{hex(pfn.start_ea)}):\n"
+                f"{hex(pfn.start_ea)}{_func_name_suffix(int(pfn.start_ea))}):\n"
             )
             result.display(config)
             return

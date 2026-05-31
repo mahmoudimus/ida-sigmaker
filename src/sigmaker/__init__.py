@@ -2594,7 +2594,94 @@ class SignatureSearcher:
         return len(matches) == 1
 
 
-_ACTIVE_PROFILE: typing.Any = None
+class Profiler:
+    """Central holder for the optional cProfile session behind the Start/Stop
+    Profiling actions.
+
+    Encapsulates the single in-flight profile so there is no bare module global:
+    inspect (``active``), flip (``start`` / ``stop``), and ``reset`` all live on
+    one object. The module exposes a singleton ``_PROFILER``; ``start_profiling``
+    and ``stop_profiling`` are thin console-facing wrappers around it.
+    """
+
+    def __init__(self) -> None:
+        self._profile: typing.Any = None
+
+    @property
+    def active(self) -> bool:
+        """True while a profiling session is running."""
+        return self._profile is not None
+
+    def start(self) -> None:
+        """Begin a session, discarding any already-running one."""
+        import cProfile
+
+        if self._profile is not None:
+            self._profile.disable()
+            idaapi.msg("start_profiling: discarding previous active session\n")
+        pr = cProfile.Profile()
+        pr.enable()
+        self._profile = pr
+        idaapi.msg("start_profiling: profiling enabled\n")
+
+    def stop(
+        self,
+        output_path: typing.Optional[str] = None,
+        top_n: int = 30,
+        sort_by: str = "cumulative",
+    ) -> typing.Optional[str]:
+        """Stop the active session, dump the result, and print a summary.
+
+        Returns the .prof path on success, or None if no session was active.
+        """
+        import pstats
+        import io as _io
+
+        if self._profile is None:
+            idaapi.msg(
+                "stop_profiling: no active session; call start_profiling() first\n"
+            )
+            return None
+        pr = self._profile
+        self._profile = None
+        pr.disable()
+
+        if output_path is None:
+            idausr = idaapi.get_user_idadir()
+            output_path = os.path.join(idausr, "sigmaker_profile.prof")
+        text_path = (
+            output_path + ".txt" if not output_path.endswith(".txt") else output_path
+        )
+
+        pr.dump_stats(output_path)
+
+        buf = _io.StringIO()
+        pstats.Stats(pr, stream=buf).sort_stats(sort_by).print_stats(top_n)
+        text = buf.getvalue()
+
+        header = (
+            f"stop_profiling:\n"
+            f"  prof dump:   {output_path}\n"
+            f"  text dump:   {text_path}\n"
+            f"  sort by:     {sort_by}\n"
+            f"  top {top_n}:\n"
+        )
+        with open(text_path, "w") as f:
+            f.write(header)
+            f.write(text)
+
+        idaapi.msg(header)
+        idaapi.msg(text)
+        return output_path
+
+    def reset(self) -> None:
+        """Discard any active session without dumping (safety / tests)."""
+        if self._profile is not None:
+            self._profile.disable()
+        self._profile = None
+
+
+_PROFILER = Profiler()
 
 
 def start_profiling() -> None:
@@ -2610,15 +2697,7 @@ def start_profiling() -> None:
     Calling start_profiling() twice without an intervening stop_profiling()
     discards the previous session and begins a fresh one.
     """
-    import cProfile
-    global _ACTIVE_PROFILE
-    if _ACTIVE_PROFILE is not None:
-        _ACTIVE_PROFILE.disable()
-        idaapi.msg("start_profiling: discarding previous active session\n")
-    pr = cProfile.Profile()
-    pr.enable()
-    _ACTIVE_PROFILE = pr
-    idaapi.msg("start_profiling: profiling enabled\n")
+    _PROFILER.start()
 
 
 def stop_profiling(
@@ -2640,41 +2719,7 @@ def stop_profiling(
         Output is also printed via idaapi.msg so it appears in the IDA
         Output window.
     """
-    import pstats
-    import io as _io
-    global _ACTIVE_PROFILE
-    if _ACTIVE_PROFILE is None:
-        idaapi.msg("stop_profiling: no active session; call start_profiling() first\n")
-        return None
-    pr = _ACTIVE_PROFILE
-    _ACTIVE_PROFILE = None
-    pr.disable()
-
-    if output_path is None:
-        idausr = idaapi.get_user_idadir()
-        output_path = os.path.join(idausr, "sigmaker_profile.prof")
-    text_path = output_path + ".txt" if not output_path.endswith(".txt") else output_path
-
-    pr.dump_stats(output_path)
-
-    buf = _io.StringIO()
-    pstats.Stats(pr, stream=buf).sort_stats(sort_by).print_stats(top_n)
-    text = buf.getvalue()
-
-    header = (
-        f"stop_profiling:\n"
-        f"  prof dump:   {output_path}\n"
-        f"  text dump:   {text_path}\n"
-        f"  sort by:     {sort_by}\n"
-        f"  top {top_n}:\n"
-    )
-    with open(text_path, "w") as f:
-        f.write(header)
-        f.write(text)
-
-    idaapi.msg(header)
-    idaapi.msg(text)
-    return output_path
+    return _PROFILER.stop(output_path=output_path, top_n=top_n, sort_by=sort_by)
 
 
 class ProgressDialog:

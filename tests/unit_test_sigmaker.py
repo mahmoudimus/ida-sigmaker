@@ -4181,6 +4181,72 @@ class TestSeedDeferredWhenAllWildcard(unittest.TestCase):
         self.assertEqual([sig[i].value for i in range(5, 8)], [0x8B, 0x45, 0x08])
 
 
+class TestFunctionNameInDisplay(unittest.TestCase):
+    """Address output is labeled with the containing function name when one is
+    available, falling back to the bare EA otherwise."""
+
+    def setUp(self):
+        self._orig_msg = sigmaker.idaapi.msg
+        self._orig_get_name = sigmaker.idaapi.get_func_name
+        self.msgs: list[str] = []
+        sigmaker.idaapi.msg = lambda s: self.msgs.append(s)
+
+    def tearDown(self):
+        sigmaker.idaapi.msg = self._orig_msg
+        sigmaker.idaapi.get_func_name = self._orig_get_name
+
+    def test_suffix_with_name(self):
+        sigmaker.idaapi.get_func_name = MagicMock(return_value="Java_x_y_calc")
+        self.assertEqual(sigmaker._func_name_suffix(0x1000), " (Java_x_y_calc)")
+
+    def test_suffix_without_name(self):
+        sigmaker.idaapi.get_func_name = MagicMock(return_value="")
+        self.assertEqual(sigmaker._func_name_suffix(0x1000), "")
+
+    def test_suffix_handles_none_and_nonstring(self):
+        sigmaker.idaapi.get_func_name = MagicMock(return_value=None)
+        self.assertEqual(sigmaker._func_name_suffix(0x1000), "")
+        sigmaker.idaapi.get_func_name = MagicMock(return_value=MagicMock())
+        self.assertEqual(sigmaker._func_name_suffix(0x1000), "")
+
+    def test_suffix_suppresses_exceptions(self):
+        sigmaker.idaapi.get_func_name = MagicMock(side_effect=RuntimeError("boom"))
+        self.assertEqual(sigmaker._func_name_suffix(0x1000), "")
+
+    def test_unique_display_includes_name_and_address(self):
+        sigmaker.idaapi.get_func_name = MagicMock(return_value="myfunc")
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA, wildcard_operands=False,
+            continue_outside_of_function=False, wildcard_optimized=False,
+        )
+        sig = sigmaker.Signature()
+        for i in range(4):
+            sig.append(sigmaker.SignatureByte(0xE8 + i, False))
+        result = sigmaker.GeneratedSignature(sig, sigmaker.Match(0x140001234))
+        with patch.object(sigmaker.Clipboard, "set_text", return_value=True):
+            result.display(cfg)
+        combined = "".join(self.msgs)
+        self.assertIn("Signature for", combined)
+        self.assertIn("(myfunc)", combined)
+        self.assertIn(str(sigmaker.Match(0x140001234)), combined)  # EA still present
+
+    def test_unique_display_falls_back_to_ea_when_unnamed(self):
+        sigmaker.idaapi.get_func_name = MagicMock(return_value="")
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA, wildcard_operands=False,
+            continue_outside_of_function=False, wildcard_optimized=False,
+        )
+        sig = sigmaker.Signature()
+        for i in range(4):
+            sig.append(sigmaker.SignatureByte(0xE8 + i, False))
+        result = sigmaker.GeneratedSignature(sig, sigmaker.Match(0x140001234))
+        with patch.object(sigmaker.Clipboard, "set_text", return_value=True):
+            result.display(cfg)
+        combined = "".join(self.msgs)
+        self.assertIn(str(sigmaker.Match(0x140001234)), combined)
+        self.assertNotIn("(", combined)  # no name parenthetical
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

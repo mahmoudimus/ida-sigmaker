@@ -23,6 +23,7 @@ An IDA Pro 9.0+ zero-dependency cross-platform signature maker plugin with optio
   - [How it works](#how-it-works)
 - [Using SigMaker as a library](#using-sigmaker-as-a-library)
   - [Stability contract](#stability-contract)
+  - [Embedding the engine](#embedding-the-engine)
   - [Used by](#used-by)
 - [Acknowledgements](#acknowledgements)
 - [Development & Releases](#development--releases)
@@ -217,6 +218,15 @@ If you embed `sigmaker`, you can rely on the following. These are treated as a c
 3. **Stable method signatures.** `SignatureMaker.make_signature(ea, cfg, end=None, *, progress_reporter=None, policy=GenerationPolicy.strict())`, `XrefFinder.find_xrefs(ea, cfg)`, `XrefFinder.count_code_xrefs_to(ea)`, and `XrefFinder.iter_code_xrefs_to(ea)`.
 4. **Stable format specs.** `f"{sig:ida}"`, `f"{sig:x64dbg}"`, `f"{sig:mask}"`, and `f"{sig:bitmask}"` keep producing their current output exactly.
 5. **Byte-identical defaults.** Production defaults are unchanged across optimizations: a script that does not opt into a new flag gets byte-identical signatures to previous versions.
+
+### Embedding the engine
+
+`sigmaker` is one file by design, but the bottom of it is the IDA plugin shell (config dialogs, action/menu registration, `plugin_t`) which subclasses IDA GUI types and will not import under `idalib`. If you want the engine without the plugin, you have two options:
+
+- **`pip install sigmaker`** for the compiled SIMD speedups, then `import sigmaker` inside IDA or idalib as shown above.
+- **Vendor the generated [`sigmaker_engine.py`](https://github.com/mahmoudimus/ida-sigmaker/releases)** attached to each release. It is the source sliced at the engine/plugin seam: the full engine (everything in `__all__`, including the SIMD path and `display()`), with no Forms, no action/menu registration, and no `plugin_t`, so it imports cleanly headless. Regenerate it yourself any time with `python tools/extract_engine.py`.
+
+The supported surface is the names in `__all__`, and the [stability contract](#stability-contract) applies to all of them. This is the maintained alternative to hand-stripping the GUI, which drifts every release.
 
 ### Used by
 

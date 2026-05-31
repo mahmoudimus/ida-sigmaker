@@ -784,3 +784,33 @@ def refine_offsets(const unsigned char[:] data_view,
                 w += 1
             r += 1
     return w
+
+
+def seed_offsets(const unsigned int[:] bucket,
+                 Py_ssize_t s,
+                 Py_ssize_t m,
+                 Py_ssize_t n):
+    """Map index-bucket hit positions p to candidate pattern starts p - s,
+    keeping only starts where the seed run fits (p >= s) and the full pattern
+    fits the buffer ((p - s) + m <= n).
+
+    Returns (starts, count): a uint32 array.array of capacity bucket.shape[0]+1
+    (the +1 reserves room for the caller's 1-byte n-1 boundary candidate) whose
+    first `count` entries are valid. nogil; one pass; no per-element Python
+    overhead. Equivalent to:
+        array('I', (p - s for p in bucket if p >= s and (p - s) + m <= n))
+    """
+    cdef Py_ssize_t cnt = bucket.shape[0]
+    cdef array.array out = array.clone(py_stdlib_arr_mod.array('I'), cnt + 1, zero=False)
+    cdef unsigned int[:] outv = out
+    cdef Py_ssize_t r = 0
+    cdef Py_ssize_t w = 0
+    cdef Py_ssize_t p
+    with nogil:
+        while r < cnt:
+            p = <Py_ssize_t>bucket[r]
+            if p >= s and (p - s) + m <= n:
+                outv[w] = <unsigned int>(p - s)
+                w += 1
+            r += 1
+    return out, w

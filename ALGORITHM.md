@@ -1,15 +1,30 @@
 # The shortest-unique-signature algorithm
 
 This document explains the math behind the "find shortest unique signature for
-the current function" search, where the approach fits relative to known string
-algorithms, and how the Cython `_speedups` extension is what makes it practical.
-It is written for someone who wants to understand *why* the search is fast, not
-just *what* the code does.
+the current function" search, how it relates to known string algorithms, and why
+the Cython `_speedups` extension is what makes it practical. It's for someone who
+wants to understand *why* the search is fast, not just *what* the code does.
 
 GitHub renders LaTeX in Markdown, so the math below is in `$...$` (inline) and
 `$$...$$` (block) form.
 
 ---
+
+## Contents
+
+- [1. The problem](#1-the-problem)
+- [2. The naive cost, and where 462 seconds went](#2-the-naive-cost-and-where-462-seconds-went)
+- [3. Monotonic shrinkage: seed once, then refine](#3-monotonic-shrinkage-seed-once-then-refine)
+- [4. The 2-byte position index (counting sort)](#4-the-2-byte-position-index-counting-sort)
+- [5. Dynamic Seed Selection (1-byte or 2-byte) from one index](#5-dynamic-seed-selection-1-byte-or-2-byte-from-one-index)
+- [6. In-place refinement on a typed buffer](#6-in-place-refinement-on-a-typed-buffer)
+- [7. Complexity summary](#7-complexity-summary)
+- [8. Relationship to known string algorithms](#8-relationship-to-known-string-algorithms)
+- [9. What is novel here](#9-what-is-novel-here)
+- [10. Future algorithmic directions](#10-future-algorithmic-directions)
+- [11. Rejected optimizations](#11-rejected-optimizations)
+- [12. How Cython makes it work](#12-how-cython-makes-it-work)
+- [13. References](#13-references)
 
 ## 1. The problem
 
@@ -65,7 +80,7 @@ $$
 
 When the search has to consider several anchors (growing outside the function
 boundary, or comparing several candidate start points), it becomes
-$O(A \cdot L \cdot N)$ for $A$ anchors. On a real 16 MB module a single function
+$O(A \cdot L \cdot N)$ for $A$ anchors. On a real 16 MB module, a single function
 took **462 s**. The whole optimization is about removing the two multiplicative
 factors $L$ and $A$ from the $N$ term.
 
@@ -94,8 +109,8 @@ $$
 
 work, proportional to the *current candidate count*, not $N$.
 
-That monotonicity is the reason the algorithm is fast in practice, but it does
-not by itself give an unconditional telescoping bound. If the seed set has size
+That monotonicity is why the search is fast in practice, but on its own it does
+not give an unconditional telescoping bound. If the seed set has size
 $C_0$ and there are $R$ refinement steps after the seed, monotonicity only gives
 
 $$
@@ -159,8 +174,9 @@ $$
 T_{\text{build}} = O(N), \qquad S_{\text{build}} = O(N + 2^{16}).
 $$
 
-Built once, amortized across **all** anchors. With the index in hand, seeding a
-pattern that contains an exact 2-byte run at offset $s$ with key $k$ costs only
+That work pays off because building the index is $O(N)$ and it can be reused
+across **all** anchors. With it in hand, seeding a pattern that contains an exact
+2-byte run at offset $s$ with key $k$ costs only
 
 $$
 O(|B_k|): \quad M_{\text{seed}} = \lbrace p - s : p \in B_k, \ \text{pattern fits} \rbrace,
@@ -190,8 +206,8 @@ $$
 $$
 
 and the 1-byte candidate list is the single slice
-`positions[heads[b<<8] : heads[(b+1)<<8]]`. No second index, no extra memory, no
-rescan. (One boundary fix: position $N-1$ is never a 2-byte window *start*, so a
+`positions[heads[b<<8] : heads[(b+1)<<8]]`, with no second index, no extra memory,
+and no rescan. (One boundary fix: position $N-1$ is never a 2-byte window *start*, so a
 1-byte hit on the final database byte is added explicitly when it can yield a
 valid pattern start.)
 
@@ -201,9 +217,8 @@ $$
 (s^\ast, w^\ast) = \arg\min_{(s, w) \in \text{exact runs}} \bigl|B^{(w)}_{\text{key}(s,w)}\bigr|.
 $$
 
-This is a deliberately small contiguous-seed family: fully exact 1-byte and
-2-byte anchors. Since the 1-byte options are a *superset* of the candidate seeds,
-the chosen seed bucket is never worse than a 2-byte-only choice:
+Since the 1-byte options are a *superset* of the candidate seeds, the chosen seed
+bucket is never worse than a 2-byte-only choice:
 
 $$
 C_0 = \bigl|B^{(w^\ast)}\bigr| \le \min_{\text{2-byte runs}} |B_k|.
@@ -223,11 +238,13 @@ richer seed family would add index complexity without new selectivity. It is
 worth revisiting only if profiling ever shows seed enumeration, not refinement,
 to be the bottleneck (see Section 10).
 
-**Deferred seeding.** For a pattern shorter than `MIN_USEFUL_SIG_BYTES` $= 5$, even
-the rarest run is too common (the seed would enumerate a large fraction of $D$),
-so seeding is deferred and a direct scan is used until the pattern is long enough
-to be selective. This avoids materializing a multi-million-entry seed for a 2-byte
-pattern.
+**Deferred seeding.** Two cases skip the index seed and wait. First, for a pattern
+shorter than `MIN_USEFUL_SIG_BYTES` $= 5$, even the rarest run is too common (the
+seed would enumerate a large fraction of $D$), so seeding waits until the pattern
+is long enough to be selective. Second, when the seedable prefix is all wildcards
+there is no exact byte to key the index on at all; rather than fall back to a full
+$O(N)$ masked scan, seeding is deferred until an exact byte appears. Both avoid
+materializing, or scanning for, a seed that cannot be selective yet.
 
 ## 6. In-place refinement on a typed buffer
 
@@ -268,12 +285,13 @@ $$
 versus the naive $O(A \cdot L \cdot N)$. The $N$ term is paid **once** and shared;
 all per-anchor database-wide work is replaced by work over the chosen seed bucket
 and its surviving candidates. In the worst case refinement can still be
-$O(RC_0)$, but real runs are expected to be close to geometric decay when exact
-bytes are selective.
+$O(RC_0)$, but in practice it decays close to geometrically when the exact bytes
+are selective.
 
 ## 8. Relationship to known string algorithms
 
-The space is not empty; this design sits near several well-studied ones.
+None of this is an empty corner of the literature; the design sits next to
+several well-studied lines of work.
 
 The exact, unmasked version of the problem is essentially **left-bounded shortest
 unique substring** (LSUS): for a fixed start position, find the shortest substring
@@ -284,20 +302,20 @@ the right reference points for the wildcard-free case and for an answer-length
 sanity check.
 
 The masked case connects to **wildcard pattern matching** and **longest common
-extensions with wildcards**, whose recurring lesson is exactly ours: anchor on
-informative non-wildcard positions instead of treating all positions uniformly.
-**Internal pattern matching** queries are the natural primitive if one ever wants
-sublinear repeated-substring queries inside a fixed text rather than a per-search
-rebuilt index.
+extensions with wildcards**, whose recurring lesson is the same one we lean on:
+anchor on informative non-wildcard positions instead of treating all positions
+uniformly.
+**Internal pattern matching** is the natural primitive if one ever wants sublinear
+repeated-substring queries inside a fixed text rather than a per-search rebuilt
+index.
 
 The closest practical neighbor is in the same domain. **YARA**'s atom-based
 scanning picks a short, rare, non-wildcard substring of a rule, finds its
 occurrences (classically via **Aho-Corasick** multi-pattern matching), and then
 verifies the full masked pattern at each hit. That is seed-then-refine for binary
-signatures. The algorithm here is the inverse-direction relative: instead of
-matching a known pattern, it *grows* the shortest pattern that is unique, using a
-byte-window index as the atom oracle and monotone in-place refinement as the
-verifier.
+signatures. The idea here is similar, but backwards: instead of matching a known
+pattern, it *grows* the shortest pattern that is unique, using a byte-window index
+as the atom oracle and monotone in-place refinement as the verifier.
 
 The bioinformatics seed-design literature (spaced, gapped, sampled, and
 multi-context seeds) does **not** transfer cleanly, for the reason in Section 5:
@@ -309,17 +327,16 @@ are known before the search.
 This is a **novel application**. The literature has the individual primitives, but
 the composition that solves *this* problem, growing the shortest masked byte
 signature that is unique in a live database, does not come pre-packaged anywhere
-we found. The **key use case** is concrete and load-bearing for reverse engineers:
-relocating a specific function or routine across rebuilds of a binary,
-interactively, inside the disassembler. That is what turns a 7.7-minute search
-into seconds (Section 2) and is what makes the feature usable at all.
+we found. The **key use case** is concrete: a reverse engineer relocating a function across
+rebuilds of a binary, interactively, in the disassembler. That is what turns a
+7.7-minute search into seconds (Section 2).
 
 What we do **not** claim is a new general theory of shortest unique substrings or
 wildcard matching; the primitives (inverted byte buckets, seed/filter/verify,
 monotone candidate filtering) are individually standard. The contribution is the
 specialization, and how cheaply the pieces combine for masked function signatures:
 
-1. **The 1-byte index is free.** This is the one genuinely non-obvious trick. A
+1. **The 1-byte index is free.** This is the one part that isn't obvious. A
    single counting-sort layout over adjacent byte *pairs* yields the exact 2-byte
    buckets, and because the buckets are stored in key order, every 1-byte bucket
    is just a contiguous *marginal* of that same `heads` array: a range view, with
@@ -340,32 +357,70 @@ specialization, and how cheaply the pieces combine for masked function signature
 
 ## 10. Future algorithmic directions
 
-The current implementation is intentionally conservative. In priority order:
+The current implementation is intentionally conservative. The instrumentation this
+section used to call for has since been done: seed bucket size $C_0$, informative
+refinement steps $R$, wildcard density, and the candidate-decay curve. It
+redirected the effort: the real costs were a Python seed-enumeration loop (now in
+C, Section 12) and a needless full scan on all-wildcard prefixes (now deferred,
+Section 5), not a fancier seed. Richer seed families (longer contiguous, spaced,
+or multi-context seeds) were measured and shelved; see Section 11. The one open
+direction that remains:
 
-1. **Empirical instrumentation first.** Before any new algorithm, runtime reports
-   should record the seed bucket size $C_0$, the number of *informative*
-   refinement steps $R$, the wildcard density, and the empirical candidate-decay
-   curve. Those measurements separate the contributions of the index, the seed
-   selector, the wildcard policy, and the Cython kernels, and they decide whether
-   the directions below are worth pursuing at all.
-
-2. **Richer seeds only if seeding dominates.** If, and only if, the instrumentation
-   shows seed enumeration (not refinement) is the bottleneck, longer contiguous
-   exact-run indexes or spaced/gapped seeds become worth their added structure.
-   Until then the contiguous 1-byte/2-byte seed is sufficient (Section 5).
-
-3. **Exact LSUS baseline.** When wildcarding is disabled, or a long exact region
+1. **Exact LSUS baseline.** When wildcarding is disabled, or a long exact region
    dominates the signature, a suffix-array/LCP LSUS baseline is a useful reference
    for both answer length and runtime.
 
-## 11. How Cython makes it work
+## 11. Rejected optimizations
+
+A couple of ideas looked good on paper, and the reasoning for skipping them is more
+useful than the verdict, so it is worth writing down.
+
+Both got the same treatment: profile the worst functions, then build a small
+adversarial benchmark that deliberately constructs each idea's best case and check
+whether it actually wins. Neither did, because the profile kept pointing somewhere
+else: not the index build (~0.05 s), and after the seed map was moved into C, not
+the refine kernel either (~0.1 s), but two boring things we had left on the table:
+an $O(C_0)$ loop still mapping seed candidates in pure Python one boxed integer at
+a time, and a full $O(N)$ scan that fired whenever a pattern began with nothing but
+wildcards. Fixing those is what moved the numbers. Everything below is what we
+talked ourselves out of along the way.
+
+**Block refinement.** The obvious next idea is to group the exact bytes into runs
+and compare a whole run at once with a wide `uint64` or SIMD load, skipping the
+wildcard gaps, on the theory that fewer instructions means less time. The benchmark
+says otherwise: refinement is bound by memory bandwidth, not instruction count. It
+is already a tight, linear, stride-1 sweep, which is the access pattern a CPU
+streams fastest, so wider-but-fewer compares do nothing for a loop that is waiting
+on memory rather than on the ALU. The premise was also weaker than it looked, since
+the expensive filtering pass already skips wildcards (Section 3). With refinement
+sitting around 0.1 s, there was simply nothing here worth chasing.
+
+**Spaced-seed intersection.** The index has a tempting property: each bucket's
+positions come out already sorted, because we fill them in one left-to-right pass
+over the database. So for a spaced pattern like `8B ?? ?? 45` you could grab both
+byte buckets and intersect them with a two-pointer merge. The problem is that we
+already do exactly this, just more cheaply: seeding from the rarest byte and
+refining against the rest *is* that intersection, and it only ever touches the
+smaller bucket. An explicit merge has to read both buckets end to end, which is
+strictly more work the moment one of them is a common byte with millions of
+entries. And once deferred seeding keeps the starting set small, the merge is pure
+overhead; no input in the benchmark ever reached the point where it paid off.
+
+The honest summary is that the wins were never algorithmic. They were "stop running
+this loop in Python" and "don't scan the whole database for a prefix that can't
+anchor anything", the kind of thing you only find by measuring, not by reaching for
+a cleverer data structure. The microbenchmark stays in the tree with a `--check`
+mode, so if some later change pushes the bottleneck back onto refinement, it will
+fail loudly and these two ideas get a fresh hearing.
+
+## 12. How Cython makes it work
 
 The math above is correct in pure Python too, but it would not be *fast* in pure
-Python. The two hot kernels, the index build and the per-step refine, are
-memory-bound, branchy loops over millions of bytes. That is precisely the
-workload where CPython's per-element overhead (boxed integers, attribute lookups,
-interpreter dispatch, dynamic bounds checks) costs 50-100x. The `_speedups`
-extension compiles them to tight C:
+Python. The hot kernels (the index build, the seed-candidate map, and the per-step
+refine) are memory-bound, branchy loops over millions of bytes, and that is where
+CPython's per-element overhead (boxed integers, attribute lookups, interpreter
+dispatch, bounds checks) costs 50-100x. The `_speedups` extension compiles them to
+tight C:
 
 - **`build_byte_index`** is the counting sort of Section 4, written as C loops
   over a `const unsigned char[:]` typed memoryview, running under `nogil` so the
@@ -378,13 +433,21 @@ extension compiles them to tight C:
   from **~14 s** (a Python list comprehension called ~165k times) to **~0.28 s**,
   roughly **50x**.
 
+- **`seed_offsets`** is the candidate-mapping kernel of Section 5: a `nogil` loop
+  that turns a seed bucket into the `array.array('I')` of pattern starts (the
+  `p - s` shift, the fit guard, the $N-1$ boundary case) in C. This was the last
+  `O(C_0)` loop left in Python, a generator expression that boxed and walked the
+  entire bucket; moving it into Cython cut the worst observed function search from
+  **~12 s** to **~1 s**. It is the same playbook as `refine_offsets`, cross-checked
+  against the Python version for byte-identical output.
+
 - **`array.array('I')` is the bridge.** A candidate set is simultaneously a
   first-class Python object the orchestration layer can slice and return, *and*
   a zero-copy `unsigned int[:]` typed memoryview inside Cython. The same buffer
   is the Python-visible candidate list and the C-level `uint32*` that
   `refine_offsets` compacts in place, so candidates cross the Python/C boundary
-  with no marshalling and no per-call allocation. This is the crux that makes
-  Section 6's "allocate once, only shrink" actually hold across the whole search.
+  with no marshalling and no per-call allocation. That is what lets Section 6's
+  "allocate once, only shrink" hold across the whole search.
 
 - **`nogil`** on both kernels means the heavy work runs without holding the
   interpreter lock, which keeps the UI live and leaves headroom for the
@@ -425,7 +488,7 @@ the run-time Python constructor. They no longer share a name, so there is nothin
 to "override". (The canonical Cython array tutorial shows both lines sharing the
 name `array`; aliasing one side is the same idiom, just spelled out.)
 
-## 12. References
+## 13. References
 
 - Larissa L. M. Aguiar and Felipe A. Louza, ["Faster computation of
   left-bounded shortest unique substrings"](https://doi.org/10.1186/s13015-025-00287-5),

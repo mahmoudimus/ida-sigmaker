@@ -3749,10 +3749,13 @@ class TestSeedViaIndex(CoveredUnitTest):
         # bucket so they lose.
         idx.bucket_size.side_effect = lambda key: {(0x8B << 8) | 0x45: 2}.get(key, 10**9)
         idx.bucket_size1.side_effect = lambda b: 10**9
+        # Real _ByteIndex.candidates returns array.array('I') slices; mirror that.
         idx.candidates.side_effect = (
-            lambda key: [0, 6] if key == ((0x8B << 8) | 0x45) else []
+            lambda key: array.array("I", [0, 6])
+            if key == ((0x8B << 8) | 0x45)
+            else array.array("I", [])
         )
-        idx.candidates1.side_effect = lambda b: []
+        idx.candidates1.side_effect = lambda b: array.array("I", [])
         arr, cnt = sigmaker._seed_via_index(sig, idx, buf)
         # offset 0 keeps (90 90 90 follow); offset 6 drops (00 00 follow)
         self.assertEqual(list(arr[:cnt]), [0])
@@ -3771,7 +3774,9 @@ class TestSeedViaIndex(CoveredUnitTest):
         idx = MagicMock()
         idx.bucket_size.side_effect = lambda key: 10**9   # no 2-byte run chosen
         idx.bucket_size1.side_effect = lambda b: {0xF3: 2}.get(b, 10**9)
-        idx.candidates1.side_effect = lambda b: [0, 8] if b == 0xF3 else []
+        idx.candidates1.side_effect = (
+            lambda b: array.array("I", [0, 8]) if b == 0xF3 else array.array("I", [])
+        )
         arr, cnt = sigmaker._seed_via_index(sig, idx, buf)
         self.assertEqual(list(arr[:cnt]), [0])
 
@@ -4057,6 +4062,123 @@ class TestBuildByteIndex(CoveredUnitTest):
         )
         self.assertEqual(len(positions), 0)
         self.assertEqual(len(heads), 65537)  # safe to look up; all buckets empty
+
+
+class TestSeedOffsetsKernel(unittest.TestCase):
+    """simd_scan.seed_offsets maps index-bucket hits to pattern starts,
+    identically to the pure-Python genexp in _seed_via_index it replaces."""
+
+    @staticmethod
+    def _genexp(bucket, s, m, n):
+        return [p - s for p in bucket if p >= s and (p - s) + m <= n]
+
+    def setUp(self):
+        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
+            self.skipTest("SIMD speedup not available")
+
+    def _check(self, bucket, s, m, n):
+        import array as _arr
+        arr, count = sigmaker.simd_scan.seed_offsets(
+            _arr.array("I", bucket), s, m, n
+        )
+        self.assertEqual(len(arr), len(bucket) + 1)   # capacity = bucket+1
+        self.assertLessEqual(count, len(bucket))
+        self.assertEqual(list(arr[:count]), self._genexp(bucket, s, m, n))
+
+    def test_empty_bucket(self):
+        self._check([], 0, 4, 100)
+
+    def test_s_zero_all_fit(self):
+        self._check([0, 10, 20, 30], 0, 5, 100)
+
+    def test_s_positive_drops_small_p(self):
+        self._check([0, 1, 2, 5, 9, 50], 3, 4, 100)
+
+    def test_boundary_inclusive_vs_exclusive(self):
+        # (p - s) + m == n is kept; == n + 1 is dropped
+        self._check([96, 97], 0, 4, 100)
+
+    def test_single_element(self):
+        self._check([42], 5, 3, 100)
+
+    def test_randomized(self):
+        import random
+        rng = random.Random(1234)
+        for _ in range(200):
+            n = rng.randint(1, 5000)
+            m = rng.randint(1, 32)
+            s = rng.randint(0, m - 1)
+            bucket = sorted(
+                rng.randint(0, n + 50) for _ in range(rng.randint(0, 300))
+            )
+            self._check(bucket, s, m, n)
+
+
+class TestSeedDeferredWhenAllWildcard(unittest.TestCase):
+    """Phase 6: an all-wildcard prefix defers seeding (no find_all_offsets full
+    scan) until an exact byte appears, then seeds via the index."""
+
+    def setUp(self):
+        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
+            self.skipTest("SIMD speedup not available")
+        self._orig_canceled = getattr(
+            sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
+        )
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+
+    def tearDown(self):
+        sigmaker.idaapi_user_canceled = self._orig_canceled
+
+    def test_all_wildcard_prefix_defers_seed(self):
+        buf_bytes = b"\xAA\xAA\xAA\xAA\xAA\x8B\x45\x08\xCC\xCC\xCC\xCC"
+        mv = memoryview(bytearray(buf_bytes))
+        seed_buf = MagicMock()
+        seed_buf.data.return_value = mv
+        idx = sigmaker._ByteIndex.build(mv)
+        self.assertIsNotNone(idx)
+
+        decoded = [
+            sigmaker._DecodedInstruction(
+                ea=0x1000, size=5, raw_bytes=buf_bytes[0:5],
+                operand_offb=0, operand_length=5,   # entire instruction wildcarded
+            ),
+            sigmaker._DecodedInstruction(
+                ea=0x1005, size=3, raw_bytes=b"\x8B\x45\x08",
+                operand_offb=0, operand_length=0,    # all exact
+            ),
+        ]
+        gen = sigmaker.MinimalFunctionSignatureGenerator(
+            sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        )
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA, wildcard_operands=True,
+            continue_outside_of_function=False, wildcard_optimized=True,
+            ask_longer_signature=False, max_single_signature_length=50,
+        )
+
+        calls = {"n": 0}
+
+        def spy(ida_sig, buf=None):
+            calls["n"] += 1
+            return [], buf
+
+        with patch.object(
+            sigmaker.SignatureSearcher, "find_all_offsets", side_effect=spy
+        ):
+            sig = gen._grow_unique_from_decoded(
+                decoded, 0, cfg.max_single_signature_length, cfg,
+                buf=seed_buf, index=idx,
+            )
+
+        self.assertEqual(
+            calls["n"], 0,
+            "find_all_offsets must not run for an all-wildcard prefix when the "
+            "index is available",
+        )
+        self.assertIsNotNone(sig)
+        self.assertEqual(len(sig), 8)               # 5 wildcard + 8B 45 08
+        self.assertTrue(all(sig[i].is_wildcard for i in range(5)))
+        self.assertEqual([sig[i].value for i in range(5, 8)], [0x8B, 0x45, 0x08])
 
 
 if __name__ == "__main__":

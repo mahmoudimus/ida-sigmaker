@@ -163,6 +163,8 @@ SigMaker's "find the shortest unique signature for the current function" search 
 
 The full derivation, including the match-set math, the counting-sort index, the selectivity proof, and what is novel about the approach, is written up in **[ALGORITHM.md](./ALGORITHM.md)**.
 
+For a narrative walkthrough with interactive visualizations (the candidate set collapsing to a single match, the byte-pair index, seed selection, and the naive versus indexed cost), see the companion post [Growing a unique function signature without rescanning the binary](https://mahmoudimus.com/blog/2026/05/growing-a-unique-function-signature-without-rescanning-the-binary/) on mahmoudimus.com.
+
 ### Benchmarks
 
 Measured on the largest function (8486 bytes) of a 16 MB module via native idalib on Apple Silicon. The effects are cumulative across the four phases:
@@ -182,7 +184,7 @@ A short tour (see [ALGORITHM.md](./ALGORITHM.md) for the math):
 
 - **Seed, then refine.** The set of database matches can only shrink as a signature grows, so instead of rescanning the whole database for every candidate length, SigMaker scans once to seed a candidate set and then filters that set in place as each byte is appended.
 - **Index the database once.** A counting-sort index over every adjacent byte pair lets the seed be drawn from the *rarest* exact run in the pattern, in time proportional to that run's frequency rather than to the database size. The same index serves both 1-byte and 2-byte runs for free, so the most selective anchor is always chosen.
-- **Push the hot loops into C.** With the optional `pip install sigmaker` SIMD wheel, the index build and the per-byte refinement run as `nogil` C over typed buffers with zero per-call allocation, and the raw byte scan uses AVX2/NEON/SSE2. Without the wheel, pure-Python fallbacks produce identical results.
+- **Push the hot loops into C.** With the optional `pip install sigmaker` SIMD wheel, the index build and the per-byte refinement run as `nogil` C over typed buffers with zero per-call allocation, and the raw byte scan uses AVX2/NEON/SSE2. Without the wheel, pure-Python fallbacks produce identical results. For the story of how and why these hot paths moved into Cython, see [IDA Pro and Cython: super-charging the work-horse of reverse engineering](https://mahmoudimus.com/blog/2025/08/ida-pro-and-cython-super-charging-the-work-horse-of-reverse-engineering/) on mahmoudimus.com.
 
 ## Using SigMaker as a library
 

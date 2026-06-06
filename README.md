@@ -6,8 +6,8 @@ An IDA Pro 9.0+ zero-dependency cross-platform signature maker plugin with optio
 
 Background reading on mahmoudimus.com:
 
-- [Growing a unique function signature without rescanning the binary](https://mahmoudimus.com/blog/2026/05/growing-a-unique-function-signature-without-rescanning-the-binary/): the search algorithm, with interactive visualizations.
 - [IDA Pro and Cython: super-charging the work-horse of reverse engineering](https://mahmoudimus.com/blog/2025/08/ida-pro-and-cython-super-charging-the-work-horse-of-reverse-engineering/): how the optional SIMD speedups were built.
+- [Growing a unique function signature without rescanning the binary](https://mahmoudimus.com/blog/2026/05/growing-a-unique-function-signature-without-rescanning-the-binary/): the search algorithm, with interactive visualizations.
 - [How do you know your Cython hot loop is fast enough?](https://mahmoudimus.com/blog/2026/05/how-do-you-know-your-cython-hot-loop-is-fast-enough/): how I confirmed those kernels are already optimal (memory-bound, not compute-bound).
 
 ## Table of contents

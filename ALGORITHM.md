@@ -406,7 +406,7 @@ strictly more work the moment one of them is a common byte with millions of
 entries. And once deferred seeding keeps the starting set small, the merge is pure
 overhead; no input in the benchmark ever reached the point where it paid off.
 
-The honest summary is that the wins were never algorithmic. They were "stop running
+Put simply, the wins were never algorithmic. They were "stop running
 this loop in Python" and "don't scan the whole database for a prefix that can't
 anchor anything", the kind of thing you only find by measuring, not by reaching for
 a cleverer data structure. The microbenchmark stays in the tree with a `--check`

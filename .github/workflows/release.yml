@@ -100,10 +100,11 @@ jobs:
               with:
                   python-version: "3.10"
             - &create-sigmaker-py
-              name: Create sigmaker.py from __init__.py
+              name: Create sigmaker.py and sigmaker_engine.py from __init__.py
               if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
               run: |
                   cp src/sigmaker/__init__.py sigmaker.py
+                  python tools/extract_engine.py sigmaker_engine.py
             - &read-changelog
               name: 📖 Read CHANGELOG section for this version
               id: changelog
@@ -159,6 +160,7 @@ jobs:
               with:
                   files: |
                       sigmaker.py
+                      sigmaker_engine.py
                   tag_name: ${{ steps.version.outputs.tag }} # e.g. v1.3.0
                   name: ${{ steps.version.outputs.tag }}
                   body_path: release_body.md

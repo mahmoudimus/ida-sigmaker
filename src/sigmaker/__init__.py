@@ -32,6 +32,40 @@ PLUGIN_NAME: str = "Signature Maker (py)"
 PLUGIN_VERSION: str = __version__
 PLUGIN_AUTHOR: str = __author__
 
+# Public engine surface. These names are the supported library API (the same set
+# the downstream-consumer contract pins) and are exactly what ships in the
+# generated, GUI-free sigmaker_engine.py. The IDA plugin shell below the seam is
+# intentionally excluded.
+__all__ = [
+    "Signature",
+    "SignatureByte",
+    "SignatureType",
+    "Match",
+    "SigMakerConfig",
+    "GenerationPolicy",
+    "GenerationStatus",
+    "WildcardPolicy",
+    "OperandProcessor",
+    "InstructionProcessor",
+    "SignatureMaker",
+    "GeneratedSignature",
+    "XrefGeneratedSignature",
+    "XrefFinder",
+    "SignatureParser",
+    "SignatureSearcher",
+    "SearchResults",
+    "SigText",
+    "SignatureFormatter",
+    "IdaFormatter",
+    "X64DbgFormatter",
+    "MaskedBytesFormatter",
+    "ByteArrayBitmaskFormatter",
+    "ProgressReporter",
+    "Unexpected",
+    "UserCanceledError",
+    "SIMD_SPEEDUP_AVAILABLE",
+]
+
 
 WILDCARD_POLICY_CTX: contextvars.ContextVar["WildcardPolicy"] = contextvars.ContextVar(
     "wildcard_policy"
@@ -2978,6 +3012,15 @@ class Clipboard:
         return self.set_text(text)
 
 
+# ============================================================================
+# ENGINE / PLUGIN SEAM
+# Everything ABOVE this line is the self-contained signature engine and is what
+# gets extracted into sigmaker_engine.py (see tools/extract_engine.py). Everything
+# BELOW is the IDA plugin shell: config dialogs, action/menu registration, and the
+# plugin_t entry point, all of which subclass idaapi GUI types.
+# INVARIANT: nothing above this line may reference a symbol defined below it.
+# The seam is enforced by tests/test_engine_extraction.py.
+# ============================================================================
 class ConfigureOperandWildcardBitmaskForm(idaapi.Form):
     """Interactive form to configure wildcardable operands using checkboxes."""
 

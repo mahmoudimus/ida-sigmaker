@@ -9,6 +9,7 @@ import array
 import dataclasses
 import gc
 import itertools
+import json
 import logging
 import pathlib
 import platform
@@ -4254,6 +4255,19 @@ class TestFunctionNameInDisplay(unittest.TestCase):
         combined = "".join(self.msgs)
         self.assertIn(str(sigmaker.Match(0x140001234)), combined)
         self.assertNotIn("(", combined)  # no name parenthetical
+
+
+class TestPluginManifestVersion(unittest.TestCase):
+    """Guard against ida-plugin.json drifting from the package version."""
+
+    def test_manifest_version_matches_package(self):
+        manifest = json.loads((TEST_DIR.parent / "ida-plugin.json").read_text())
+        self.assertEqual(
+            manifest["plugin"]["version"],
+            sigmaker.__version__,
+            "ida-plugin.json version is out of sync with sigmaker.__version__; "
+            "bump ida-plugin.json whenever you bump the package version.",
+        )
 
 
 if __name__ == "__main__":

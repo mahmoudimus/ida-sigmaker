@@ -15,6 +15,7 @@ Background reading on mahmoudimus.com:
 - [Installation](#installation)
   - [Quick Install](#quick-install)
   - [From Releases](#from-releases)
+  - [Install with hcli](#install-with-hcli)
   - [Need to find your plugin directory?](#need-to-find-your-plugin-directory)
   - [Where and what is my default user directory?](#where-and-what-is-my-default-user-directory)
 - [SIMD Speedups](#simd-speedups)
@@ -54,6 +55,24 @@ sigmaker's main value proposition is its cross-platform (Windows, macOS, Linux) 
 - Restart IDA Pro
 
 That's it!
+
+### Install with hcli
+
+[`hcli`](https://hcli.docs.hex-rays.com/) is Hex-Rays' command-line tool, and it can install sigmaker from the IDA Plugin Repository. Install `hcli` once:
+
+```bash
+curl -LsSf https://hcli.docs.hex-rays.com/install | sh        # macOS/Linux
+iwr -useb https://hcli.docs.hex-rays.com/install.ps1 | iex    # Windows (PowerShell)
+```
+
+Then authenticate (see the [hcli docs](https://hcli.docs.hex-rays.com/)) and install the plugin:
+
+```bash
+hcli plugin search sigmaker
+hcli plugin install SigMaker
+```
+
+`hcli` downloads the plugin and places it in `$IDAUSR/plugins` (`~/.idapro/plugins` on macOS/Linux), where IDA loads it on the next launch. Requires IDA 9.0+. For `SIMD` speedups, also run `pip install sigmaker` as above.
 
 ### Need to find your plugin directory?
 
@@ -251,6 +270,14 @@ Thank you to [@A200K](https://github.com/A200K)'s [IDA-Pro-SigMaker](https://git
 3. Make your changes
 4. Test thoroughly
 5. Submit a pull request
+
+The version lives in one place, `__version__` in `src/sigmaker/__init__.py`. To keep `ida-plugin.json` in step with it automatically, enable the repo's git hook once per clone:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+The pre-commit hook (`.githooks/pre-commit`) runs `tools/sync_plugin_version.py`, which copies `__version__` into `ida-plugin.json` and stages it, so the manifest the IDA Plugin Repository reads can never drift behind a version bump. CI runs the same check (`TestPluginManifestVersion`) as a backstop for commits that skip the hook.
 
 ## Contact
 

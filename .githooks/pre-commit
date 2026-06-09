@@ -1,0 +1,21 @@
+#!/bin/sh
+# Keep ida-plugin.json's version in sync with sigmaker.__version__ on every
+# commit. Enable once per clone with:
+#
+#     git config core.hooksPath .githooks
+#
+# The sync script is pure-stdlib Python. If it changes the manifest, the change
+# is staged into this commit so the two versions never drift apart.
+set -e
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "pre-commit: python3 not found, skipping ida-plugin.json version sync" >&2
+    exit 0
+fi
+
+python3 tools/sync_plugin_version.py
+
+if ! git diff --quiet -- ida-plugin.json; then
+    git add ida-plugin.json
+    echo "pre-commit: synced ida-plugin.json version and staged it"
+fi

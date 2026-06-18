@@ -2571,6 +2571,95 @@ class TestGeneratedSignatureDisplay(CoveredUnitTest):
         fa.assert_not_called()
 
 
+class _FakeXrefProgressDialog:
+    """Minimal progress dialog for XrefFinder unit tests."""
+
+    def __init__(self) -> None:
+        self.messages: list[str] = []
+
+    def user_canceled(self) -> bool:
+        return False
+
+    def replace_message(self, msg: str) -> None:
+        self.messages.append(msg)
+
+
+class TestXrefFinderCancellation(CoveredUnitTest):
+    """Cancel during one XREF candidate stops and keeps prior results."""
+
+    def _cfg(self) -> sigmaker.SigMakerConfig:
+        return sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+
+    def _sig(self, value: int) -> sigmaker.Signature:
+        sig = sigmaker.Signature()
+        sig.append(sigmaker.SignatureByte(value, False))
+        sig.append(sigmaker.SignatureByte(value + 1, False))
+        return sig
+
+    def _finder(self) -> sigmaker.XrefFinder:
+        finder = sigmaker.XrefFinder()
+        finder.progress_dialog = _FakeXrefProgressDialog()
+        return finder
+
+    def test_cancel_inside_candidate_generation_returns_prior_xrefs(self):
+        finder = self._finder()
+        first = sigmaker.GeneratedSignature(self._sig(0x40))
+        third = sigmaker.GeneratedSignature(self._sig(0x50))
+
+        with patch.object(sigmaker.XrefFinder, "count_code_xrefs_to", return_value=3), \
+                patch.object(
+                    sigmaker.XrefFinder,
+                    "iter_code_xrefs_to",
+                    return_value=iter([0x1010, 0x1020, 0x1030]),
+                ), patch.object(
+                    sigmaker.SignatureMaker,
+                    "make_signature",
+                    side_effect=[
+                        first,
+                        sigmaker.UserCanceledError("user canceled"),
+                        third,
+                    ],
+                ) as make_signature:
+            result = finder.find_xrefs(0x2000, self._cfg())
+
+        self.assertEqual(make_signature.call_count, 2)
+        self.assertEqual(len(result.signatures), 1)
+        self.assertEqual(result.signatures[0].address, sigmaker.Match(0x1010))
+        self.assertEqual(result.signatures[0].signature, first.signature)
+
+    def test_non_cancel_candidate_error_still_skips_and_continues(self):
+        finder = self._finder()
+        first = sigmaker.GeneratedSignature(self._sig(0x40))
+        third = sigmaker.GeneratedSignature(self._sig(0x50))
+
+        with patch.object(sigmaker.XrefFinder, "count_code_xrefs_to", return_value=3), \
+                patch.object(
+                    sigmaker.XrefFinder,
+                    "iter_code_xrefs_to",
+                    return_value=iter([0x1010, 0x1020, 0x1030]),
+                ), patch.object(
+                    sigmaker.SignatureMaker,
+                    "make_signature",
+                    side_effect=[
+                        first,
+                        RuntimeError("bad xref"),
+                        third,
+                    ],
+                ) as make_signature:
+            result = finder.find_xrefs(0x2000, self._cfg())
+
+        self.assertEqual(make_signature.call_count, 3)
+        self.assertEqual(
+            [generated.address for generated in result.signatures],
+            [sigmaker.Match(0x1010), sigmaker.Match(0x1030)],
+        )
+
+
 class TestGenerationStatusAndPolicy(CoveredUnitTest):
     """GenerationStatus and GenerationPolicy classmethods give callers a clean opt-in switch."""
 

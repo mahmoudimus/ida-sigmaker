@@ -1541,7 +1541,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
 
         find_all.assert_called_once_with("E8 ?? ?? ?? ?? 48")
         self.assertEqual(result.signature_str, "E8 ? ? ? ? 48")
-        self.assertEqual(result.ida_pattern, "E8 ? ? ? ? 48")
+        self.assertEqual(result.search_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(result.normalized_signature, "E8 ?? ?? ?? ?? 48")
         self.assertEqual(result.raw_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(result.status, "matched")
@@ -1551,7 +1551,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         self.assertEqual(result.matches[0], sigmaker.Match(0x1000))
         self.assertEqual(result.matches[0].rva, 0)
 
-    def test_search_preserves_ida_pattern_signature_string(self):
+    def test_search_preserves_search_pattern_signature_string(self):
         cases = (
             "48 8B ? 48 89",
             "\\x48\\x8B\\x00\\x48\\x89 xx?xx",
@@ -1568,7 +1568,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
 
             find_all.assert_called_once_with("48 8B ?? 48 89")
             self.assertEqual(result.signature_str, "48 8B ? 48 89")
-            self.assertEqual(result.ida_pattern, "48 8B ? 48 89")
+            self.assertEqual(result.search_pattern, "48 8B ? 48 89")
             self.assertEqual(result.normalized_signature, "48 8B ?? 48 89")
 
     def test_search_preserves_nibble_wildcard_patterns(self):
@@ -1577,7 +1577,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
             ("48 8B 4? ?F ??", "48 8B 4? ?F ?", "48 8B 4? ?F ??"),
         )
 
-        for raw, ida_pattern, normalized in cases:
+        for raw, search_pattern, normalized in cases:
             with self.subTest(raw=raw), patch.object(
                 sigmaker.SignatureSearcher,
                 "find_all",
@@ -1587,8 +1587,8 @@ class TestSignatureSearcherInput(CoveredUnitTest):
 
             find_all.assert_called_once_with(normalized)
             self.assertEqual(result.raw_pattern, raw)
-            self.assertEqual(result.signature_str, ida_pattern)
-            self.assertEqual(result.ida_pattern, ida_pattern)
+            self.assertEqual(result.signature_str, search_pattern)
+            self.assertEqual(result.search_pattern, search_pattern)
             self.assertEqual(result.normalized_signature, normalized)
 
     def test_search_rejects_all_wildcard_pattern(self):
@@ -1698,7 +1698,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         )
         self.assertEqual(results[0].normalized_signature, "48 8B C4")
         self.assertEqual(results[2].signature_str, "E8 ? ? ? ? 48")
-        self.assertEqual(results[2].ida_pattern, "E8 ? ? ? ? 48")
+        self.assertEqual(results[2].search_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(results[2].normalized_signature, "E8 ?? ?? ?? ?? 48")
         self.assertEqual(
             results[0].rva_for_match(sigmaker.Match(0x140001000)),
@@ -1746,7 +1746,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         find_all.assert_called_once_with("4? ?F ?? 7A", buf=None)
         self.assertEqual(results[0].raw_pattern, "4? ?F ?? 7A")
         self.assertEqual(results[0].signature_str, "4? ?F ? 7A")
-        self.assertEqual(results[0].ida_pattern, "4? ?F ? 7A")
+        self.assertEqual(results[0].search_pattern, "4? ?F ? 7A")
         self.assertEqual(results[0].normalized_signature, "4? ?F ?? 7A")
 
     def test_search_records_parse_errors_per_entry(self):
@@ -1886,7 +1886,7 @@ class TestBatchSearchFormatters(CoveredUnitTest):
         rows = list(csv.DictReader(io.StringIO(out)))
 
         self.assertEqual(rows[0]["name"], "print")
-        self.assertEqual(rows[0]["ida_pattern"], "48 8B ? 48 89")
+        self.assertEqual(rows[0]["search_pattern"], "48 8B ? 48 89")
         self.assertEqual(rows[0]["normalized_signature"], "48 8B ?? 48 89")
         self.assertEqual(rows[0]["raw_pattern"], "\\x48\\x8B\\x00\\x48\\x89 xx?xx")
         self.assertEqual(rows[0]["match_eas"], "0x140001000")
@@ -1899,7 +1899,7 @@ class TestBatchSearchFormatters(CoveredUnitTest):
         self.assertEqual(payload["imagebase"], 0x140000000)
         self.assertEqual(payload["entry_count"], 3)
         self.assertEqual(payload["entries"][0]["name"], "print")
-        self.assertEqual(payload["entries"][0]["ida_pattern"], "48 8B ? 48 89")
+        self.assertEqual(payload["entries"][0]["search_pattern"], "48 8B ? 48 89")
         self.assertEqual(
             payload["entries"][0]["normalized_signature"],
             "48 8B ?? 48 89",

@@ -2372,7 +2372,7 @@ class SearchResults:
     error: str = ""
     imagebase: typing.Optional[int] = None
     file_offsets: dict[int, int] = dataclasses.field(default_factory=dict)
-    search_signature: str = ""
+    canonical_pattern: str = ""
 
     def __post_init__(self) -> None:
         self._apply_match_metadata()
@@ -2384,7 +2384,7 @@ class SearchResults:
 
     @property
     def normalized_signature(self) -> str:
-        return self.search_signature or self.signature_str
+        return self.canonical_pattern or self.signature_str
 
     @property
     def display_name(self) -> str:
@@ -2454,33 +2454,25 @@ class SearchResults:
             return hit.rva
         if self.imagebase is None:
             return None
-        rva = int(hit) - self.imagebase
-        self._replace_match_metadata(int(hit), rva=rva)
-        return rva
+        return int(hit) - self.imagebase
 
     def file_offset_for_match(self, hit: Match) -> typing.Optional[int]:
         if hit.file_offset is not None:
             return hit.file_offset
         ea = int(hit)
         if ea in self.file_offsets:
-            file_offset = self.file_offsets[ea]
-            self._replace_match_metadata(ea, file_offset=file_offset)
-            return file_offset
+            return self.file_offsets[ea]
         file_offset = self._file_offset_for_ea(ea)
         if file_offset is not None:
             self.file_offsets[ea] = file_offset
-            self._replace_match_metadata(ea, file_offset=file_offset)
         return file_offset
 
-    def enriched_match_for(self, hit: Match) -> Match:
-        return Match(
-            int(hit),
-            rva=self.rva_for_match(hit),
-            file_offset=self.file_offset_for_match(hit),
-        )
-
     def match_record(self, hit: Match) -> dict[str, typing.Optional[int]]:
-        return self.enriched_match_for(hit).to_record()
+        return {
+            "ea": int(hit),
+            "rva": self.rva_for_match(hit),
+            "file_offset": self.file_offset_for_match(hit),
+        }
 
     def _apply_match_metadata(self) -> None:
         if self.imagebase is None and not self.file_offsets:
@@ -2499,24 +2491,6 @@ class SearchResults:
                     else self.file_offsets.get(int(hit))
                 ),
             )
-            for hit in self.matches
-        ]
-
-    def _replace_match_metadata(
-        self,
-        ea: int,
-        *,
-        rva: typing.Optional[int] = None,
-        file_offset: typing.Optional[int] = None,
-    ) -> None:
-        self.matches = [
-            Match(
-                int(hit),
-                rva=hit.rva if rva is None else rva,
-                file_offset=hit.file_offset if file_offset is None else file_offset,
-            )
-            if int(hit) == ea
-            else hit
             for hit in self.matches
         ]
 
@@ -2582,7 +2556,6 @@ class BatchSearchResults:
     results: list[SearchResults]
     source_text: str
     imagebase: typing.Optional[int] = None
-    file_offsets: dict[int, int] = dataclasses.field(default_factory=dict)
 
     def __iter__(self) -> typing.Iterator[SearchResults]:
         return iter(self.results)
@@ -2603,37 +2576,6 @@ class BatchSearchResults:
     @property
     def error_count(self) -> int:
         return sum(1 for result in self.results if result.error)
-
-    def rva_for_match(self, hit: Match) -> typing.Optional[int]:
-        if hit.rva is not None:
-            return hit.rva
-        if self.imagebase is None:
-            return None
-        return int(hit) - self.imagebase
-
-    def file_offset_for_match(self, hit: Match) -> typing.Optional[int]:
-        if hit.file_offset is not None:
-            return hit.file_offset
-        ea = int(hit)
-        if ea in self.file_offsets:
-            return self.file_offsets[ea]
-        file_offset = SearchResults._file_offset_for_ea(ea)
-        if file_offset is not None:
-            self.file_offsets[ea] = file_offset
-        return file_offset
-
-    @staticmethod
-    def _hex_or_none(value: typing.Optional[int]) -> typing.Optional[str]:
-        if value is None:
-            return None
-        return f"0x{value:X}"
-
-    def match_record(self, hit: Match) -> dict[str, typing.Optional[int]]:
-        return Match(
-            int(hit),
-            rva=self.rva_for_match(hit),
-            file_offset=self.file_offset_for_match(hit),
-        ).to_record()
 
     def format(
         self,
@@ -2707,6 +2649,12 @@ class BatchSearchFormatter(typing.Protocol):
         ...
 
 
+def _hex_or_none(value: typing.Optional[int]) -> typing.Optional[str]:
+    if value is None:
+        return None
+    return f"0x{value:X}"
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class BatchSearchTextFormatter:
     """Human-readable batch search summary."""
@@ -2714,13 +2662,13 @@ class BatchSearchTextFormatter:
     include_function_names: bool = False
     max_preview_matches: int = 3
 
-    def _format_match(self, results: BatchSearchResults, hit: Match) -> str:
+    def _format_match(self, entry: SearchResults, hit: Match) -> str:
         label = str(hit)
         details: list[str] = []
-        rva = results._hex_or_none(results.rva_for_match(hit))
+        rva = _hex_or_none(entry.rva_for_match(hit))
         if rva is not None:
             details.append(f"rva {rva}")
-        file_offset = results._hex_or_none(results.file_offset_for_match(hit))
+        file_offset = _hex_or_none(entry.file_offset_for_match(hit))
         if file_offset is not None:
             details.append(f"file {file_offset}")
         if self.include_function_names:
@@ -2737,7 +2685,7 @@ class BatchSearchTextFormatter:
             f"Batch search finished: {results.matched_count}/"
             f"{len(results)} matched, {results.error_count} error(s)",
         ]
-        imagebase = results._hex_or_none(results.imagebase)
+        imagebase = _hex_or_none(results.imagebase)
         if imagebase is not None:
             lines.append(f"Imagebase: {imagebase}")
         for entry in results:
@@ -2752,7 +2700,7 @@ class BatchSearchTextFormatter:
             if entry.matches:
                 preview_matches = entry.matches[: self.max_preview_matches]
                 preview = ", ".join(
-                    self._format_match(results, hit) for hit in preview_matches
+                    self._format_match(entry, hit) for hit in preview_matches
                 )
                 if entry.match_count > self.max_preview_matches:
                     preview += (
@@ -2770,20 +2718,20 @@ class BatchSearchCsvFormatter:
         return " | ".join(str(hit) for hit in hits)
 
     @classmethod
-    def _format_rvas(cls, results: BatchSearchResults, hits: list[Match]) -> str:
+    def _format_rvas(cls, entry: SearchResults, hits: list[Match]) -> str:
         return " | ".join(
-            results._hex_or_none(results.rva_for_match(hit)) or ""
+            _hex_or_none(entry.rva_for_match(hit)) or ""
             for hit in hits
         )
 
     @classmethod
     def _format_file_offsets(
         cls,
-        results: BatchSearchResults,
+        entry: SearchResults,
         hits: list[Match],
     ) -> str:
         return " | ".join(
-            results._hex_or_none(results.file_offset_for_match(hit)) or ""
+            _hex_or_none(entry.file_offset_for_match(hit)) or ""
             for hit in hits
         )
 
@@ -2805,10 +2753,10 @@ class BatchSearchCsvFormatter:
                     entry.search_pattern,
                     entry.normalized_signature,
                     entry.raw_pattern,
-                    results._hex_or_none(results.imagebase) or "",
+                    _hex_or_none(results.imagebase) or "",
                     self._format_matches(entry.matches),
-                    self._format_rvas(results, entry.matches),
-                    self._format_file_offsets(results, entry.matches),
+                    self._format_rvas(entry, entry.matches),
+                    self._format_file_offsets(entry, entry.matches),
                     entry.error,
                 ]
             )
@@ -3118,7 +3066,7 @@ class SignatureSearcher:
 
     def search(self) -> SearchResults:
         try:
-            sig_str, search_signature = self._parse_search_signature(
+            sig_str, canonical_pattern = self._parse_search_signature(
                 self.input_signature
             )
         except ValueError:
@@ -3131,14 +3079,14 @@ class SignatureSearcher:
             "Scanning the whole database for your pattern.\n\n"
             "Press Cancel to stop"
         ):
-            matches = self.find_all(search_signature)
+            matches = self.find_all(canonical_pattern)
 
         return SearchResults(
             matches,
             sig_str,
             raw_pattern=self.input_signature,
             imagebase=SearchResults.current_imagebase(),
-            search_signature=search_signature,
+            canonical_pattern=canonical_pattern,
         )
 
     @staticmethod
@@ -3345,7 +3293,7 @@ class BatchSignatureSearcher:
                     raw_pattern=query.raw_pattern,
                     name=query.name,
                     source_line=query.source_line,
-                    search_signature=normalized,
+                    canonical_pattern=normalized,
                 )
             except UserCanceledError:
                 raise
@@ -3375,7 +3323,6 @@ class BatchSignatureSearcher:
             results=results,
             source_text=self.input_text,
             imagebase=imagebase,
-            file_offsets=file_offsets,
         )
 
 

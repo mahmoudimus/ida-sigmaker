@@ -26,7 +26,7 @@ import idaapi
 import idc
 
 __author__ = "mahmoudimus"
-__version__ = "1.9.1"
+__version__ = "1.9.2"
 
 PLUGIN_NAME: str = "Signature Maker (py)"
 PLUGIN_VERSION: str = __version__
@@ -2265,6 +2265,8 @@ class XrefFinder:
                 # Public API: returns SignatureResult
                 result = self.signature_maker.make_signature(frm_ea, cfg_no_prompt)
                 sig: typing.Optional[Signature] = result.signature
+            except UserCanceledError:
+                break
             except Exception:
                 sig = None
 

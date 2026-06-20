@@ -1490,17 +1490,10 @@ class TestSigTextAndSignatureParsing(CoveredUnitTest):
 class TestSignatureSearcherInput(CoveredUnitTest):
     """Normal signature search owns single-pattern parse/validation policy."""
 
-    def test_parse_search_signature_normalizes_wildcards(self):
-        self.assertEqual(
-            sigmaker.SignatureSearcher.parse_search_signature("E8 ? ? ? ? 48"),
-            "E8 ?? ?? ?? ?? 48",
+    def test_searcher_does_not_expose_parser_api(self):
+        self.assertFalse(
+            hasattr(sigmaker.SignatureSearcher, "parse_search_signature")
         )
-
-    def test_parse_search_signature_rejects_invalid_patterns(self):
-        for raw in ("not-a-signature", "?? ?? ??"):
-            with self.subTest(raw=raw):
-                with self.assertRaises(ValueError):
-                    sigmaker.SignatureSearcher.parse_search_signature(raw)
 
     def test_search_results_keeps_plain_match_list_without_metadata(self):
         matches = [sigmaker.Match(0x1000)]

@@ -591,14 +591,36 @@ class SigMakerConfig:
     output_partial_on_cancel: bool = False
 
 
-@dataclasses.dataclass(slots=True, frozen=True, repr=False, eq=False)
 class Match:
     """Container for a single match.
 
     Acts like an int, but can also carry optional derived address metadata.
     """
 
-    address: int
+    __slots__ = ("_address", "_rva", "_file_offset")
+
+    def __init__(
+        self,
+        address: int,
+        *,
+        rva: typing.Optional[int] = None,
+        file_offset: typing.Optional[int] = None,
+    ) -> None:
+        self._address = address
+        self._rva = rva
+        self._file_offset = file_offset
+
+    @property
+    def address(self) -> int:
+        return self._address
+
+    @property
+    def rva(self) -> typing.Optional[int]:
+        return self._rva
+
+    @property
+    def file_offset(self) -> typing.Optional[int]:
+        return self._file_offset
 
     def __repr__(self) -> str:
         return f"Match(address={hex(self.address)})"
@@ -618,14 +640,6 @@ class Match:
 
     def __hash__(self) -> int:
         return hash((self.address,))
-
-    @property
-    def rva(self) -> typing.Optional[int]:
-        return None
-
-    @property
-    def file_offset(self) -> typing.Optional[int]:
-        return None
 
     def __format__(self, format_spec: str) -> str:
         """Format address metadata for this hit.
@@ -670,17 +684,11 @@ class Match:
         next_file_offset = self.file_offset if file_offset is None else file_offset
         if next_rva == self.rva and next_file_offset == self.file_offset:
             return self
-        return _MatchWithMetadata(
+        return Match(
             self.address,
             rva=next_rva,
             file_offset=next_file_offset,
         )
-
-    @staticmethod
-    def _repr_optional_hex(value: typing.Optional[int]) -> str:
-        if value is None:
-            return "None"
-        return hex(value)
 
     def to_record(self) -> dict[str, typing.Optional[int]]:
         return {
@@ -688,31 +696,6 @@ class Match:
             "rva": self.rva,
             "file_offset": self.file_offset,
         }
-
-
-class _MatchWithMetadata(Match):
-    """Private Match variant used when result metadata is available."""
-
-    __slots__ = ("_rva", "_file_offset")
-
-    def __init__(
-        self,
-        address: int,
-        *,
-        rva: typing.Optional[int] = None,
-        file_offset: typing.Optional[int] = None,
-    ) -> None:
-        super().__init__(address)
-        object.__setattr__(self, "_rva", rva)
-        object.__setattr__(self, "_file_offset", file_offset)
-
-    @property
-    def rva(self) -> typing.Optional[int]:
-        return self._rva
-
-    @property
-    def file_offset(self) -> typing.Optional[int]:
-        return self._file_offset
 
 
 class SignatureType(enum.Enum):

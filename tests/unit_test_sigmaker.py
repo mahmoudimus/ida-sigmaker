@@ -1514,6 +1514,24 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         self.assertEqual(repr(result.matches[0]), "Match(address=0x1000)")
         self.assertEqual(hash(result.matches[0]), hash(sigmaker.Match(0x1000)))
 
+    def test_metadata_lookup_does_not_replace_matches(self):
+        result = sigmaker.SearchResults([sigmaker.Match(0x1000)], "90")
+        original = result.matches[0]
+        result.imagebase = 0x1000
+
+        with patch.object(
+            sigmaker.SearchResults,
+            "_file_offset_for_ea",
+            return_value=0x400,
+        ):
+            self.assertEqual(result.rva_for_match(original), 0)
+            self.assertEqual(result.file_offset_for_match(original), 0x400)
+
+        self.assertIs(result.matches[0], original)
+        self.assertIsNone(result.matches[0].rva)
+        self.assertIsNone(result.matches[0].file_offset)
+        self.assertEqual(result.file_offsets[0x1000], 0x400)
+
     def test_match_metadata_keeps_address_equality_and_hash(self):
         plain = sigmaker.Match(0x1000)
         enriched = sigmaker.Match(0x1000, rva=0x100, file_offset=0x400)
@@ -1696,7 +1714,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         )
         self.assertEqual(results.imagebase, 0x140000000)
         self.assertEqual(
-            results.file_offset_for_match(sigmaker.Match(0x140001000)),
+            results[0].file_offset_for_match(sigmaker.Match(0x140001000)),
             0x401000,
         )
         self.assertEqual(results[0].normalized_signature, "48 8B C4")
@@ -1808,7 +1826,7 @@ class TestBatchSearchFormatters(CoveredUnitTest):
             source_line=1,
             imagebase=0x140000000,
             file_offsets={0x140001000: 0x401000},
-            search_signature="48 8B ?? 48 89",
+            canonical_pattern="48 8B ?? 48 89",
         )
         multi = sigmaker.SearchResults(
             matches=[sigmaker.Match(0x140002000), sigmaker.Match(0x140003000)],
@@ -1834,11 +1852,6 @@ class TestBatchSearchFormatters(CoveredUnitTest):
             [matched, multi, error],
             source_text="",
             imagebase=0x140000000,
-            file_offsets={
-                0x140001000: 0x401000,
-                0x140002000: 0x402000,
-                0x140003000: 0x403000,
-            },
         )
 
     def test_render_text_includes_names_and_statuses(self):

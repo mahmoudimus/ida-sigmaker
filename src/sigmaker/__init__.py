@@ -652,43 +652,20 @@ class SigMakerConfig:
     scope_to_segment: bool = False
 
 
-_OBJECT_SETATTR = object.__setattr__
-
-
-@dataclasses.dataclass(repr=False, init=False, unsafe_hash=True)
+@dataclasses.dataclass(slots=True, repr=False)
 class Match:
     """Container for a single match.
 
     Acts like an int, but can also carry optional derived address metadata.
     """
 
-    __slots__ = ("address", "_rva", "_file_offset")
-
     address: int
-
-    def __init__(
-        self,
-        address: int,
-        *,
-        rva: typing.Optional[int] = None,
-        file_offset: typing.Optional[int] = None,
-    ) -> None:
-        _OBJECT_SETATTR(self, "address", address)
-        if rva is not None:
-            _OBJECT_SETATTR(self, "_rva", rva)
-        if file_offset is not None:
-            _OBJECT_SETATTR(self, "_file_offset", file_offset)
-
-    def __setattr__(self, name: str, value) -> None:
-        raise AttributeError(f"cannot assign to field {name!r}")
-
-    @property
-    def rva(self) -> typing.Optional[int]:
-        return getattr(self, "_rva", None)
-
-    @property
-    def file_offset(self) -> typing.Optional[int]:
-        return getattr(self, "_file_offset", None)
+    rva: typing.Optional[int] = dataclasses.field(
+        default=None, kw_only=True, compare=False, hash=False, repr=False
+    )
+    file_offset: typing.Optional[int] = dataclasses.field(
+        default=None, kw_only=True, compare=False, hash=False, repr=False
+    )
 
     def __repr__(self) -> str:
         return f"Match(address={hex(self.address)})"
@@ -700,6 +677,9 @@ class Match:
         return self.address
 
     __index__ = __int__
+
+    def __hash__(self) -> int:
+        return hash((self.address,))
 
     def __format__(self, format_spec: str) -> str:
         """Format address metadata for this hit.

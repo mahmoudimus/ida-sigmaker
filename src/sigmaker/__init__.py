@@ -2390,7 +2390,12 @@ class XrefFinder:
 
 @dataclasses.dataclass(slots=True)
 class SearchResults:
-    """Result container for one signature search operation."""
+    """Result container for one signature search operation.
+
+    ``signature_str`` is kept for compatibility. New code should use
+    ``ida_pattern`` for the parsed IDA search-pattern form and
+    ``raw_pattern`` for the exact extracted user input.
+    """
 
     matches: list[Match]
     signature_str: str
@@ -2404,6 +2409,11 @@ class SearchResults:
 
     def __post_init__(self) -> None:
         self._apply_match_metadata()
+
+    @property
+    def ida_pattern(self) -> str:
+        """Parsed IDA search-pattern form, e.g. ``48 8B ? 48 89``."""
+        return self.signature_str
 
     @property
     def normalized_signature(self) -> str:
@@ -2542,6 +2552,7 @@ class SearchResults:
             "name": self.name,
             "source_line": self.source_line,
             "raw_pattern": self.raw_pattern,
+            "ida_pattern": self.ida_pattern,
             "normalized_signature": self.normalized_signature,
             "status": self.status,
             "match_count": self.match_count,
@@ -2762,7 +2773,7 @@ class BatchSearchTextFormatter:
                 continue
             lines.append(
                 f"[{label}] {entry.match_count} match(es) for "
-                f"{entry.normalized_signature}"
+                f"{entry.ida_pattern}"
             )
             if entry.matches:
                 preview_matches = entry.matches[: self.max_preview_matches]
@@ -2805,8 +2816,9 @@ class BatchSearchCsvFormatter:
     def format(self, results: BatchSearchResults) -> str:
         output = io.StringIO()
         output.write(
-            "name,source_line,status,match_count,normalized_signature,"
-            "raw_pattern,imagebase,match_eas,match_rvas,match_file_offsets,error\n"
+            "name,source_line,status,match_count,ida_pattern,"
+            "normalized_signature,raw_pattern,imagebase,match_eas,match_rvas,"
+            "match_file_offsets,error\n"
         )
         writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
         for entry in results:
@@ -2816,6 +2828,7 @@ class BatchSearchCsvFormatter:
                     entry.source_line,
                     entry.status,
                     entry.match_count,
+                    entry.ida_pattern,
                     entry.normalized_signature,
                     entry.raw_pattern,
                     results._hex_or_none(results.imagebase) or "",

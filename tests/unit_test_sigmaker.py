@@ -1539,7 +1539,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
             ).search()
 
         find_all.assert_called_once_with("E8 ?? ?? ?? ?? 48")
-        self.assertEqual(result.signature_str, "E8 ?? ?? ?? ?? 48")
+        self.assertEqual(result.signature_str, "E8 ? ? ? ? 48")
         self.assertEqual(result.normalized_signature, "E8 ?? ?? ?? ?? 48")
         self.assertEqual(result.raw_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(result.status, "matched")
@@ -1548,6 +1548,25 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         self.assertEqual(result.rva_for_match(sigmaker.Match(0x1000)), 0)
         self.assertEqual(result.matches[0], sigmaker.Match(0x1000))
         self.assertEqual(result.matches[0].rva, 0)
+
+    def test_search_preserves_legacy_signature_string(self):
+        cases = (
+            "48 8B ? 48 89",
+            "\\x48\\x8B\\x00\\x48\\x89 xx?xx",
+            "0x48, 0x8B, 0x00, 0x48, 0x89 0b11011",
+        )
+
+        for raw in cases:
+            with self.subTest(raw=raw), patch.object(
+                sigmaker.SignatureSearcher,
+                "find_all",
+                return_value=[sigmaker.Match(0x1000)],
+            ) as find_all:
+                result = sigmaker.SignatureSearcher.from_signature(raw).search()
+
+            find_all.assert_called_once_with("48 8B ?? 48 89")
+            self.assertEqual(result.signature_str, "48 8B ? 48 89")
+            self.assertEqual(result.normalized_signature, "48 8B ?? 48 89")
 
     def test_search_rejects_all_wildcard_pattern(self):
         with patch.object(sigmaker.idaapi, "msg") as msg, patch.object(

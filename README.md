@@ -334,19 +334,30 @@ class LabelFormatter:
 
 After registration, `results.format("labels")` uses the formatter by name, and exporting to `something.labels` uses it by suffix. Formatter classes are instantiated once at registration time; formatter objects can be registered the same way.
 
-To install a formatter permanently, put it somewhere IDA can import it and import it from `idapythonrc.py` in your IDA user directory. IDA sources that file during startup. For example:
+To install a formatter permanently, paste the formatter registration code into `idapythonrc.py` in your IDA user directory. IDA sources that file during startup, so the formatter is available in each new IDA session. For example:
 
 ```python
 # $IDAUSR/idapythonrc.py
-import sys
+import sigmaker
 
-sys.path.append("/path/to/ida-sigmaker/examples")
-import batch_search_c_formatter  # registers the "c" formatter
+
+@sigmaker.BatchSearchFormatter.register("labels", suffixes=(".labels",))
+class LabelFormatter:
+    def format(self, results: sigmaker.BatchSearchResults) -> str:
+        lines = []
+        for result in results:
+            if len(result.matches) != 1:
+                continue
+            name = result.name or result.display_name
+            hit = result.matches[0]
+            address = f"{hit:rva}" if hit.rva is not None else f"{hit:ea}"
+            lines.append(f"{name}: {address}")
+        return "\n".join(lines) + "\n"
 ```
 
-If `sigmaker` is not already importable from your IDA Python environment, add the SigMaker plugin directory to `sys.path` before importing the formatter.
+If `sigmaker` is not already importable from your IDA Python environment, add the SigMaker plugin directory to `sys.path` before the formatter code.
 
-See [`examples/batch_search_c_formatter.py`](./examples/batch_search_c_formatter.py) for a complete C-style formatter that emits absolute EAs, RVAs, and file offsets while keeping C output out of the built-in format list.
+See [`examples/batch_search_c_formatter.py`](./examples/batch_search_c_formatter.py) for a complete C-style formatter template that emits absolute EAs, RVAs, and file offsets while keeping C output out of the built-in format list.
 
 ### Stability contract
 

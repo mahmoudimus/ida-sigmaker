@@ -1518,12 +1518,15 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         plain = sigmaker.Match(0x1000)
         enriched = plain.with_metadata(rva=0x100, file_offset=0x400)
 
+        self.assertIs(type(enriched), sigmaker.Match)
         self.assertEqual(enriched, plain)
         self.assertEqual(hash(enriched), hash(plain))
         self.assertEqual(str(enriched), "0x1000")
         self.assertEqual(repr(enriched), "Match(address=0x1000)")
         self.assertEqual(f"{enriched:rva}", "0x100")
         self.assertEqual(f"{enriched:fileoffset}", "0x400")
+        with self.assertRaises(AttributeError):
+            enriched.rva = 0x200
 
     def test_search_uses_canonical_signature(self):
         with patch.object(

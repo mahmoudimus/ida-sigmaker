@@ -3158,18 +3158,6 @@ class SignatureSearcher:
         return cls(input_signature=input_signature)
 
     @staticmethod
-    def parse_search_signature(input_signature: str) -> str:
-        """Parse and canonicalize one searchable signature.
-
-        This is the shared single-signature policy used by both the normal
-        search action and batch search. Batch parsing may extract names or
-        split multiple statements first, but the actual searchable pattern is
-        validated here.
-        """
-        _, normalized = SignatureSearcher._parse_search_signature(input_signature)
-        return normalized
-
-    @staticmethod
     def _parse_search_signature(input_signature: str) -> tuple[str, str]:
         """Return the display signature and canonical search signature."""
         try:

@@ -308,7 +308,7 @@ results.display(output=buf, formatter="json")
 payload = buf.getvalue()
 ```
 
-The built-in batch formats are `text`, `csv`, and `json`. Export suffix lookup uses `batch_search_formatter_for_path(path)`, so `.txt`, `.csv`, and `.json` select the matching built-in formatter. Loadable formatter examples live in [`examples/`](./examples/); copy one into your IDA user startup file or import it from there to register project-specific formats.
+The built-in batch formats are `text`, `csv`, and `json`. Export suffix lookup uses `batch_search_formatter_for_path(path)`, so `.txt`, `.csv`, and `.json` select the matching built-in formatter. Loadable formatter examples live in [`examples/`](./examples/).
 
 ### Custom batch search formatters
 
@@ -333,6 +333,18 @@ class LabelFormatter:
 ```
 
 After registration, `results.format("labels")` uses the formatter by name, and exporting to `something.labels` uses it by suffix. Formatter classes are instantiated once at registration time; formatter objects can be registered the same way.
+
+To install a formatter permanently, put it somewhere IDA can import it and import it from `idapythonrc.py` in your IDA user directory. IDA sources that file during startup. For example:
+
+```python
+# $IDAUSR/idapythonrc.py
+import sys
+
+sys.path.append("/path/to/ida-sigmaker/examples")
+import batch_search_c_formatter  # registers the "c" formatter
+```
+
+If `sigmaker` is not already importable from your IDA Python environment, add the SigMaker plugin directory to `sys.path` before importing the formatter.
 
 See [`examples/batch_search_c_formatter.py`](./examples/batch_search_c_formatter.py) for a complete C-style formatter that emits absolute EAs, RVAs, and file offsets while keeping C output out of the built-in format list.
 

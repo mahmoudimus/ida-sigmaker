@@ -652,7 +652,7 @@ class SigMakerConfig:
     scope_to_segment: bool = False
 
 
-@dataclasses.dataclass(slots=True, repr=False)
+@dataclasses.dataclass(slots=True, frozen=True, repr=False)
 class Match:
     """Container for a single match.
 

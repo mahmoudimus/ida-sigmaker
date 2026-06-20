@@ -1537,6 +1537,10 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         self.assertEqual(repr(enriched), "Match(address=0x1000)")
         self.assertEqual(f"{enriched:rva}", "0x100")
         self.assertEqual(f"{enriched:fileoffset}", "0x400")
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            enriched.rva = 0x200
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            enriched.address = 0x2000
 
     def test_search_uses_canonical_signature(self):
         with patch.object(

@@ -1,8 +1,15 @@
 """Example: register a C-style batch search formatter from IDA Python.
 
-Drop this into an IDA user startup script after sigmaker is importable, or paste
-it into IDA's Python console after loading the plugin. It adds `.c` and `.h`
-export handling without making C output a built-in sigmaker format.
+For a persistent install, place this file somewhere IDA can import it and add
+``import batch_search_c_formatter`` to ``idapythonrc.py`` in your IDA user
+directory (``$IDAUSR/idapythonrc.py``). IDA sources that file during startup.
+
+If SigMaker is not already importable from IDA Python, add the SigMaker plugin
+directory to ``sys.path`` before importing this module. You can also paste this
+file into IDA's Python console after loading the plugin.
+
+Importing this module registers `.c`, `.h`, `.hpp`, and `.cpp` export handling
+without making C output a built-in sigmaker format.
 """
 
 import re

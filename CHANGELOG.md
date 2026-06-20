@@ -2,6 +2,14 @@
 
 All notable user-visible changes to this plugin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.9.2] - 2026-06-19
+
+### Fixed
+
+- **Canceling XREF signature generation now stops the XREF loop and keeps completed results.** If Cancel fired while one per-xref signature was being generated, `UserCanceledError` was caught as a generic per-candidate failure and the loop moved on to the next xref. XREF generation now stops immediately and prints the complete xref signatures found so far. This does not touch the SIMD speedup paths. ([#55](https://github.com/mahmoudimus/ida-sigmaker/issues/55), [#56](https://github.com/mahmoudimus/ida-sigmaker/pull/56))
+
+[1.9.2]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.9.1...v1.9.2
+
 ## [1.9.1] - 2026-05-30
 
 ### Added

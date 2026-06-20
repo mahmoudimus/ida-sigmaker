@@ -2515,7 +2515,7 @@ class SearchResults:
     """Result container for one signature search operation.
 
     ``signature_str`` is kept for compatibility. New code should use
-    ``ida_pattern`` for the parsed IDA search-pattern form and
+    ``search_pattern`` for the parsed SigMaker search pattern and
     ``raw_pattern`` for the exact extracted user input.
     """
 
@@ -2533,8 +2533,8 @@ class SearchResults:
         self._apply_match_metadata()
 
     @property
-    def ida_pattern(self) -> str:
-        """Parsed IDA search-pattern form, e.g. ``48 8B ? 48 89``."""
+    def search_pattern(self) -> str:
+        """Parsed SigMaker search pattern, e.g. ``48 8B ? 4? ?F``."""
         return self.signature_str
 
     @property
@@ -2674,7 +2674,7 @@ class SearchResults:
             "name": self.name,
             "source_line": self.source_line,
             "raw_pattern": self.raw_pattern,
-            "ida_pattern": self.ida_pattern,
+            "search_pattern": self.search_pattern,
             "normalized_signature": self.normalized_signature,
             "status": self.status,
             "match_count": self.match_count,
@@ -2895,7 +2895,7 @@ class BatchSearchTextFormatter:
                 continue
             lines.append(
                 f"[{label}] {entry.match_count} match(es) for "
-                f"{entry.ida_pattern}"
+                f"{entry.search_pattern}"
             )
             if entry.matches:
                 preview_matches = entry.matches[: self.max_preview_matches]
@@ -2938,7 +2938,7 @@ class BatchSearchCsvFormatter:
     def format(self, results: BatchSearchResults) -> str:
         output = io.StringIO()
         output.write(
-            "name,source_line,status,match_count,ida_pattern,"
+            "name,source_line,status,match_count,search_pattern,"
             "normalized_signature,raw_pattern,imagebase,match_eas,match_rvas,"
             "match_file_offsets,error\n"
         )
@@ -2950,7 +2950,7 @@ class BatchSearchCsvFormatter:
                     entry.source_line,
                     entry.status,
                     entry.match_count,
-                    entry.ida_pattern,
+                    entry.search_pattern,
                     entry.normalized_signature,
                     entry.raw_pattern,
                     results._hex_or_none(results.imagebase) or "",
@@ -3140,8 +3140,9 @@ class SignatureParser:
       - 0x-prefixed run: "0x48 0x8B 0x05 ..." or "0x488B05..."
       - Loose hex:       "48 8B 05 ? ? 00"
 
-    Output is an IDA-style signature string (space-separated; '?' for wildcards),
-    or an empty string on failure.
+    Output is a SigMaker search pattern string (space-separated, '?' for
+    full-byte wildcards, nibble wildcards preserved), or an empty string on
+    failure.
     """
 
     _ESCAPED_HEX = re.compile(r"\\x[0-9A-Fa-f]{2}")

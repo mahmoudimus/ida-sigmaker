@@ -1674,6 +1674,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             0x401000,
         )
         self.assertEqual(results[0].normalized_signature, "48 8B C4")
+        self.assertEqual(results[2].signature_str, "E8 ? ? ? ? 48")
         self.assertEqual(results[2].normalized_signature, "E8 ?? ?? ?? ?? 48")
         self.assertEqual(
             results[0].rva_for_match(sigmaker.Match(0x140001000)),

@@ -3505,7 +3505,7 @@ class BatchSignatureSearcher:
 
         for query in queries:
             try:
-                normalized = SignatureSearcher.parse_search_signature(
+                signature_str, normalized = SignatureSearcher._parse_search_signature(
                     query.raw_pattern
                 )
 
@@ -3516,10 +3516,11 @@ class BatchSignatureSearcher:
 
                 result = SearchResults(
                     matches=list(matches),
-                    signature_str=normalized,
+                    signature_str=signature_str,
                     raw_pattern=query.raw_pattern,
                     name=query.name,
                     source_line=query.source_line,
+                    search_signature=normalized,
                 )
             except UserCanceledError:
                 raise

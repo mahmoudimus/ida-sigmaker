@@ -1529,6 +1529,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         plain = sigmaker.Match(0x1000)
         enriched = sigmaker.Match(0x1000, rva=0x100, file_offset=0x400)
 
+        self.assertTrue(dataclasses.is_dataclass(sigmaker.Match))
         self.assertIs(type(enriched), sigmaker.Match)
         self.assertEqual(enriched, plain)
         self.assertEqual(hash(enriched), hash(plain))

@@ -10,9 +10,12 @@ from __future__ import annotations
 import array
 import contextlib
 import contextvars
+import csv
 import dataclasses
 import enum
 import functools
+import io
+import json
 import logging
 import os
 import pathlib
@@ -588,11 +591,11 @@ class SigMakerConfig:
     output_partial_on_cancel: bool = False
 
 
-@dataclasses.dataclass(slots=True, frozen=True, repr=False)
+@dataclasses.dataclass(slots=True, frozen=True, repr=False, eq=False)
 class Match:
     """Container for a single match.
 
-    Acts like an int, but provides a more readable representation.
+    Acts like an int, but can also carry optional derived address metadata.
     """
 
     address: int
@@ -607,6 +610,109 @@ class Match:
         return self.address
 
     __index__ = __int__
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, Match):
+            return self.address == other.address
+        return NotImplemented
+
+    def __hash__(self) -> int:
+        return hash((self.address,))
+
+    @property
+    def rva(self) -> typing.Optional[int]:
+        return None
+
+    @property
+    def file_offset(self) -> typing.Optional[int]:
+        return None
+
+    def __format__(self, format_spec: str) -> str:
+        """Format address metadata for this hit.
+
+        Supported named fields:
+            - '' / 'ea' / 'address': effective address
+            - 'rva': imagebase-relative offset
+            - 'fileoffset' / 'file_offset' / 'file': input-file offset
+
+        A nested integer format can follow a colon, e.g. ``rva:x``. If a
+        requested optional field is unavailable, formatting returns
+        ``repr(self)`` so output still shows the hit EA.
+        """
+        if not format_spec:
+            return str(self)
+
+        field, separator, nested_spec = format_spec.partition(":")
+        normalized = field.lower().replace("_", "").replace("-", "")
+        value: typing.Optional[int]
+        if normalized in {"ea", "address"}:
+            value = self.address
+        elif normalized == "rva":
+            value = self.rva
+        elif normalized in {"fileoffset", "file"}:
+            value = self.file_offset
+        else:
+            return format(self.address, format_spec)
+
+        if value is None:
+            return repr(self)
+        if separator:
+            return format(value, nested_spec)
+        return f"0x{value:X}"
+
+    def with_metadata(
+        self,
+        *,
+        rva: typing.Optional[int] = None,
+        file_offset: typing.Optional[int] = None,
+    ) -> "Match":
+        next_rva = self.rva if rva is None else rva
+        next_file_offset = self.file_offset if file_offset is None else file_offset
+        if next_rva == self.rva and next_file_offset == self.file_offset:
+            return self
+        return _MatchWithMetadata(
+            self.address,
+            rva=next_rva,
+            file_offset=next_file_offset,
+        )
+
+    @staticmethod
+    def _repr_optional_hex(value: typing.Optional[int]) -> str:
+        if value is None:
+            return "None"
+        return hex(value)
+
+    def to_record(self) -> dict[str, typing.Optional[int]]:
+        return {
+            "ea": self.address,
+            "rva": self.rva,
+            "file_offset": self.file_offset,
+        }
+
+
+class _MatchWithMetadata(Match):
+    """Private Match variant used when result metadata is available."""
+
+    __slots__ = ("_rva", "_file_offset")
+
+    def __init__(
+        self,
+        address: int,
+        *,
+        rva: typing.Optional[int] = None,
+        file_offset: typing.Optional[int] = None,
+    ) -> None:
+        super().__init__(address)
+        object.__setattr__(self, "_rva", rva)
+        object.__setattr__(self, "_file_offset", file_offset)
+
+    @property
+    def rva(self) -> typing.Optional[int]:
+        return self._rva
+
+    @property
+    def file_offset(self) -> typing.Optional[int]:
+        return self._file_offset
 
 
 class SignatureType(enum.Enum):
@@ -628,7 +734,7 @@ class Action(enum.IntEnum):
 
     Values are bound to the rAction radio-group order:
     ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature",
-     "rFindFunctionSig").
+     "rFindFunctionSig", "rBatchSearchSignatures").
     Changing values requires updating the radio group too.
     """
 
@@ -637,6 +743,7 @@ class Action(enum.IntEnum):
     COPY_RANGE = 2
     SEARCH = 3
     FIND_FUNCTION_SIG = 4
+    BATCH_SEARCH = 5
 
 
 class GenerationStatus(enum.Enum):
@@ -2283,14 +2390,174 @@ class XrefFinder:
 
 @dataclasses.dataclass(slots=True)
 class SearchResults:
-    """Result container for signature search operations."""
+    """Result container for one signature search operation."""
 
     matches: list[Match]
     signature_str: str
+    raw_pattern: str = ""
+    name: str = ""
+    source_line: int = 0
+    error: str = ""
+    imagebase: typing.Optional[int] = None
+    file_offsets: dict[int, int] = dataclasses.field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        self._apply_match_metadata()
+
+    @property
+    def normalized_signature(self) -> str:
+        return self.signature_str
+
+    @property
+    def display_name(self) -> str:
+        if self.name:
+            return self.name
+        if self.source_line:
+            return f"Pattern line {self.source_line}"
+        return "Pattern"
+
+    @property
+    def status(self) -> str:
+        if self.error:
+            return "error"
+        if self.matches:
+            return "matched"
+        return "no_matches"
+
+    @property
+    def match_count(self) -> int:
+        return len(self.matches)
+
+    @staticmethod
+    def current_imagebase(
+        buf: typing.Optional["InMemoryBuffer"] = None,
+    ) -> typing.Optional[int]:
+        if buf is not None:
+            imagebase = getattr(buf, "imagebase", None)
+            if isinstance(imagebase, int):
+                return imagebase
+        with contextlib.suppress(BaseException):
+            imagebase = idaapi.get_imagebase()
+            if isinstance(imagebase, int):
+                return imagebase
+        return None
+
+    @staticmethod
+    def _file_offset_for_ea(ea: int) -> typing.Optional[int]:
+        for provider in (idaapi, idc):
+            get_fileregion_offset = getattr(provider, "get_fileregion_offset", None)
+            if not callable(get_fileregion_offset):
+                continue
+            with contextlib.suppress(BaseException):
+                file_offset = get_fileregion_offset(ea)
+                badaddr = getattr(idaapi, "BADADDR", None)
+                if (
+                    isinstance(file_offset, int)
+                    and file_offset >= 0
+                    and not (isinstance(badaddr, int) and file_offset == badaddr)
+                ):
+                    return file_offset
+        return None
+
+    @classmethod
+    def file_offsets_for_matches(cls, hits: list[Match]) -> dict[int, int]:
+        file_offsets: dict[int, int] = {}
+        for hit in hits:
+            ea = int(hit)
+            if ea in file_offsets:
+                continue
+            file_offset = cls._file_offset_for_ea(ea)
+            if file_offset is not None:
+                file_offsets[ea] = file_offset
+        return file_offsets
+
+    def rva_for_match(self, hit: Match) -> typing.Optional[int]:
+        if hit.rva is not None:
+            return hit.rva
+        if self.imagebase is None:
+            return None
+        rva = int(hit) - self.imagebase
+        self._replace_match_metadata(int(hit), rva=rva)
+        return rva
+
+    def file_offset_for_match(self, hit: Match) -> typing.Optional[int]:
+        if hit.file_offset is not None:
+            return hit.file_offset
+        ea = int(hit)
+        if ea in self.file_offsets:
+            file_offset = self.file_offsets[ea]
+            self._replace_match_metadata(ea, file_offset=file_offset)
+            return file_offset
+        file_offset = self._file_offset_for_ea(ea)
+        if file_offset is not None:
+            self.file_offsets[ea] = file_offset
+            self._replace_match_metadata(ea, file_offset=file_offset)
+        return file_offset
+
+    def enriched_match_for(self, hit: Match) -> Match:
+        return hit.with_metadata(
+            rva=self.rva_for_match(hit),
+            file_offset=self.file_offset_for_match(hit),
+        )
+
+    def match_record(self, hit: Match) -> dict[str, typing.Optional[int]]:
+        return self.enriched_match_for(hit).to_record()
+
+    def _apply_match_metadata(self) -> None:
+        if self.imagebase is None and not self.file_offsets:
+            return
+        self.matches = [
+            hit.with_metadata(
+                rva=(
+                    hit.rva
+                    if hit.rva is not None or self.imagebase is None
+                    else int(hit) - self.imagebase
+                ),
+                file_offset=(
+                    hit.file_offset
+                    if hit.file_offset is not None
+                    else self.file_offsets.get(int(hit))
+                ),
+            )
+            for hit in self.matches
+        ]
+
+    def _replace_match_metadata(
+        self,
+        ea: int,
+        *,
+        rva: typing.Optional[int] = None,
+        file_offset: typing.Optional[int] = None,
+    ) -> None:
+        self.matches = [
+            hit.with_metadata(rva=rva, file_offset=file_offset)
+            if int(hit) == ea
+            else hit
+            for hit in self.matches
+        ]
+
+    def to_record(self) -> dict[str, typing.Any]:
+        return {
+            "name": self.name,
+            "source_line": self.source_line,
+            "raw_pattern": self.raw_pattern,
+            "normalized_signature": self.normalized_signature,
+            "status": self.status,
+            "match_count": self.match_count,
+            "imagebase": self.imagebase,
+            "matches": [
+                self.match_record(hit) for hit in self.matches
+            ],
+            "error": self.error,
+        }
 
     def display(self) -> None:
         """Display the search results to the user."""
         idaapi.msg(f"Signature: {self.signature_str}\n")
+
+        if self.error:
+            idaapi.msg(f"Error: {self.error}\n")
+            return
 
         if not self.matches:
             idaapi.msg("Signature does not match!\n")
@@ -2304,6 +2571,428 @@ class SearchResults:
                 idaapi.msg(f"Match @ {ea} in {fn_name}\n")
             else:
                 idaapi.msg(f"Match @ {ea}\n")
+
+
+@dataclasses.dataclass(slots=True, frozen=True)
+class BatchSignatureQuery:
+    """One raw pattern from a pasted batch search input."""
+
+    raw_pattern: str
+    name: str = ""
+    source_line: int = 0
+
+    @property
+    def display_name(self) -> str:
+        if self.name:
+            return self.name
+        if self.source_line:
+            return f"Pattern line {self.source_line}"
+        return "Pattern"
+
+
+@dataclasses.dataclass(slots=True)
+class BatchSearchResults:
+    """Result container for batch signature searches."""
+
+    results: list[SearchResults]
+    source_text: str
+    imagebase: typing.Optional[int] = None
+    file_offsets: dict[int, int] = dataclasses.field(default_factory=dict)
+
+    def __iter__(self) -> typing.Iterator[SearchResults]:
+        return iter(self.results)
+
+    def __len__(self) -> int:
+        return len(self.results)
+
+    def __getitem__(
+        self,
+        index: typing.Union[int, slice],
+    ) -> typing.Union[SearchResults, list[SearchResults]]:
+        return self.results[index]
+
+    @property
+    def matched_count(self) -> int:
+        return sum(1 for result in self.results if result.matches)
+
+    @property
+    def error_count(self) -> int:
+        return sum(1 for result in self.results if result.error)
+
+    def rva_for_match(self, hit: Match) -> typing.Optional[int]:
+        if hit.rva is not None:
+            return hit.rva
+        if self.imagebase is None:
+            return None
+        return int(hit) - self.imagebase
+
+    def file_offset_for_match(self, hit: Match) -> typing.Optional[int]:
+        if hit.file_offset is not None:
+            return hit.file_offset
+        ea = int(hit)
+        if ea in self.file_offsets:
+            return self.file_offsets[ea]
+        file_offset = SearchResults._file_offset_for_ea(ea)
+        if file_offset is not None:
+            self.file_offsets[ea] = file_offset
+        return file_offset
+
+    @staticmethod
+    def _hex_or_none(value: typing.Optional[int]) -> typing.Optional[str]:
+        if value is None:
+            return None
+        return f"0x{value:X}"
+
+    def match_record(self, hit: Match) -> dict[str, typing.Optional[int]]:
+        return hit.with_metadata(
+            rva=self.rva_for_match(hit),
+            file_offset=self.file_offset_for_match(hit),
+        ).to_record()
+
+    def format(
+        self,
+        formatter: typing.Optional[
+            typing.Union[str, "BatchSearchFormatter"]
+        ] = None,
+    ) -> str:
+        formatter = batch_search_formatter(formatter)
+        return formatter.format(self)
+
+    def display(
+        self,
+        output: typing.Optional[
+            typing.Union[typing.TextIO, typing.Callable[[str], typing.Any]]
+        ] = None,
+        formatter: typing.Optional[
+            typing.Union[str, "BatchSearchFormatter"]
+        ] = None,
+    ) -> None:
+        formatter = formatter or BatchSearchTextFormatter(include_function_names=True)
+        text = batch_search_formatter(formatter).format(self)
+        if output is None:
+            idaapi.msg(text)
+            return
+
+        writer = getattr(output, "write", None)
+        if writer is not None:
+            writer(text)
+            return
+        output(text)
+
+    def to_record(self) -> dict[str, typing.Any]:
+        return {
+            "entry_count": len(self.results),
+            "matched_count": self.matched_count,
+            "error_count": self.error_count,
+            "imagebase": self.imagebase,
+            "entries": [
+                result.to_record()
+                for result in self.results
+            ],
+        }
+
+
+class BatchSearchFormatter(typing.Protocol):
+    """Protocol for objects that can format batch search results."""
+
+    @classmethod
+    def register(
+        cls,
+        name: str,
+        suffixes: typing.Iterable[str] = (),
+    ) -> typing.Callable[[typing.Any], typing.Any]:
+        """Register a batch formatter class or formatter object.
+
+        Used as:
+            @BatchSearchFormatter.register("myfmt", suffixes=(".mine",))
+            class MyFormatter:
+                def format(self, results): ...
+        """
+
+        def decorator(formatter: typing.Any) -> typing.Any:
+            instance = formatter() if isinstance(formatter, type) else formatter
+            _register_batch_search_formatter(name, instance, suffixes)
+            return formatter
+
+        return decorator
+
+    def format(self, results: BatchSearchResults) -> str:
+        """Format the given batch search results."""
+        ...
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class BatchSearchTextFormatter:
+    """Human-readable batch search summary."""
+
+    include_function_names: bool = False
+    max_preview_matches: int = 3
+
+    def _format_match(self, results: BatchSearchResults, hit: Match) -> str:
+        label = str(hit)
+        details: list[str] = []
+        rva = results._hex_or_none(results.rva_for_match(hit))
+        if rva is not None:
+            details.append(f"rva {rva}")
+        file_offset = results._hex_or_none(results.file_offset_for_match(hit))
+        if file_offset is not None:
+            details.append(f"file {file_offset}")
+        if self.include_function_names:
+            with contextlib.suppress(BaseException):
+                fn_name = idaapi.get_func_name(int(hit))
+                if fn_name:
+                    details.append(fn_name)
+        if details:
+            return f"{label} ({', '.join(details)})"
+        return label
+
+    def format(self, results: BatchSearchResults) -> str:
+        lines = [
+            f"Batch search finished: {results.matched_count}/"
+            f"{len(results)} matched, {results.error_count} error(s)",
+        ]
+        imagebase = results._hex_or_none(results.imagebase)
+        if imagebase is not None:
+            lines.append(f"Imagebase: {imagebase}")
+        for entry in results:
+            label = entry.display_name
+            if entry.error:
+                lines.append(f"[{label}] ERROR: {entry.error}")
+                continue
+            lines.append(
+                f"[{label}] {entry.match_count} match(es) for "
+                f"{entry.normalized_signature}"
+            )
+            if entry.matches:
+                preview_matches = entry.matches[: self.max_preview_matches]
+                preview = ", ".join(
+                    self._format_match(results, hit) for hit in preview_matches
+                )
+                if entry.match_count > self.max_preview_matches:
+                    preview += (
+                        f", ... (+{entry.match_count - self.max_preview_matches} more)"
+                    )
+                lines.append(f"  {preview}")
+        return "\n".join(lines).rstrip() + "\n"
+
+
+class BatchSearchCsvFormatter:
+    """CSV batch search result renderer."""
+
+    @classmethod
+    def _format_matches(cls, hits: list[Match]) -> str:
+        return " | ".join(str(hit) for hit in hits)
+
+    @classmethod
+    def _format_rvas(cls, results: BatchSearchResults, hits: list[Match]) -> str:
+        return " | ".join(
+            results._hex_or_none(results.rva_for_match(hit)) or ""
+            for hit in hits
+        )
+
+    @classmethod
+    def _format_file_offsets(
+        cls,
+        results: BatchSearchResults,
+        hits: list[Match],
+    ) -> str:
+        return " | ".join(
+            results._hex_or_none(results.file_offset_for_match(hit)) or ""
+            for hit in hits
+        )
+
+    def format(self, results: BatchSearchResults) -> str:
+        output = io.StringIO()
+        output.write(
+            "name,source_line,status,match_count,normalized_signature,"
+            "raw_pattern,imagebase,match_eas,match_rvas,match_file_offsets,error\n"
+        )
+        writer = csv.writer(output, quoting=csv.QUOTE_ALL, lineterminator="\n")
+        for entry in results:
+            writer.writerow(
+                [
+                    entry.name,
+                    entry.source_line,
+                    entry.status,
+                    entry.match_count,
+                    entry.normalized_signature,
+                    entry.raw_pattern,
+                    results._hex_or_none(results.imagebase) or "",
+                    self._format_matches(entry.matches),
+                    self._format_rvas(results, entry.matches),
+                    self._format_file_offsets(results, entry.matches),
+                    entry.error,
+                ]
+            )
+        return output.getvalue()
+
+
+class BatchSearchJsonFormatter:
+    """JSON batch search result renderer."""
+
+    def format(self, results: BatchSearchResults) -> str:
+        return json.dumps(results.to_record(), indent=2, ensure_ascii=True) + "\n"
+
+
+BATCH_SEARCH_FORMATTERS: dict[str, BatchSearchFormatter] = {}
+BATCH_SEARCH_FORMAT_SUFFIXES: dict[str, str] = {}
+
+
+def _register_batch_search_formatter(
+    name: str,
+    formatter: BatchSearchFormatter,
+    suffixes: typing.Iterable[str] = (),
+) -> None:
+    normalized_name = name.strip().lower()
+    if not normalized_name:
+        raise ValueError("Batch search formatter name cannot be empty")
+    BATCH_SEARCH_FORMATTERS[normalized_name] = formatter
+    for suffix in suffixes:
+        normalized_suffix = suffix.strip().lower()
+        if not normalized_suffix:
+            continue
+        if not normalized_suffix.startswith("."):
+            normalized_suffix = "." + normalized_suffix
+        BATCH_SEARCH_FORMAT_SUFFIXES[normalized_suffix] = normalized_name
+
+
+def batch_search_formatter(
+    formatter: typing.Optional[typing.Union[str, BatchSearchFormatter]] = None,
+) -> BatchSearchFormatter:
+    if formatter is None:
+        return BATCH_SEARCH_FORMATTERS["text"]
+    if not isinstance(formatter, str):
+        return formatter
+    name = formatter.strip().lower()
+    try:
+        return BATCH_SEARCH_FORMATTERS[name]
+    except KeyError:
+        raise ValueError(f"Unknown batch search format: {formatter}") from None
+
+
+_register_batch_search_formatter("text", BatchSearchTextFormatter(), suffixes=(".txt",))
+_register_batch_search_formatter("csv", BatchSearchCsvFormatter(), suffixes=(".csv",))
+_register_batch_search_formatter("json", BatchSearchJsonFormatter(), suffixes=(".json",))
+
+
+def batch_search_formatter_for_path(path: pathlib.Path) -> BatchSearchFormatter:
+    format_name = BATCH_SEARCH_FORMAT_SUFFIXES.get(path.suffix.lower(), "text")
+    return batch_search_formatter(format_name)
+
+
+class BatchSignatureParser:
+    """Parse a pasted list of named or unnamed signature patterns."""
+
+    _FENCE_RE = re.compile(r"^```")
+    _ASSIGNMENT_RE = re.compile(r"(.+?)(?:[:=])\s*(.+)$")
+    _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
+
+    @classmethod
+    def parse_many(cls, text: str) -> list[BatchSignatureQuery]:
+        queries: list[BatchSignatureQuery] = []
+        for source_line, statement in cls._split_statements(text):
+            query = cls._parse_statement(statement, source_line)
+            if query is not None:
+                queries.append(query)
+        return queries
+
+    @classmethod
+    def _split_statements(cls, text: str) -> list[tuple[int, str]]:
+        statements: list[tuple[int, str]] = []
+        current: list[str] = []
+        start_line = 1
+        line_number = 1
+        in_quote = False
+        escaped = False
+
+        for ch in text:
+            if not current and ch.isspace():
+                if ch == "\n":
+                    line_number += 1
+                escaped = False
+                continue
+            if not current:
+                start_line = line_number
+            if ch == "\n":
+                if not in_quote:
+                    statement = "".join(current).strip()
+                    if statement:
+                        statements.append((start_line, statement))
+                    current = []
+                    line_number += 1
+                    escaped = False
+                    continue
+                current.append(ch)
+                line_number += 1
+                escaped = False
+                continue
+            if ch == ";" and not in_quote:
+                statement = "".join(current).strip()
+                if statement:
+                    statements.append((start_line, statement))
+                current = []
+                escaped = False
+                continue
+
+            current.append(ch)
+            if ch == '"' and not escaped:
+                in_quote = not in_quote
+            escaped = ch == "\\" and not escaped
+
+        statement = "".join(current).strip()
+        if statement:
+            statements.append((start_line, statement))
+        return statements
+
+    @classmethod
+    def _parse_statement(
+        cls, statement: str, source_line: int
+    ) -> typing.Optional[BatchSignatureQuery]:
+        line = cls._strip_comments(statement).strip()
+        if not line or cls._FENCE_RE.match(line):
+            return None
+
+        quoted = re.search(r'"([^"\n]+)"', line)
+        if quoted:
+            prefix = line[: quoted.start()].strip()
+            return BatchSignatureQuery(
+                raw_pattern=quoted.group(1).strip(),
+                name=cls._extract_name(prefix),
+                source_line=source_line,
+            )
+
+        assignment = cls._ASSIGNMENT_RE.match(line)
+        if assignment:
+            prefix = assignment.group(1).strip()
+            pattern = assignment.group(2).strip().strip('"')
+            if pattern:
+                return BatchSignatureQuery(
+                    raw_pattern=pattern,
+                    name=cls._extract_name(prefix),
+                    source_line=source_line,
+                )
+
+        return BatchSignatureQuery(raw_pattern=line, source_line=source_line)
+
+    @staticmethod
+    def _strip_comments(line: str) -> str:
+        in_quote = False
+        escaped = False
+        for idx, ch in enumerate(line):
+            if ch == '"' and not escaped:
+                in_quote = not in_quote
+            if not in_quote:
+                if ch == "#":
+                    return line[:idx]
+                if ch == "/" and idx + 1 < len(line) and line[idx + 1] == "/":
+                    return line[:idx]
+            escaped = ch == "\\" and not escaped
+        return line
+
+    @classmethod
+    def _extract_name(cls, prefix: str) -> str:
+        tokens = cls._IDENTIFIER_RE.findall(prefix)
+        return tokens[-1] if tokens else ""
 
 
 class SignatureParser:
@@ -2421,11 +3110,35 @@ class SignatureSearcher:
     def from_signature(cls, input_signature: str) -> "SignatureSearcher":
         return cls(input_signature=input_signature)
 
+    @staticmethod
+    def parse_search_signature(input_signature: str) -> str:
+        """Parse and canonicalize one searchable signature.
+
+        This is the shared single-signature policy used by both the normal
+        search action and batch search. Batch parsing may extract names or
+        split multiple statements first, but the actual searchable pattern is
+        validated here.
+        """
+        try:
+            sig_str = SignatureParser.parse(input_signature)
+            if not sig_str:
+                raise ValueError
+            normalized, pattern = SigText.normalize(sig_str)
+        except ValueError:
+            raise ValueError("Unrecognized signature format") from None
+
+        if not normalized or not any(
+            not is_wildcard for _, is_wildcard in pattern
+        ):
+            raise ValueError("Unrecognized signature format")
+        return normalized
+
     def search(self) -> SearchResults:
-        sig_str = SignatureParser.parse(self.input_signature)
-        if not sig_str:
+        try:
+            sig_str = self.parse_search_signature(self.input_signature)
+        except ValueError:
             idaapi.msg("Unrecognized signature type\n")
-            return SearchResults([], "")
+            return SearchResults([], "", raw_pattern=self.input_signature)
 
         # Wrap the search in a ProgressDialog to allow cancellation
         with ProgressDialog(
@@ -2435,7 +3148,12 @@ class SignatureSearcher:
         ):
             matches = self.find_all(sig_str)
 
-        return SearchResults(matches, sig_str)
+        return SearchResults(
+            matches,
+            sig_str,
+            raw_pattern=self.input_signature,
+            imagebase=SearchResults.current_imagebase(),
+        )
 
     @staticmethod
     def _find_all_simd(
@@ -2594,6 +3312,84 @@ class SignatureSearcher:
         """
         matches = cls.find_all(ida_signature, buf=buf, skip_more_than_one=True)
         return len(matches) == 1
+
+
+@dataclasses.dataclass(slots=True)
+class BatchSignatureSearcher:
+    """Search multiple pasted signatures in one operation."""
+
+    input_text: str
+
+    @classmethod
+    def from_text(cls, input_text: str) -> "BatchSignatureSearcher":
+        return cls(input_text=input_text)
+
+    @classmethod
+    def _file_offsets_for_results(
+        cls,
+        results: list[SearchResults],
+    ) -> dict[int, int]:
+        matches: list[Match] = []
+        for result in results:
+            matches.extend(result.matches)
+        return SearchResults.file_offsets_for_matches(matches)
+
+    def search(
+        self,
+        buf: typing.Optional["InMemoryBuffer"] = None,
+    ) -> BatchSearchResults:
+        queries = BatchSignatureParser.parse_many(self.input_text)
+        results: list[SearchResults] = []
+        match_cache: dict[str, list[Match]] = {}
+
+        for query in queries:
+            try:
+                normalized = SignatureSearcher.parse_search_signature(
+                    query.raw_pattern
+                )
+
+                matches = match_cache.get(normalized)
+                if matches is None:
+                    matches = SignatureSearcher.find_all(normalized, buf=buf)
+                    match_cache[normalized] = matches
+
+                result = SearchResults(
+                    matches=list(matches),
+                    signature_str=normalized,
+                    raw_pattern=query.raw_pattern,
+                    name=query.name,
+                    source_line=query.source_line,
+                )
+            except UserCanceledError:
+                raise
+            except ValueError as exc:
+                result = SearchResults(
+                    [],
+                    "",
+                    raw_pattern=query.raw_pattern,
+                    name=query.name,
+                    source_line=query.source_line,
+                    error=str(exc),
+                )
+            results.append(result)
+
+        imagebase = SearchResults.current_imagebase(buf)
+        file_offsets = self._file_offsets_for_results(results)
+        for result in results:
+            result.imagebase = imagebase
+            result.file_offsets = {
+                int(hit): file_offsets[int(hit)]
+                for hit in result.matches
+                if int(hit) in file_offsets
+            }
+            result._apply_match_metadata()
+
+        return BatchSearchResults(
+            results=results,
+            source_text=self.input_text,
+            imagebase=imagebase,
+            file_offsets=file_offsets,
+        )
 
 
 class Profiler:
@@ -3144,7 +3940,8 @@ Select action:
 <#Select an address or variable, and create code signatures for its references. Will output the shortest 5 signatures#Find shortest XREF signature for current data or code address:{rFindXRefSig}>
 <#Select 1+ instructions, and copy the bytes using the specified output format#Copy selected code:{rCopyCode}>
 <#Paste any string containing your signature/mask and find matches#Search for a signature:{rSearchSignature}>
-<#Find the shortest unique signature anywhere inside the current function, with automatic xref fallback if the function body is not unique#Find shortest unique signature for current function:{rFindFunctionSig}>{rAction}>
+<#Find the shortest unique signature anywhere inside the current function, with automatic xref fallback if the function body is not unique#Find shortest unique signature for current function:{rFindFunctionSig}>
+<#Paste several named or unnamed signatures, search them together, and optionally export the result list#Batch search signatures:{rBatchSearchSignatures}>{rAction}>
 
 Output format:
 <#Example - E8 ? ? ? ? 45 33 F6 66 44 89 34 33#IDA Signature:{rIDASig}>
@@ -3172,6 +3969,7 @@ Quick Options:
                     "rCopyCode",
                     "rSearchSignature",
                     "rFindFunctionSig",
+                    "rBatchSearchSignatures",
                 )
             ),
             "rOutputFormat": F.RadGroupControl(
@@ -3425,6 +4223,8 @@ class SigMakerPlugin(idaapi.plugin_t):
                     idaapi.msg("No signature entered!\n")
             elif action == Action.FIND_FUNCTION_SIG:
                 self._run_find_function_sig(config)
+            elif action == Action.BATCH_SEARCH:
+                self._run_batch_search()
             else:
                 idaapi.msg("Invalid action!\n")
         except Unexpected as e:
@@ -3435,6 +4235,74 @@ class SigMakerPlugin(idaapi.plugin_t):
         except Exception as e:
             LOGGER.error("Exception occurred: %s%s%s", e, os.linesep, traceback.format_exc())
             return
+
+    @staticmethod
+    def _ask_batch_search_text() -> typing.Optional[str]:
+        return idaapi.ask_text(
+            1_000_000,
+            "",
+            (
+                "Paste one or more signatures or named patterns.\n\n"
+                'Examples:\nprint = "4C 8B DC ?? ??"\n'
+                'constexpr const char* print = "4C 8B DC ?? ??";\n'
+                "48 8B ?? ?? 89\n"
+            ),
+        )
+
+    @staticmethod
+    def _maybe_export_batch_results(results: BatchSearchResults) -> None:
+        if (
+            idaapi.ask_yn(
+                idaapi.ASKBTN_NO,
+                "Export this batch search result list to a file now?",
+            )
+            != idaapi.ASKBTN_YES
+        ):
+            return
+        path_str = idaapi.ask_file(
+            1,
+            "sigmaker-batch-search.txt",
+            "Export SigMaker batch search results (.txt/.csv/.json)",
+        )
+        if not path_str:
+            return
+        path = pathlib.Path(path_str)
+        formatter = batch_search_formatter_for_path(path)
+        with path.open("w", encoding="utf-8", newline="") as output:
+            results.display(output=output, formatter=formatter)
+        idaapi.msg(f"Batch search results exported to {path}\n")
+
+    def _run_batch_search(self) -> None:
+        input_text = self._ask_batch_search_text()
+        if not input_text or not input_text.strip():
+            idaapi.msg("No signatures entered!\n")
+            return
+
+        buf: typing.Optional["InMemoryBuffer"] = None
+        with ProgressDialog(
+            "Batch search signatures\n\n"
+            "Preparing the database for batch signature search.\n\n"
+            "Press Cancel to stop"
+        ) as progress:
+            if SIMD_SPEEDUP_AVAILABLE:
+                progress.replace_message(
+                    "Batch search signatures\n\n"
+                    "Copying segments once for all patterns.\n\n"
+                    "Press Cancel to stop"
+                )
+                buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
+            progress.replace_message(
+                "Batch search signatures\n\n"
+                "Searching pasted patterns.\n\n"
+                "Press Cancel to stop"
+            )
+            results = BatchSignatureSearcher.from_text(input_text).search(buf=buf)
+
+        if not results:
+            idaapi.msg("No patterns entered!\n")
+            return
+        results.display()
+        self._maybe_export_batch_results(results)
 
     def _run_find_function_sig(self, config: SigMakerConfig) -> None:
         """Action.FIND_FUNCTION_SIG: shortest unique sig within the function,

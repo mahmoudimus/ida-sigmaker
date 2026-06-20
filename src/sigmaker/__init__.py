@@ -2400,13 +2400,14 @@ class SearchResults:
     error: str = ""
     imagebase: typing.Optional[int] = None
     file_offsets: dict[int, int] = dataclasses.field(default_factory=dict)
+    search_signature: str = ""
 
     def __post_init__(self) -> None:
         self._apply_match_metadata()
 
     @property
     def normalized_signature(self) -> str:
-        return self.signature_str
+        return self.search_signature or self.signature_str
 
     @property
     def display_name(self) -> str:
@@ -3119,6 +3120,12 @@ class SignatureSearcher:
         split multiple statements first, but the actual searchable pattern is
         validated here.
         """
+        _, normalized = SignatureSearcher._parse_search_signature(input_signature)
+        return normalized
+
+    @staticmethod
+    def _parse_search_signature(input_signature: str) -> tuple[str, str]:
+        """Return the display signature and canonical search signature."""
         try:
             sig_str = SignatureParser.parse(input_signature)
             if not sig_str:
@@ -3131,11 +3138,13 @@ class SignatureSearcher:
             not is_wildcard for _, is_wildcard in pattern
         ):
             raise ValueError("Unrecognized signature format")
-        return normalized
+        return sig_str, normalized
 
     def search(self) -> SearchResults:
         try:
-            sig_str = self.parse_search_signature(self.input_signature)
+            sig_str, search_signature = self._parse_search_signature(
+                self.input_signature
+            )
         except ValueError:
             idaapi.msg("Unrecognized signature type\n")
             return SearchResults([], "", raw_pattern=self.input_signature)
@@ -3146,13 +3155,14 @@ class SignatureSearcher:
             "Scanning the whole database for your pattern.\n\n"
             "Press Cancel to stop"
         ):
-            matches = self.find_all(sig_str)
+            matches = self.find_all(search_signature)
 
         return SearchResults(
             matches,
             sig_str,
             raw_pattern=self.input_signature,
             imagebase=SearchResults.current_imagebase(),
+            search_signature=search_signature,
         )
 
     @staticmethod

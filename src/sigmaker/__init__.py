@@ -3022,7 +3022,6 @@ class SignatureParser:
     or an empty string on failure.
     """
 
-    _HEX_PAIR = re.compile(r"^[0-9A-Fa-f]{2}$")
     _ESCAPED_HEX = re.compile(r"\\x[0-9A-Fa-f]{2}")
     _RUN_0X = re.compile(r"(?:0x[0-9A-Fa-f]{2})+")
 
@@ -3091,27 +3090,16 @@ class SignatureParser:
         s = input_str
         s = re.sub(r"[\)\(\[\]]+", "", s)  # strip brackets
         s = re.sub(r"^\s+", "", s)  # lstrip
-        s = re.sub(r"[? ]+$", "", s) + " "  # ensure trailing space
+        s = s.strip() + " "  # ensure trailing space
         s = re.sub(r"\\?\\x", "", s)  # drop any stray \x or escaped \x
         s = re.sub(r"\s+", " ", s)  # collapse whitespace
 
-        # Also coerce any '??' or '?' tokens into a single '?' and ensure hex pairs are normalized
-        tokens = [t.strip() for t in s.split() if t.strip()]
-        out: list[str] = []
-        for t in tokens:
-            if t == "?" or t == "??":
-                out.append("?")
-                continue
-            # accept '0xAA' or 'AA'; normalize to two hex chars upper
-            if t.lower().startswith("0x"):
-                t = t[2:]
-            if not cls._HEX_PAIR.match(t):
-                # If it's not a hex pair, treat as wildcard to be safe
-                out.append("?")
-                continue
-            out.append(t.upper())
+        try:
+            normalized, _ = SigText.normalize(s)
+        except ValueError:
+            return ""
 
-        return (" ".join(out) + " ") if out else ""
+        return " ".join("?" if tok == "??" else tok for tok in normalized.split())
 
 
 @dataclasses.dataclass(slots=True)

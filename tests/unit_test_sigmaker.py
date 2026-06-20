@@ -1571,6 +1571,26 @@ class TestSignatureSearcherInput(CoveredUnitTest):
             self.assertEqual(result.ida_pattern, "48 8B ? 48 89")
             self.assertEqual(result.normalized_signature, "48 8B ?? 48 89")
 
+    def test_search_preserves_nibble_wildcard_patterns(self):
+        cases = (
+            ("4? ?F ?? 7A", "4? ?F ? 7A", "4? ?F ?? 7A"),
+            ("48 8B 4? ?F ??", "48 8B 4? ?F ?", "48 8B 4? ?F ??"),
+        )
+
+        for raw, ida_pattern, normalized in cases:
+            with self.subTest(raw=raw), patch.object(
+                sigmaker.SignatureSearcher,
+                "find_all",
+                return_value=[sigmaker.Match(0x1000)],
+            ) as find_all:
+                result = sigmaker.SignatureSearcher.from_signature(raw).search()
+
+            find_all.assert_called_once_with(normalized)
+            self.assertEqual(result.raw_pattern, raw)
+            self.assertEqual(result.signature_str, ida_pattern)
+            self.assertEqual(result.ida_pattern, ida_pattern)
+            self.assertEqual(result.normalized_signature, normalized)
+
     def test_search_rejects_all_wildcard_pattern(self):
         with patch.object(sigmaker.idaapi, "msg") as msg, patch.object(
             sigmaker.SignatureSearcher,
@@ -1712,6 +1732,22 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         )
         self.assertEqual(f"{sparse_hit:rva}", repr(sparse_hit))
         self.assertEqual(f"{sparse_hit:fileoffset}", repr(sparse_hit))
+
+    def test_search_preserves_batch_nibble_wildcard_patterns(self):
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[sigmaker.Match(0x1000)],
+        ) as find_all:
+            results = sigmaker.BatchSignatureSearcher.from_text(
+                'nibble = "4? ?F ?? 7A"'
+            ).search()
+
+        find_all.assert_called_once_with("4? ?F ?? 7A", buf=None)
+        self.assertEqual(results[0].raw_pattern, "4? ?F ?? 7A")
+        self.assertEqual(results[0].signature_str, "4? ?F ? 7A")
+        self.assertEqual(results[0].ida_pattern, "4? ?F ? 7A")
+        self.assertEqual(results[0].normalized_signature, "4? ?F ?? 7A")
 
     def test_search_records_parse_errors_per_entry(self):
         text = """

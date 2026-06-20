@@ -735,22 +735,6 @@ class Match:
             return format(value, nested_spec)
         return f"0x{value:X}"
 
-    def with_metadata(
-        self,
-        *,
-        rva: typing.Optional[int] = None,
-        file_offset: typing.Optional[int] = None,
-    ) -> "Match":
-        next_rva = self.rva if rva is None else rva
-        next_file_offset = self.file_offset if file_offset is None else file_offset
-        if next_rva == self.rva and next_file_offset == self.file_offset:
-            return self
-        return Match(
-            self.address,
-            rva=next_rva,
-            file_offset=next_file_offset,
-        )
-
     def to_record(self) -> dict[str, typing.Optional[int]]:
         return {
             "ea": self.address,
@@ -2611,7 +2595,8 @@ class SearchResults:
         return file_offset
 
     def enriched_match_for(self, hit: Match) -> Match:
-        return hit.with_metadata(
+        return Match(
+            int(hit),
             rva=self.rva_for_match(hit),
             file_offset=self.file_offset_for_match(hit),
         )
@@ -2623,7 +2608,8 @@ class SearchResults:
         if self.imagebase is None and not self.file_offsets:
             return
         self.matches = [
-            hit.with_metadata(
+            Match(
+                int(hit),
                 rva=(
                     hit.rva
                     if hit.rva is not None or self.imagebase is None
@@ -2646,7 +2632,11 @@ class SearchResults:
         file_offset: typing.Optional[int] = None,
     ) -> None:
         self.matches = [
-            hit.with_metadata(rva=rva, file_offset=file_offset)
+            Match(
+                int(hit),
+                rva=hit.rva if rva is None else rva,
+                file_offset=hit.file_offset if file_offset is None else file_offset,
+            )
             if int(hit) == ea
             else hit
             for hit in self.matches
@@ -2761,7 +2751,8 @@ class BatchSearchResults:
         return f"0x{value:X}"
 
     def match_record(self, hit: Match) -> dict[str, typing.Optional[int]]:
-        return hit.with_metadata(
+        return Match(
+            int(hit),
             rva=self.rva_for_match(hit),
             file_offset=self.file_offset_for_match(hit),
         ).to_record()

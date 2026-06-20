@@ -1516,7 +1516,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
 
     def test_match_metadata_keeps_address_equality_and_hash(self):
         plain = sigmaker.Match(0x1000)
-        enriched = plain.with_metadata(rva=0x100, file_offset=0x400)
+        enriched = sigmaker.Match(0x1000, rva=0x100, file_offset=0x400)
 
         self.assertIs(type(enriched), sigmaker.Match)
         self.assertEqual(enriched, plain)

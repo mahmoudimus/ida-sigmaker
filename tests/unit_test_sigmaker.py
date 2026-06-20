@@ -6,6 +6,7 @@ to ensure reliable testing across different platforms and architectures.
 """
 
 import array
+import csv
 import dataclasses
 import gc
 import itertools
@@ -1540,6 +1541,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
 
         find_all.assert_called_once_with("E8 ?? ?? ?? ?? 48")
         self.assertEqual(result.signature_str, "E8 ? ? ? ? 48")
+        self.assertEqual(result.ida_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(result.normalized_signature, "E8 ?? ?? ?? ?? 48")
         self.assertEqual(result.raw_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(result.status, "matched")
@@ -1549,7 +1551,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         self.assertEqual(result.matches[0], sigmaker.Match(0x1000))
         self.assertEqual(result.matches[0].rva, 0)
 
-    def test_search_preserves_legacy_signature_string(self):
+    def test_search_preserves_ida_pattern_signature_string(self):
         cases = (
             "48 8B ? 48 89",
             "\\x48\\x8B\\x00\\x48\\x89 xx?xx",
@@ -1566,6 +1568,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
 
             find_all.assert_called_once_with("48 8B ?? 48 89")
             self.assertEqual(result.signature_str, "48 8B ? 48 89")
+            self.assertEqual(result.ida_pattern, "48 8B ? 48 89")
             self.assertEqual(result.normalized_signature, "48 8B ?? 48 89")
 
     def test_search_rejects_all_wildcard_pattern(self):
@@ -1675,6 +1678,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         )
         self.assertEqual(results[0].normalized_signature, "48 8B C4")
         self.assertEqual(results[2].signature_str, "E8 ? ? ? ? 48")
+        self.assertEqual(results[2].ida_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(results[2].normalized_signature, "E8 ?? ?? ?? ?? 48")
         self.assertEqual(
             results[0].rva_for_match(sigmaker.Match(0x140001000)),
@@ -1759,12 +1763,13 @@ class TestBatchSearchFormatters(CoveredUnitTest):
     def _results(self):
         matched = sigmaker.SearchResults(
             matches=[sigmaker.Match(0x140001000)],
-            signature_str="48 8B C4",
-            raw_pattern="48 8B C4",
+            signature_str="48 8B ? 48 89",
+            raw_pattern="\\x48\\x8B\\x00\\x48\\x89 xx?xx",
             name="print",
             source_line=1,
             imagebase=0x140000000,
             file_offsets={0x140001000: 0x401000},
+            search_signature="48 8B ?? 48 89",
         )
         multi = sigmaker.SearchResults(
             matches=[sigmaker.Match(0x140002000), sigmaker.Match(0x140003000)],
@@ -1808,7 +1813,7 @@ class TestBatchSearchFormatters(CoveredUnitTest):
         out = self._results().format()
         self.assertIn("Batch search finished: 2/3 matched, 1 error(s)", out)
         self.assertIn("Imagebase: 0x140000000", out)
-        self.assertIn("[print] 1 match(es) for 48 8B C4", out)
+        self.assertIn("[print] 1 match(es) for 48 8B ? 48 89", out)
 
     def test_display_writes_formatted_text_to_text_io(self):
         output = io.StringIO()
@@ -1842,11 +1847,15 @@ class TestBatchSearchFormatters(CoveredUnitTest):
 
     def test_render_csv_quotes_fields(self):
         out = self._results().format(sigmaker.BatchSearchCsvFormatter())
-        self.assertIn("name,source_line,status", out)
-        self.assertIn('"print"', out)
-        self.assertIn('"0x140001000"', out)
-        self.assertIn('"0x1000"', out)
-        self.assertIn('"0x401000"', out)
+        rows = list(csv.DictReader(io.StringIO(out)))
+
+        self.assertEqual(rows[0]["name"], "print")
+        self.assertEqual(rows[0]["ida_pattern"], "48 8B ? 48 89")
+        self.assertEqual(rows[0]["normalized_signature"], "48 8B ?? 48 89")
+        self.assertEqual(rows[0]["raw_pattern"], "\\x48\\x8B\\x00\\x48\\x89 xx?xx")
+        self.assertEqual(rows[0]["match_eas"], "0x140001000")
+        self.assertEqual(rows[0]["match_rvas"], "0x1000")
+        self.assertEqual(rows[0]["match_file_offsets"], "0x401000")
 
     def test_render_json_is_parseable(self):
         out = self._results().format(sigmaker.BatchSearchJsonFormatter())
@@ -1854,6 +1863,15 @@ class TestBatchSearchFormatters(CoveredUnitTest):
         self.assertEqual(payload["imagebase"], 0x140000000)
         self.assertEqual(payload["entry_count"], 3)
         self.assertEqual(payload["entries"][0]["name"], "print")
+        self.assertEqual(payload["entries"][0]["ida_pattern"], "48 8B ? 48 89")
+        self.assertEqual(
+            payload["entries"][0]["normalized_signature"],
+            "48 8B ?? 48 89",
+        )
+        self.assertEqual(
+            payload["entries"][0]["raw_pattern"],
+            "\\x48\\x8B\\x00\\x48\\x89 xx?xx",
+        )
         self.assertEqual(payload["entries"][0]["matches"][0]["ea"], 0x140001000)
         self.assertEqual(payload["entries"][0]["matches"][0]["rva"], 0x1000)
         self.assertEqual(

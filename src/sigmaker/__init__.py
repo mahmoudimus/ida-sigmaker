@@ -2799,7 +2799,7 @@ class BatchSignatureParser:
     """Parse a pasted list of named or unnamed signature patterns."""
 
     _FENCE_RE = re.compile(r"^```")
-    _NAMED_PATTERN_RE = re.compile(r"^([A-Za-z_]\w*)\s*[:=]\s*(.+)$")
+    _NAMED_PATTERN_RE = re.compile(r"^([A-Za-z_]\w*)\s*(?::=|=)\s*(.+)$")
 
     @classmethod
     def parse_many(cls, text: str) -> list[BatchSignatureQuery]:
@@ -4115,7 +4115,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             (
                 "Paste one or more signatures or named patterns.\n\n"
                 'Examples:\nprint = "4C 8B DC ?? ??"\n'
-                "update: E8 ? ? ? ? 48 89 C7\n"
+                "update := E8 ? ? ? ? 48 89 C7\n"
                 'tick = "90 90 CC"; draw = 48 89 C7\n'
                 "48 8B ?? ?? 89\n"
             ),

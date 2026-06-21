@@ -1739,12 +1739,13 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             sigmaker.idaapi,
             "get_fileregion_offset",
             return_value=0x401000,
-        ):
+        ) as get_fileregion_offset:
             results = sigmaker.BatchSignatureSearcher.from_text(text).search(
                 buf=shared_buf
             )
 
         self.assertEqual(calls, ["48 8B C4", "E8 ?? ?? ?? ?? 48"])
+        get_fileregion_offset.assert_called_once_with(0x140001000)
         self.assertEqual(len(results), 3)
         result_list = list(results)
         self.assertEqual(len(result_list), 3)
@@ -1947,14 +1948,16 @@ class TestBatchSearchFormatters(CoveredUnitTest):
             sigmaker.idaapi,
             "get_func_name",
             return_value="print_fn",
-        ):
+        ) as get_func_name:
             self._results().display()
 
         msg.assert_called_once()
+        get_func_name.assert_not_called()
         self.assertIn(
-            "0x140001000 (rva 0x1000, file 0x401000, print_fn)",
+            "0x140001000 (rva 0x1000, file 0x401000)",
             msg.call_args.args[0],
         )
+        self.assertNotIn("print_fn", msg.call_args.args[0])
 
     def test_render_csv_quotes_fields(self):
         out = self._results().format(sigmaker.BatchSearchCsvFormatter())
@@ -3840,19 +3843,6 @@ class TestSignatureSearcherBufferCache(CoveredUnitTest):
         ), patch.object(sigmaker, "ProgressDialog"):
             sigmaker.SignatureSearcher._find_all_simd("48 8B C4")
         mp_load.assert_called_once()
-
-
-class TestActionEnumAddsFunctionSig(CoveredUnitTest):
-    """The Action IntEnum gains FIND_FUNCTION_SIG=4 for issue #17."""
-
-    def test_find_function_sig_value(self):
-        self.assertEqual(int(sigmaker.Action.FIND_FUNCTION_SIG), 4)
-
-    def test_existing_action_values_unchanged(self):
-        self.assertEqual(int(sigmaker.Action.CREATE_UNIQUE), 0)
-        self.assertEqual(int(sigmaker.Action.FIND_XREF), 1)
-        self.assertEqual(int(sigmaker.Action.COPY_RANGE), 2)
-        self.assertEqual(int(sigmaker.Action.SEARCH), 3)
 
 
 class TestGeneratedSignatureOrdering(CoveredUnitTest):

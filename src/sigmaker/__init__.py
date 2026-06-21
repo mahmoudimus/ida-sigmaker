@@ -2628,12 +2628,35 @@ class BatchSearchFormatter(typing.Protocol):
         ...
 
 
+BATCH_SEARCH_FORMATTERS: dict[str, BatchSearchFormatter] = {}
+BATCH_SEARCH_FORMAT_SUFFIXES: dict[str, str] = {}
+
+
+def _register_batch_search_formatter(
+    name: str,
+    formatter: BatchSearchFormatter,
+    suffixes: typing.Iterable[str] = (),
+) -> None:
+    normalized_name = name.strip().lower()
+    if not normalized_name:
+        raise ValueError("Batch search formatter name cannot be empty")
+    BATCH_SEARCH_FORMATTERS[normalized_name] = formatter
+    for suffix in suffixes:
+        normalized_suffix = suffix.strip().lower()
+        if not normalized_suffix:
+            continue
+        if not normalized_suffix.startswith("."):
+            normalized_suffix = "." + normalized_suffix
+        BATCH_SEARCH_FORMAT_SUFFIXES[normalized_suffix] = normalized_name
+
+
 def _hex_or_none(value: typing.Optional[int]) -> typing.Optional[str]:
     if value is None:
         return None
     return f"0x{value:X}"
 
 
+@BatchSearchFormatter.register("text", suffixes=(".txt",))
 @dataclasses.dataclass(frozen=True, slots=True)
 class BatchSearchTextFormatter:
     """Human-readable batch search summary."""
@@ -2689,6 +2712,7 @@ class BatchSearchTextFormatter:
         return "\n".join(lines).rstrip() + "\n"
 
 
+@BatchSearchFormatter.register("csv", suffixes=(".csv",))
 class BatchSearchCsvFormatter:
     """CSV batch search result renderer."""
 
@@ -2742,33 +2766,12 @@ class BatchSearchCsvFormatter:
         return output.getvalue()
 
 
+@BatchSearchFormatter.register("json", suffixes=(".json",))
 class BatchSearchJsonFormatter:
     """JSON batch search result renderer."""
 
     def format(self, results: BatchSearchResults) -> str:
         return json.dumps(results.to_record(), indent=2, ensure_ascii=True) + "\n"
-
-
-BATCH_SEARCH_FORMATTERS: dict[str, BatchSearchFormatter] = {}
-BATCH_SEARCH_FORMAT_SUFFIXES: dict[str, str] = {}
-
-
-def _register_batch_search_formatter(
-    name: str,
-    formatter: BatchSearchFormatter,
-    suffixes: typing.Iterable[str] = (),
-) -> None:
-    normalized_name = name.strip().lower()
-    if not normalized_name:
-        raise ValueError("Batch search formatter name cannot be empty")
-    BATCH_SEARCH_FORMATTERS[normalized_name] = formatter
-    for suffix in suffixes:
-        normalized_suffix = suffix.strip().lower()
-        if not normalized_suffix:
-            continue
-        if not normalized_suffix.startswith("."):
-            normalized_suffix = "." + normalized_suffix
-        BATCH_SEARCH_FORMAT_SUFFIXES[normalized_suffix] = normalized_name
 
 
 def batch_search_formatter(
@@ -2783,11 +2786,6 @@ def batch_search_formatter(
         return BATCH_SEARCH_FORMATTERS[name]
     except KeyError:
         raise ValueError(f"Unknown batch search format: {formatter}") from None
-
-
-_register_batch_search_formatter("text", BatchSearchTextFormatter(), suffixes=(".txt",))
-_register_batch_search_formatter("csv", BatchSearchCsvFormatter(), suffixes=(".csv",))
-_register_batch_search_formatter("json", BatchSearchJsonFormatter(), suffixes=(".json",))
 
 
 def batch_search_formatter_for_path(path: pathlib.Path) -> BatchSearchFormatter:

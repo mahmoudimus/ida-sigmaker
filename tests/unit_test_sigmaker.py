@@ -2713,13 +2713,13 @@ class TestActionEnum(CoveredUnitTest):
 
     def test_action_values_match_form_order(self):
         # Order is locked by SignatureMakerForm.rAction:
-        #   ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature")
+        #   ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode",
+        #    "rSearchSignature", "rFindFunctionSig")
         self.assertEqual(int(sigmaker.Action.CREATE_UNIQUE), 0)
         self.assertEqual(int(sigmaker.Action.FIND_XREF), 1)
         self.assertEqual(int(sigmaker.Action.COPY_RANGE), 2)
         self.assertEqual(int(sigmaker.Action.SEARCH), 3)
         self.assertEqual(int(sigmaker.Action.FIND_FUNCTION_SIG), 4)
-        self.assertEqual(int(sigmaker.Action.BATCH_SEARCH), 5)
 
     def test_action_is_intenum(self):
         import enum as _enum
@@ -3836,7 +3836,6 @@ class TestActionEnumAddsFunctionSig(CoveredUnitTest):
         self.assertEqual(int(sigmaker.Action.FIND_XREF), 1)
         self.assertEqual(int(sigmaker.Action.COPY_RANGE), 2)
         self.assertEqual(int(sigmaker.Action.SEARCH), 3)
-        self.assertEqual(int(sigmaker.Action.BATCH_SEARCH), 5)
 
 
 class TestGeneratedSignatureOrdering(CoveredUnitTest):

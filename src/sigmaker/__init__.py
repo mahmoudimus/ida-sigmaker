@@ -744,7 +744,7 @@ class Action(enum.IntEnum):
 
     Values are bound to the rAction radio-group order:
     ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature",
-     "rFindFunctionSig", "rBatchSearchSignatures").
+     "rFindFunctionSig").
     Changing values requires updating the radio group too.
     """
 
@@ -753,7 +753,6 @@ class Action(enum.IntEnum):
     COPY_RANGE = 2
     SEARCH = 3
     FIND_FUNCTION_SIG = 4
-    BATCH_SEARCH = 5
 
 
 class GenerationStatus(enum.Enum):
@@ -4002,8 +4001,7 @@ Select action:
 <#Select an address or variable, and create code signatures for its references. Will output the shortest 5 signatures#Find shortest XREF signature for current data or code address:{rFindXRefSig}>
 <#Select 1+ instructions, and copy the bytes using the specified output format#Copy selected code:{rCopyCode}>
 <#Paste any string containing your signature/mask and find matches#Search for a signature:{rSearchSignature}>
-<#Find the shortest unique signature anywhere inside the current function, with automatic xref fallback if the function body is not unique#Find shortest unique signature for current function:{rFindFunctionSig}>
-<#Paste several named or unnamed signatures, search them together, and optionally export the result list#Batch search signatures:{rBatchSearchSignatures}>{rAction}>
+<#Find the shortest unique signature anywhere inside the current function, with automatic xref fallback if the function body is not unique#Find shortest unique signature for current function:{rFindFunctionSig}>{rAction}>
 
 Output format:
 <#Example - E8 ? ? ? ? 45 33 F6 66 44 89 34 33#IDA Signature:{rIDASig}>
@@ -4032,7 +4030,6 @@ Quick Options:
                     "rCopyCode",
                     "rSearchSignature",
                     "rFindFunctionSig",
-                    "rBatchSearchSignatures",
                 )
             ),
             "rOutputFormat": F.RadGroupControl(
@@ -4296,8 +4293,6 @@ class SigMakerPlugin(idaapi.plugin_t):
                     idaapi.msg("No signature entered!\n")
             elif action == Action.FIND_FUNCTION_SIG:
                 self._run_find_function_sig(config)
-            elif action == Action.BATCH_SEARCH:
-                self._run_batch_search()
             else:
                 idaapi.msg("Invalid action!\n")
         except Unexpected as e:
@@ -4308,75 +4303,6 @@ class SigMakerPlugin(idaapi.plugin_t):
         except Exception as e:
             LOGGER.error("Exception occurred: %s%s%s", e, os.linesep, traceback.format_exc())
             return
-
-    @staticmethod
-    def _ask_batch_search_text() -> typing.Optional[str]:
-        return idaapi.ask_text(
-            1_000_000,
-            "",
-            (
-                "Paste one or more signatures or named patterns.\n\n"
-                'Examples:\nprint = "4C 8B DC ?? ??"\n'
-                "update := E8 ? ? ? ? 48 89 C7\n"
-                'tick = "90 90 CC"; draw = 48 89 C7\n'
-                "48 8B ?? ?? 89\n"
-            ),
-        )
-
-    @staticmethod
-    def _maybe_export_batch_results(results: BatchSearchResults) -> None:
-        if (
-            idaapi.ask_yn(
-                idaapi.ASKBTN_NO,
-                "Export this batch search result list to a file now?",
-            )
-            != idaapi.ASKBTN_YES
-        ):
-            return
-        path_str = idaapi.ask_file(
-            1,
-            "sigmaker-batch-search.txt",
-            "Export SigMaker batch search results (.txt/.csv/.json)",
-        )
-        if not path_str:
-            return
-        path = pathlib.Path(path_str)
-        formatter = batch_search_formatter_for_path(path)
-        with path.open("w", encoding="utf-8", newline="") as output:
-            results.display(output=output, formatter=formatter)
-        idaapi.msg(f"Batch search results exported to {path}\n")
-
-    def _run_batch_search(self) -> None:
-        input_text = self._ask_batch_search_text()
-        if not input_text or not input_text.strip():
-            idaapi.msg("No signatures entered!\n")
-            return
-
-        buf: typing.Optional["InMemoryBuffer"] = None
-        with ProgressDialog(
-            "Batch search signatures\n\n"
-            "Preparing the database for batch signature search.\n\n"
-            "Press Cancel to stop"
-        ) as progress:
-            if SIMD_SPEEDUP_AVAILABLE:
-                progress.replace_message(
-                    "Batch search signatures\n\n"
-                    "Copying segments once for all patterns.\n\n"
-                    "Press Cancel to stop"
-                )
-                buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
-            progress.replace_message(
-                "Batch search signatures\n\n"
-                "Searching pasted patterns.\n\n"
-                "Press Cancel to stop"
-            )
-            results = BatchSignatureSearcher.from_text(input_text).search(buf=buf)
-
-        if not results:
-            idaapi.msg("No patterns entered!\n")
-            return
-        results.display()
-        self._maybe_export_batch_results(results)
 
     def _run_find_function_sig(self, config: SigMakerConfig) -> None:
         """Action.FIND_FUNCTION_SIG: shortest unique sig within the function,

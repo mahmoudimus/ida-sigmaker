@@ -48,6 +48,11 @@ Source = "https://github.com/mahmoudimus/ida-sigmaker"
 Issues = "https://github.com/mahmoudimus/ida-sigmaker/issues"
 
 
+[project.scripts]
+sigmaker = "sigmaker_cli:main"
+ida-sigmaker = "sigmaker_cli:main"
+
+
 [tool.setuptools.packages.find]
 where = ["src", "include"]
 #exclude = ["test*"]

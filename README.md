@@ -272,6 +272,23 @@ for gen in xrefs.signatures:
     print(str(gen.address), f"{gen.signature:ida}")
 ```
 
+## Command-line use with idalib
+
+The package also installs a small `sigmaker` CLI for IDA 9.x idalib-capable Python environments. The command imports `idapro`, opens the target database or input binary, waits for auto-analysis, and then calls the same library APIs used by the plugin:
+
+```bash
+sigmaker search ./app.exe "48 8B ? 48 89" --format json
+sigmaker search ./app.exe --input patterns.txt --format csv --output matches.csv
+sigmaker make ./app.exe 0x140001234 --format ida
+sigmaker make ./app.exe 0x1234 --rva --format x64dbg --json
+```
+
+`search` accepts one signature, piped text, or a file containing several newline/semicolon-separated batch entries. Its output format is selected through the batch formatter registry, so built-ins such as `text`, `csv`, and `json` work the same way as `BatchSearchResults.format(...)`.
+
+`make` generates a signature at an EA by default, or at an imagebase-relative RVA with `--rva`. It mirrors the plugin's generation defaults: wildcard operands on, optimized wildcarding on, continue-outside-function off, and continue prompts disabled for noninteractive use.
+
+Formatted command output is written to stdout, or to `--output`; IDA startup and plugin chatter is routed to stderr so JSON and CSV output remains pipeable.
+
 ### Batch search API
 
 The batch search feature is also available to scripts:

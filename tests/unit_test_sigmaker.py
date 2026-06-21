@@ -1618,7 +1618,29 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         find_all.assert_not_called()
         self.assertEqual(result.matches, [])
         self.assertEqual(result.signature_str, "")
+        self.assertEqual(result.status, "error")
+        self.assertIn("Unrecognized", result.error)
         msg.assert_called_once_with("Unrecognized signature type\n")
+
+    def test_search_reports_nibble_wildcard_error_without_simd(self):
+        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        try:
+            sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+            with patch.object(sigmaker.idaapi, "msg") as msg, patch.object(
+                sigmaker.SignatureSearcher,
+                "find_all",
+            ) as find_all:
+                result = sigmaker.SignatureSearcher.from_signature("48 4? ?F").search()
+
+            find_all.assert_not_called()
+            self.assertEqual(result.status, "error")
+            self.assertEqual(
+                result.error,
+                "Nibble wildcard search requires SIMD speedups",
+            )
+            msg.assert_called_once_with("Unrecognized signature type\n")
+        finally:
+            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
 
 
 class TestBatchSignatureParser(CoveredUnitTest):
@@ -2574,6 +2596,21 @@ class TestSearchCancellation(CoveredUnitTest):
             self.assertEqual(int(results[2]), 0x3000)
         finally:
             # Restore SIMD setting
+            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+
+    def test_find_all_rejects_nibble_wildcards_without_simd(self):
+        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+        sigmaker.idaapi.parse_binpat_str = MagicMock()
+
+        try:
+            with self.assertRaisesRegex(
+                ValueError,
+                "Nibble wildcard search requires SIMD speedups",
+            ):
+                sigmaker.SignatureSearcher.find_all("48 4? ?F")
+            sigmaker.idaapi.parse_binpat_str.assert_not_called()
+        finally:
             sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
 
     def test_cancellation_returns_partial_results(self):

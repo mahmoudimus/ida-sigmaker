@@ -659,10 +659,13 @@ class Match:
     Acts like an int, but can also carry optional derived address metadata.
     """
 
+    #: Effective address of the match.
     address: int
+    #: Imagebase-relative offset for this match, when known.
     rva: typing.Optional[int] = dataclasses.field(
         default=None, kw_only=True, compare=False, hash=False, repr=False
     )
+    #: Input-file offset for this match, when IDA can resolve it.
     file_offset: typing.Optional[int] = dataclasses.field(
         default=None, kw_only=True, compare=False, hash=False, repr=False
     )
@@ -2465,14 +2468,23 @@ class SearchResults:
     ``raw_pattern`` for the exact extracted user input.
     """
 
+    #: Matched addresses for this search.
     matches: list[Match]
+    #: Parsed SigMaker search pattern, kept for compatibility.
     signature_str: str
+    #: Exact user input extracted for this search entry.
     raw_pattern: str = ""
+    #: Optional user-supplied pattern name.
     name: str = ""
+    #: One-based source line in batch input, or zero when unknown.
     source_line: int = 0
+    #: Per-entry parse or search error; empty when the entry succeeded.
     error: str = ""
+    #: Imagebase used to compute match RVAs, when known.
     imagebase: typing.Optional[int] = None
+    #: Mapping from effective address to input-file offset.
     file_offsets: dict[int, int] = dataclasses.field(default_factory=dict)
+    #: Canonical matcher/cache pattern, preserving supported wildcard detail.
     canonical_pattern: str = ""
 
     def __post_init__(self) -> None:
@@ -2637,8 +2649,11 @@ class SearchResults:
 class BatchSignatureQuery:
     """One raw pattern from a pasted batch search input."""
 
+    #: Exact pattern text for this batch entry.
     raw_pattern: str
+    #: Optional user-supplied pattern name.
     name: str = ""
+    #: One-based source line in the pasted batch input.
     source_line: int = 0
 
     @property
@@ -2654,8 +2669,11 @@ class BatchSignatureQuery:
 class BatchSearchResults:
     """Result container for batch signature searches."""
 
+    #: Per-entry search results, in input order.
     results: list[SearchResults]
+    #: Original pasted batch input.
     source_text: str
+    #: Imagebase shared by the batch search, when known.
     imagebase: typing.Optional[int] = None
 
     def __iter__(self) -> typing.Iterator[SearchResults]:
@@ -2750,7 +2768,9 @@ class BatchSearchFormatter(typing.Protocol):
         ...
 
 
+#: Registered batch-search formatter instances, keyed by lowercase name.
 BATCH_SEARCH_FORMATTERS: dict[str, BatchSearchFormatter] = {}
+#: Mapping from lowercase file suffix to registered formatter name.
 BATCH_SEARCH_FORMAT_SUFFIXES: dict[str, str] = {}
 
 
@@ -2783,7 +2803,9 @@ def _hex_or_none(value: typing.Optional[int]) -> typing.Optional[str]:
 class BatchSearchTextFormatter:
     """Human-readable batch search summary."""
 
+    #: Include IDA function names next to previewed matches.
     include_function_names: bool = False
+    #: Maximum number of matches to preview for each batch entry.
     max_preview_matches: int = 3
 
     def _format_match(self, entry: SearchResults, hit: Match) -> str:

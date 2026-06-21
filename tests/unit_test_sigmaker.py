@@ -1626,7 +1626,7 @@ class TestBatchSignatureParser(CoveredUnitTest):
 
     def test_parse_named_quoted_and_plain_patterns(self):
         text = """
-        print = "48 8B ?? ??"; update: E8 ? ? ? ? 48 89 C7
+        print = "48 8B ?? ??"; update := E8 ? ? ? ? 48 89 C7
         90 90 CC
         """
 
@@ -1642,6 +1642,13 @@ class TestBatchSignatureParser(CoveredUnitTest):
         self.assertEqual(queries[2].name, "")
         self.assertEqual(queries[2].raw_pattern, "90 90 CC")
         self.assertEqual(queries[2].source_line, 3)
+
+    def test_parse_does_not_accept_bare_colon_names(self):
+        queries = sigmaker.BatchSignatureParser.parse_many("update: E8 ? ? ? ?")
+
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(queries[0].name, "")
+        self.assertEqual(queries[0].raw_pattern, "update: E8 ? ? ? ?")
 
     def test_parse_does_not_infer_c_declarations_or_join_lines(self):
         text = """
@@ -1668,7 +1675,7 @@ class TestBatchSignatureParser(CoveredUnitTest):
         foo = "AA BB CC" // inline comment
 
         # another comment
-        bar: 11 22 33
+        bar := 11 22 33
         ```
         """
 
@@ -1698,7 +1705,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
 
         text = """
         first = "48 8B C4"
-        second: 48 8B C4
+        second := 48 8B C4
         third = "E8 ? ? ? ? 48"
         """
 

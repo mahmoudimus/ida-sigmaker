@@ -194,7 +194,7 @@ Each pattern is normalized through the same parser used by regular signature sea
 
 Results are printed to the IDA output window with:
 
-- the normalized signature,
+- the parsed search pattern,
 - match count,
 - a short address preview,
 - containing function names when IDA can resolve them,

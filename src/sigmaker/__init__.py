@@ -2956,7 +2956,7 @@ class SignatureParser:
 
     @classmethod
     def _normalize_loose_hex(cls, input_str: str) -> str:
-        """Best-effort cleanup into 'AA BB CC ? DD ' format expected by downstream."""
+        """Best-effort cleanup into a trimmed SigMaker search pattern."""
         s = input_str
         s = re.sub(r"[\)\(\[\]]+", "", s)  # strip brackets
         s = re.sub(r"^\s+", "", s)  # lstrip
@@ -2983,6 +2983,14 @@ class SignatureSearcher:
         return cls(input_signature=input_signature)
 
     @staticmethod
+    def _has_nibble_wildcards(ida_signature: str) -> bool:
+        normalized, _ = SigText.normalize(ida_signature)
+        return any(
+            len(token) == 2 and "?" in token and token != "??"
+            for token in normalized.split()
+        )
+
+    @staticmethod
     def _parse_search_signature(input_signature: str) -> tuple[str, str]:
         """Return the display signature and canonical search signature."""
         try:
@@ -2997,6 +3005,11 @@ class SignatureSearcher:
             not is_wildcard for _, is_wildcard in pattern
         ):
             raise ValueError("Unrecognized signature format")
+        if (
+            not SIMD_SPEEDUP_AVAILABLE
+            and SignatureSearcher._has_nibble_wildcards(normalized)
+        ):
+            raise ValueError("Nibble wildcard search requires SIMD speedups")
         return sig_str, normalized
 
     def search(self) -> SearchResults:
@@ -3004,9 +3017,14 @@ class SignatureSearcher:
             sig_str, canonical_pattern = self._parse_search_signature(
                 self.input_signature
             )
-        except ValueError:
+        except ValueError as exc:
             idaapi.msg("Unrecognized signature type\n")
-            return SearchResults([], "", raw_pattern=self.input_signature)
+            return SearchResults(
+                [],
+                "",
+                raw_pattern=self.input_signature,
+                error=str(exc),
+            )
 
         # Wrap the search in a ProgressDialog to allow cancellation
         with ProgressDialog(
@@ -3127,6 +3145,8 @@ class SignatureSearcher:
             return SignatureSearcher._find_all_simd(
                 ida_signature, skip_more_than_one=skip_more_than_one, buf=buf
             )
+        if SignatureSearcher._has_nibble_wildcards(ida_signature):
+            raise ValueError("Nibble wildcard search requires SIMD speedups")
         binary = idaapi.compiled_binpat_vec_t()
         idaapi.parse_binpat_str(binary, idaapi.inf_get_min_ea(), ida_signature, 16)
         out: list[Match] = []

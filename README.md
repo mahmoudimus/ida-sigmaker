@@ -24,7 +24,6 @@ Background reading on [mahmoudimus.com](https://mahmoudimus.com):
 - [Usage](#usage)
   - [Finding XREFs](#finding-xrefs)
   - [Signature searching](#signature-searching)
-  - [Batch signature search](#batch-signature-search)
   - [Signature Configuration](#signature-configuration)
 - [Performance](#performance)
   - [Benchmarks](#benchmarks)
@@ -175,42 +174,6 @@ If the matched address is not a function name or has no function name, it falls 
 
 ![](./assets/matches_console_no_func.png)
 
-### Batch signature search
-
-To search several signatures at once, choose **Batch search signatures** from the main SigMaker dialog. Paste one signature per line, or separate entries with semicolons.
-
-Batch search accepts named and unnamed patterns:
-
-```text
-print = "48 8B ?? ??"
-update := E8 ? ? ? ? 48 89 C7
-tick = 90 90 CC; draw = "48 89 C7"
-48 8B ?? ?? 89
-```
-
-Names are optional and must use `name := pattern` or `name = pattern`. Quoted patterns are supported only as the right-hand side of a named pattern. SigMaker does not parse C declarations or join patterns across multiple lines. If a pattern has no name, SigMaker labels it by source line in the result list. `#` and `//` comments are ignored outside quoted strings, and Markdown fence lines are skipped so you can paste snippets from issues or notes.
-
-Each pattern is normalized through the same parser used by regular signature search. Invalid patterns are reported per entry instead of aborting the whole batch. Patterns must contain at least one exact byte; an all-wildcard pattern such as `?? ?? ??` is rejected because it matches almost everywhere and is not a useful search key.
-
-Results are printed to the IDA output window with:
-
-- the parsed search pattern,
-- match count,
-- a short address preview,
-- containing function names when IDA can resolve them,
-- RVA relative to the imagebase,
-- file offset when IDA can map the address back to the input file.
-
-After the search, SigMaker can export the batch result list:
-
-| Extension | Format |
-| --- | --- |
-| `.txt` | Human-readable text report |
-| `.csv` | Quoted CSV with name, source line, status, signature, EAs, RVAs, file offsets, and errors |
-| `.json` | Structured JSON with imagebase and per-match `ea`, `rva`, and `file_offset` records |
-
-Unknown export suffixes default to the text formatter. SigMaker does not currently write automatic batch history; exports happen only when you choose to write a file.
-
 ### Signature Configuration
 
 `sigmaker` also supports configurable wildcardable operands for unique signature creation:
@@ -282,6 +245,8 @@ import sigmaker
 text = """
 print = "48 8B ?? ??"
 update := E8 ? ? ? ? 48 89 C7
+tick = 90 90 CC; draw = "48 89 C7"
+48 8B ?? ?? 89
 """
 
 results = sigmaker.BatchSignatureSearcher.from_text(text).search()
@@ -295,6 +260,10 @@ for result in results:
     for hit in result.matches:
         print(f"{hit:ea}", f"{hit:rva}", f"{hit:fileoffset}")
 ```
+
+Batch search accepts named and unnamed patterns. Names are optional and must use `name := pattern` or `name = pattern`. Quoted patterns are supported only as the right-hand side of a named pattern. SigMaker does not parse C declarations or join patterns across multiple lines. If a pattern has no name, SigMaker labels it by source line in the result list. `#` and `//` comments are ignored outside quoted strings, and Markdown fence lines are skipped so you can paste snippets from issues or notes.
+
+Each pattern is normalized through the same parser used by regular signature search. Invalid patterns are reported per entry instead of aborting the whole batch. Patterns must contain at least one exact byte; an all-wildcard pattern such as `?? ?? ??` is rejected because it matches almost everywhere and is not a useful search key.
 
 `BatchSearchResults` is iterable, so `list(results)` gives the per-pattern `SearchResults` objects. `SearchResults.raw_pattern` is the extracted user input, `SearchResults.search_pattern` is the parsed SigMaker search pattern, and `SearchResults.normalized_signature` is the canonical matcher/cache pattern. Nibble wildcard patterns such as `4? ?F ??` keep their nibble masks in both parsed and normalized forms; full-byte wildcards display as `?` in `search_pattern` and normalize to `??` in `normalized_signature`. `SearchResults.signature_str` remains available as a compatibility alias for the search pattern. `SearchResults.matches` remains the main match list, and each `Match` still acts like an int while also carrying optional `rva` and `file_offset` metadata when SigMaker can resolve it.
 `Match` supports f-string fields such as `f"{hit:ea}"`, `f"{hit:rva}"`, and `f"{hit:fileoffset}"`. `:rva` and `:fileoffset` do not fall back to `:ea`, because that would label an absolute address as a derived offset. If a derived field is unavailable, the formatted value is `repr(hit)`, so output still shows the hit EA. Check `hit.rva is not None` or `hit.file_offset is not None` before formatting optional fields in strict output formats.

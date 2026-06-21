@@ -250,9 +250,10 @@ tick = 90 90 CC; draw = "48 89 C7"
 """
 
 results = sigmaker.BatchSignatureSearcher.from_text(text).search()
-print(results.format())       # text
-print(results.format("csv"))  # registered CSV formatter
-print(results.format("json")) # registered JSON formatter
+print(results)            # text
+print(f"{results:text}")  # registered text formatter
+print(f"{results:csv}")   # registered CSV formatter
+print(f"{results:json}")  # registered JSON formatter
 
 for result in results:
     print(result.display_name, result.status, result.match_count)
@@ -302,7 +303,7 @@ class LabelFormatter:
         return "\n".join(lines) + "\n"
 ```
 
-After registration, `results.format("labels")` uses the formatter by name, and exporting to `something.labels` uses it by suffix. Formatter classes are instantiated once at registration time; formatter objects can be registered the same way.
+After registration, `results.format("labels")` and `f"{results:labels}"` use the formatter by name, and exporting to `something.labels` uses it by suffix. Formatter classes are instantiated once at registration time; formatter objects can be registered the same way.
 
 To install a formatter permanently, paste the formatter registration code into `idapythonrc.py` in your IDA user directory. IDA sources that file during startup, so the formatter is available in each new IDA session. For example:
 
@@ -334,7 +335,7 @@ See [`examples/batch_search_c_formatter.py`](./examples/batch_search_c_formatter
 If you embed `sigmaker`, you can rely on the following. These are treated as a contract and are checked before any change to the public surface:
 
 1. **Append-only config.** `SigMakerConfig` fields are never reordered or removed. New behavior arrives as new fields with safe defaults, so existing constructions keep working.
-2. **Stable public names.** These names and their documented attributes are not renamed or removed: `SignatureMaker`, `SigMakerConfig`, `SignatureType` (`IDA`, `x64Dbg`, `Mask`, `BitMask`), `XrefFinder`, `GeneratedSignature` (`signature`, `address`, `status`, `match_count`), `XrefGeneratedSignature` (`signatures`), `Match` (`__str__` returns the hex address, `__format__` supports `ea`, `rva`, and `fileoffset`), `Signature` (`__len__`, `__format__`), `SearchResults` (`matches`, `signature_str`, `raw_pattern`, `search_pattern`, `normalized_signature`), `GenerationPolicy`, `GenerationStatus`, `BatchSignatureSearcher`, `BatchSignatureQuery`, `BatchSearchResults`, `BatchSearchFormatter`.
+2. **Stable public names.** These names and their documented attributes are not renamed or removed: `SignatureMaker`, `SigMakerConfig`, `SignatureType` (`IDA`, `x64Dbg`, `Mask`, `BitMask`), `XrefFinder`, `GeneratedSignature` (`signature`, `address`, `status`, `match_count`), `XrefGeneratedSignature` (`signatures`), `Match` (`__str__` returns the hex address, `__format__` supports `ea`, `rva`, and `fileoffset`), `Signature` (`__len__`, `__format__`), `SearchResults` (`matches`, `signature_str`, `raw_pattern`, `search_pattern`, `normalized_signature`), `GenerationPolicy`, `GenerationStatus`, `BatchSignatureSearcher`, `BatchSignatureQuery`, `BatchSearchResults` (`__str__`, `__format__`), `BatchSearchFormatter`.
 3. **Stable method signatures.** `SignatureMaker.make_signature(ea, cfg, end=None, *, progress_reporter=None, policy=GenerationPolicy.strict())`, `XrefFinder.find_xrefs(ea, cfg)`, `XrefFinder.count_code_xrefs_to(ea)`, and `XrefFinder.iter_code_xrefs_to(ea)`.
 4. **Stable format specs.** `f"{sig:ida}"`, `f"{sig:x64dbg}"`, `f"{sig:mask}"`, and `f"{sig:bitmask}"` keep producing their current output exactly. Batch search keeps the registered built-in formatter names `text`, `csv`, and `json`.
 5. **Byte-identical defaults.** Production defaults are unchanged across optimizations: a script that does not opt into a new flag gets byte-identical signatures to previous versions.

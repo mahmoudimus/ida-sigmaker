@@ -2687,6 +2687,12 @@ class BatchSearchResults:
     ) -> typing.Union[SearchResults, list[SearchResults]]:
         return self.results[index]
 
+    def __str__(self) -> str:
+        return self.format()
+
+    def __format__(self, format_spec: str) -> str:
+        return self.format(format_spec or None)
+
     @property
     def matched_count(self) -> int:
         return sum(1 for result in self.results if result.matches)

@@ -269,7 +269,7 @@ Each pattern is normalized through the same parser used by regular signature sea
 `BatchSearchResults` is iterable, so `list(results)` gives the per-pattern `SearchResults` objects. `SearchResults.raw_pattern` is the extracted user input, `SearchResults.search_pattern` is the parsed SigMaker search pattern, and `SearchResults.normalized_signature` is the canonical matcher/cache pattern. Nibble wildcard patterns such as `4? ?F ??` keep their nibble masks in both parsed and normalized forms; full-byte wildcards display as `?` in `search_pattern` and normalize to `??` in `normalized_signature`. `SearchResults.signature_str` remains available as a compatibility alias for the search pattern. `SearchResults.matches` remains the main match list, and each `Match` still acts like an int while also carrying optional `rva` and `file_offset` metadata when SigMaker can resolve it.
 `Match` supports f-string fields such as `f"{hit:ea}"`, `f"{hit:rva}"`, and `f"{hit:fileoffset}"`. `:rva` and `:fileoffset` do not fall back to `:ea`, because that would label an absolute address as a derived offset. If a derived field is unavailable, the formatted value is `repr(hit)`, so output still shows the hit EA. Check `hit.rva is not None` or `hit.file_offset is not None` before formatting optional fields in strict output formats.
 
-`BatchSearchResults.display()` writes the selected formatter to `idaapi.msg` by default, or to any text file-like object or callable sink:
+`BatchSearchResults.display()` writes the text format to `idaapi.msg` by default, or writes the selected formatter to any text file-like object or callable sink:
 
 ```python
 import io
@@ -305,26 +305,7 @@ class LabelFormatter:
 
 After registration, `results.format("labels")` and `f"{results:labels}"` use the formatter by name, and exporting to `something.labels` uses it by suffix. Formatter classes are instantiated once at registration time; formatter objects can be registered the same way.
 
-To install a formatter permanently, paste the formatter registration code into `idapythonrc.py` in your IDA user directory. IDA sources that file during startup, so the formatter is available in each new IDA session. For example:
-
-```python
-# $IDAUSR/idapythonrc.py
-import sigmaker
-
-
-@sigmaker.BatchSearchFormatter.register("labels", suffixes=(".labels",))
-class LabelFormatter:
-    def format(self, results: sigmaker.BatchSearchResults) -> str:
-        lines = []
-        for result in results:
-            if len(result.matches) != 1:
-                continue
-            name = result.name or result.display_name
-            hit = result.matches[0]
-            address = f"{hit:rva}" if hit.rva is not None else f"{hit:ea}"
-            lines.append(f"{name}: {address}")
-        return "\n".join(lines) + "\n"
-```
+To install a formatter permanently, paste the same formatter registration code into `$IDAUSR/idapythonrc.py`. IDA sources that file during startup, so the formatter is available in each new IDA session.
 
 If `sigmaker` is not already importable from your IDA Python environment, add the SigMaker plugin directory to `sys.path` before the formatter code.
 

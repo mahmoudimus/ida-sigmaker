@@ -2550,14 +2550,23 @@ class SearchResults:
         return None
 
     @classmethod
-    def file_offsets_for_matches(cls, hits: list[Match]) -> dict[int, int]:
+    def file_offsets_for_matches(
+        cls,
+        hits: list[Match],
+        cache: typing.Optional[dict[int, int]] = None,
+    ) -> dict[int, int]:
         file_offsets: dict[int, int] = {}
+        cache = cache if cache is not None else {}
         for hit in hits:
             ea = int(hit)
             if ea in file_offsets:
                 continue
+            if ea in cache:
+                file_offsets[ea] = cache[ea]
+                continue
             file_offset = cls._file_offset_for_ea(ea)
             if file_offset is not None:
+                cache[ea] = file_offset
                 file_offsets[ea] = file_offset
         return file_offsets
 
@@ -2655,15 +2664,6 @@ class BatchSignatureQuery:
     #: One-based source line in the pasted batch input.
     source_line: int = 0
 
-    @property
-    def display_name(self) -> str:
-        if self.name:
-            return self.name
-        if self.source_line:
-            return f"Pattern line {self.source_line}"
-        return "Pattern"
-
-
 @dataclasses.dataclass(slots=True)
 class BatchSearchResults:
     """Result container for batch signature searches."""
@@ -2719,8 +2719,7 @@ class BatchSearchResults:
             typing.Union[str, "BatchSearchFormatter"]
         ] = None,
     ) -> None:
-        formatter = formatter or BatchSearchTextFormatter(include_function_names=True)
-        text = batch_search_formatter(formatter).format(self)
+        text = self.format(formatter)
         if output is None:
             idaapi.msg(text)
             return
@@ -3391,16 +3390,6 @@ class BatchSignatureSearcher:
     def from_text(cls, input_text: str) -> "BatchSignatureSearcher":
         return cls(input_text=input_text)
 
-    @classmethod
-    def _file_offsets_for_results(
-        cls,
-        results: list[SearchResults],
-    ) -> dict[int, int]:
-        matches: list[Match] = []
-        for result in results:
-            matches.extend(result.matches)
-        return SearchResults.file_offsets_for_matches(matches)
-
     def search(
         self,
         buf: typing.Optional["InMemoryBuffer"] = None,
@@ -3408,6 +3397,8 @@ class BatchSignatureSearcher:
         queries = BatchSignatureParser.parse_many(self.input_text)
         results: list[SearchResults] = []
         match_cache: dict[str, list[Match]] = {}
+        file_offset_cache: dict[int, int] = {}
+        imagebase = SearchResults.current_imagebase(buf)
 
         for query in queries:
             try:
@@ -3420,12 +3411,18 @@ class BatchSignatureSearcher:
                     matches = SignatureSearcher.find_all(normalized, buf=buf)
                     match_cache[normalized] = matches
 
+                file_offsets = SearchResults.file_offsets_for_matches(
+                    matches,
+                    cache=file_offset_cache,
+                )
                 result = SearchResults(
                     matches=list(matches),
                     signature_str=signature_str,
                     raw_pattern=query.raw_pattern,
                     name=query.name,
                     source_line=query.source_line,
+                    imagebase=imagebase,
+                    file_offsets=file_offsets,
                     canonical_pattern=normalized,
                 )
             except UserCanceledError:
@@ -3437,20 +3434,10 @@ class BatchSignatureSearcher:
                     raw_pattern=query.raw_pattern,
                     name=query.name,
                     source_line=query.source_line,
+                    imagebase=imagebase,
                     error=str(exc),
                 )
             results.append(result)
-
-        imagebase = SearchResults.current_imagebase(buf)
-        file_offsets = self._file_offsets_for_results(results)
-        for result in results:
-            result.imagebase = imagebase
-            result.file_offsets = {
-                int(hit): file_offsets[int(hit)]
-                for hit in result.matches
-                if int(hit) in file_offsets
-            }
-            result._apply_match_metadata()
 
         return BatchSearchResults(
             results=results,

@@ -1909,6 +1909,23 @@ class TestBatchSearchFormatters(CoveredUnitTest):
         self.assertIn("Imagebase: 0x140000000", out)
         self.assertIn("[print] 1 match(es) for 48 8B ? 48 89", out)
 
+    def test_results_str_defaults_to_text_formatter(self):
+        self.assertEqual(str(self._results()), self._results().format())
+
+    def test_results_format_spec_selects_registered_formatter(self):
+        self.assertEqual(
+            f"{self._results():text}",
+            self._results().format("text"),
+        )
+        self.assertEqual(
+            f"{self._results():csv}",
+            self._results().format("csv"),
+        )
+        self.assertEqual(
+            f"{self._results():json}",
+            self._results().format("json"),
+        )
+
     def test_display_writes_formatted_text_to_text_io(self):
         output = io.StringIO()
         formatter = sigmaker.BatchSearchTextFormatter(max_preview_matches=1)

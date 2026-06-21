@@ -2930,91 +2930,6 @@ def batch_search_formatter_for_path(path: pathlib.Path) -> BatchSearchFormatter:
     return batch_search_formatter(format_name)
 
 
-class BatchSignatureParser:
-    """Parse a pasted list of named or unnamed signature patterns."""
-
-    _FENCE_RE = re.compile(r"^```")
-    _NAMED_PATTERN_RE = re.compile(r"^([A-Za-z_]\w*)\s*(?::=|=)\s*(.+)$")
-
-    @classmethod
-    def parse_many(cls, text: str) -> list["SignatureSearcher"]:
-        searchers: list[SignatureSearcher] = []
-        for source_line, statement in cls._split_statements(text):
-            searcher = cls._parse_statement(statement, source_line)
-            if searcher is not None:
-                searchers.append(searcher)
-        return searchers
-
-    @classmethod
-    def _split_statements(cls, text: str) -> list[tuple[int, str]]:
-        statements: list[tuple[int, str]] = []
-        for source_line, raw_line in enumerate(text.splitlines(), start=1):
-            line = cls._strip_comments(raw_line)
-            current: list[str] = []
-            in_quote = False
-            escaped = False
-
-            for ch in line:
-                if ch == ";" and not in_quote:
-                    statement = "".join(current).strip()
-                    if statement:
-                        statements.append((source_line, statement))
-                    current = []
-                    escaped = False
-                    continue
-
-                current.append(ch)
-                if ch == '"' and not escaped:
-                    in_quote = not in_quote
-                escaped = ch == "\\" and not escaped
-
-            statement = "".join(current).strip()
-            if statement:
-                statements.append((source_line, statement))
-        return statements
-
-    @classmethod
-    def _parse_statement(
-        cls, statement: str, source_line: int
-    ) -> typing.Optional["SignatureSearcher"]:
-        line = statement.strip()
-        if not line or cls._FENCE_RE.match(line):
-            return None
-
-        named_pattern = cls._NAMED_PATTERN_RE.match(line)
-        if named_pattern:
-            pattern = cls._strip_optional_quotes(named_pattern.group(2).strip())
-            if pattern:
-                return SignatureSearcher.from_signature(
-                    pattern,
-                    name=named_pattern.group(1),
-                    source_line=source_line,
-                )
-
-        return SignatureSearcher.from_signature(line, source_line=source_line)
-
-    @staticmethod
-    def _strip_comments(line: str) -> str:
-        in_quote = False
-        escaped = False
-        for idx, ch in enumerate(line):
-            if ch == '"' and not escaped:
-                in_quote = not in_quote
-            if not in_quote:
-                if ch == "#":
-                    return line[:idx]
-                if ch == "/" and idx + 1 < len(line) and line[idx + 1] == "/":
-                    return line[:idx]
-            escaped = ch == "\\" and not escaped
-        return line
-
-    @staticmethod
-    def _strip_optional_quotes(pattern: str) -> str:
-        if len(pattern) >= 2 and pattern[0] == '"' and pattern[-1] == '"':
-            return pattern[1:-1].strip()
-        return pattern
-
-
 class SignatureParser:
     """Centralized, readable parsing for various signature input styles.
 
@@ -3119,6 +3034,11 @@ class SignatureSearcher:
     #: One-based source line in batch input, or zero when unknown.
     source_line: int = dataclasses.field(default=0, kw_only=True)
 
+    _FENCE_RE: typing.ClassVar[re.Pattern[str]] = re.compile(r"^```")
+    _NAMED_PATTERN_RE: typing.ClassVar[re.Pattern[str]] = re.compile(
+        r"^([A-Za-z_]\w*)\s*(?::=|=)\s*(.+)$"
+    )
+
     @classmethod
     def from_signature(
         cls,
@@ -3132,6 +3052,85 @@ class SignatureSearcher:
             name=name,
             source_line=source_line,
         )
+
+    @classmethod
+    def from_many(cls, text: str) -> list["SignatureSearcher"]:
+        """Create searchers from pasted named or unnamed signature lines."""
+        searchers: list[SignatureSearcher] = []
+        for source_line, statement in cls._split_statements(text):
+            searcher = cls._from_statement(statement, source_line)
+            if searcher is not None:
+                searchers.append(searcher)
+        return searchers
+
+    @classmethod
+    def _split_statements(cls, text: str) -> list[tuple[int, str]]:
+        statements: list[tuple[int, str]] = []
+        for source_line, raw_line in enumerate(text.splitlines(), start=1):
+            line = cls._strip_comments(raw_line)
+            current: list[str] = []
+            in_quote = False
+            escaped = False
+
+            for ch in line:
+                if ch == ";" and not in_quote:
+                    statement = "".join(current).strip()
+                    if statement:
+                        statements.append((source_line, statement))
+                    current = []
+                    escaped = False
+                    continue
+
+                current.append(ch)
+                if ch == '"' and not escaped:
+                    in_quote = not in_quote
+                escaped = ch == "\\" and not escaped
+
+            statement = "".join(current).strip()
+            if statement:
+                statements.append((source_line, statement))
+        return statements
+
+    @classmethod
+    def _from_statement(
+        cls, statement: str, source_line: int
+    ) -> typing.Optional["SignatureSearcher"]:
+        line = statement.strip()
+        if not line or cls._FENCE_RE.match(line):
+            return None
+
+        named_pattern = cls._NAMED_PATTERN_RE.match(line)
+        if named_pattern:
+            pattern = cls._strip_optional_quotes(named_pattern.group(2).strip())
+            if pattern:
+                return cls.from_signature(
+                    pattern,
+                    name=named_pattern.group(1),
+                    source_line=source_line,
+                )
+
+        return cls.from_signature(line, source_line=source_line)
+
+    @staticmethod
+    def _strip_comments(line: str) -> str:
+        in_quote = False
+        escaped = False
+        for idx, ch in enumerate(line):
+            if ch == '"' and not escaped:
+                in_quote = not in_quote
+            if not in_quote:
+                if ch == "#":
+                    return line[:idx]
+                if ch == "/" and idx + 1 < len(line) and line[idx + 1] == "/":
+                    return line[:idx]
+            escaped = ch == "\\" and not escaped
+        return line
+
+    @staticmethod
+    def _strip_optional_quotes(pattern: str) -> str:
+        if len(pattern) >= 2 and pattern[0] == '"' and pattern[-1] == '"':
+            return pattern[1:-1].strip()
+        return pattern
 
     @staticmethod
     def _has_nibble_wildcards(ida_signature: str) -> bool:
@@ -3400,14 +3399,14 @@ class BatchSignatureSearcher:
     def from_text(cls, input_text: str) -> "BatchSignatureSearcher":
         return cls(
             input_text=input_text,
-            searchers=BatchSignatureParser.parse_many(input_text),
+            searchers=SignatureSearcher.from_many(input_text),
         )
 
     def search(
         self,
         buf: typing.Optional["InMemoryBuffer"] = None,
     ) -> BatchSearchResults:
-        searchers = self.searchers or BatchSignatureParser.parse_many(self.input_text)
+        searchers = self.searchers or SignatureSearcher.from_many(self.input_text)
         results: list[SearchResults] = []
         match_cache: dict[str, list[Match]] = {}
         file_offset_cache: dict[int, int] = {}

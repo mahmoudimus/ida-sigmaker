@@ -1659,8 +1659,8 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         self.assertEqual(result.source_line, 7)
 
 
-class TestBatchSignatureParser(CoveredUnitTest):
-    """Batch search accepts named and unnamed pasted signature lines."""
+class TestSignatureSearcherFromMany(CoveredUnitTest):
+    """Batch construction accepts named and unnamed pasted signature lines."""
 
     def test_parse_named_quoted_and_plain_patterns(self):
         text = """
@@ -1668,7 +1668,7 @@ class TestBatchSignatureParser(CoveredUnitTest):
         90 90 CC
         """
 
-        searchers = sigmaker.BatchSignatureParser.parse_many(text)
+        searchers = sigmaker.SignatureSearcher.from_many(text)
 
         self.assertEqual(len(searchers), 3)
         self.assertEqual(searchers[0].name, "print")
@@ -1682,7 +1682,7 @@ class TestBatchSignatureParser(CoveredUnitTest):
         self.assertEqual(searchers[2].source_line, 3)
 
     def test_parse_does_not_accept_bare_colon_names(self):
-        searchers = sigmaker.BatchSignatureParser.parse_many("update: E8 ? ? ? ?")
+        searchers = sigmaker.SignatureSearcher.from_many("update: E8 ? ? ? ?")
 
         self.assertEqual(len(searchers), 1)
         self.assertIsNone(searchers[0].name)
@@ -1695,7 +1695,7 @@ class TestBatchSignatureParser(CoveredUnitTest):
           "90 90 CC";
         """
 
-        searchers = sigmaker.BatchSignatureParser.parse_many(text)
+        searchers = sigmaker.SignatureSearcher.from_many(text)
 
         self.assertEqual(
             [
@@ -1720,15 +1720,15 @@ class TestBatchSignatureParser(CoveredUnitTest):
         ```
         """
 
-        searchers = sigmaker.BatchSignatureParser.parse_many(text)
+        searchers = sigmaker.SignatureSearcher.from_many(text)
 
         self.assertEqual(
             [(searcher.name, searcher.input_signature) for searcher in searchers],
             [("foo", "AA BB CC"), ("bar", "11 22 33")],
         )
 
-    def test_empty_input_returns_no_queries(self):
-        self.assertEqual(sigmaker.BatchSignatureParser.parse_many("  \n\t"), [])
+    def test_empty_input_returns_no_searchers(self):
+        self.assertEqual(sigmaker.SignatureSearcher.from_many("  \n\t"), [])
 
 
 class TestBatchSignatureSearcher(CoveredUnitTest):

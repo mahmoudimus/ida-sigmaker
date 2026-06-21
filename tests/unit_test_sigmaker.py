@@ -1642,6 +1642,22 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         finally:
             sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
 
+    def test_searcher_metadata_flows_to_results(self):
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[sigmaker.Match(0x1000)],
+        ):
+            result = sigmaker.SignatureSearcher.from_signature(
+                "90",
+                name="tick",
+                source_line=7,
+            ).search()
+
+        self.assertEqual(result.raw_pattern, "90")
+        self.assertEqual(result.name, "tick")
+        self.assertEqual(result.source_line, 7)
+
 
 class TestBatchSignatureParser(CoveredUnitTest):
     """Batch search accepts named and unnamed pasted signature lines."""
@@ -1652,25 +1668,25 @@ class TestBatchSignatureParser(CoveredUnitTest):
         90 90 CC
         """
 
-        queries = sigmaker.BatchSignatureParser.parse_many(text)
+        searchers = sigmaker.BatchSignatureParser.parse_many(text)
 
-        self.assertEqual(len(queries), 3)
-        self.assertEqual(queries[0].name, "print")
-        self.assertEqual(queries[0].raw_pattern, "48 8B ?? ??")
-        self.assertEqual(queries[0].source_line, 2)
-        self.assertEqual(queries[1].name, "update")
-        self.assertEqual(queries[1].raw_pattern, "E8 ? ? ? ? 48 89 C7")
-        self.assertEqual(queries[1].source_line, 2)
-        self.assertEqual(queries[2].name, "")
-        self.assertEqual(queries[2].raw_pattern, "90 90 CC")
-        self.assertEqual(queries[2].source_line, 3)
+        self.assertEqual(len(searchers), 3)
+        self.assertEqual(searchers[0].name, "print")
+        self.assertEqual(searchers[0].input_signature, "48 8B ?? ??")
+        self.assertEqual(searchers[0].source_line, 2)
+        self.assertEqual(searchers[1].name, "update")
+        self.assertEqual(searchers[1].input_signature, "E8 ? ? ? ? 48 89 C7")
+        self.assertEqual(searchers[1].source_line, 2)
+        self.assertIsNone(searchers[2].name)
+        self.assertEqual(searchers[2].input_signature, "90 90 CC")
+        self.assertEqual(searchers[2].source_line, 3)
 
     def test_parse_does_not_accept_bare_colon_names(self):
-        queries = sigmaker.BatchSignatureParser.parse_many("update: E8 ? ? ? ?")
+        searchers = sigmaker.BatchSignatureParser.parse_many("update: E8 ? ? ? ?")
 
-        self.assertEqual(len(queries), 1)
-        self.assertEqual(queries[0].name, "")
-        self.assertEqual(queries[0].raw_pattern, "update: E8 ? ? ? ?")
+        self.assertEqual(len(searchers), 1)
+        self.assertIsNone(searchers[0].name)
+        self.assertEqual(searchers[0].input_signature, "update: E8 ? ? ? ?")
 
     def test_parse_does_not_infer_c_declarations_or_join_lines(self):
         text = """
@@ -1679,14 +1695,17 @@ class TestBatchSignatureParser(CoveredUnitTest):
           "90 90 CC";
         """
 
-        queries = sigmaker.BatchSignatureParser.parse_many(text)
+        searchers = sigmaker.BatchSignatureParser.parse_many(text)
 
         self.assertEqual(
-            [(query.name, query.raw_pattern, query.source_line) for query in queries],
             [
-                ("", 'constexpr const char* print = "48 8B ?? ??"', 2),
-                ("", "split =", 3),
-                ("", '"90 90 CC"', 4),
+                (searcher.name, searcher.input_signature, searcher.source_line)
+                for searcher in searchers
+            ],
+            [
+                (None, 'constexpr const char* print = "48 8B ?? ??"', 2),
+                (None, "split =", 3),
+                (None, '"90 90 CC"', 4),
             ],
         )
 
@@ -1701,10 +1720,10 @@ class TestBatchSignatureParser(CoveredUnitTest):
         ```
         """
 
-        queries = sigmaker.BatchSignatureParser.parse_many(text)
+        searchers = sigmaker.BatchSignatureParser.parse_many(text)
 
         self.assertEqual(
-            [(query.name, query.raw_pattern) for query in queries],
+            [(searcher.name, searcher.input_signature) for searcher in searchers],
             [("foo", "AA BB CC"), ("bar", "11 22 33")],
         )
 
@@ -1714,6 +1733,24 @@ class TestBatchSignatureParser(CoveredUnitTest):
 
 class TestBatchSignatureSearcher(CoveredUnitTest):
     """Batch search normalizes patterns and keeps per-entry errors."""
+
+    def test_from_text_stores_parsed_signature_searchers(self):
+        batch = sigmaker.BatchSignatureSearcher.from_text(
+            'print = "48 8B C4"\n90 90 CC'
+        )
+
+        self.assertEqual(batch.input_text, 'print = "48 8B C4"\n90 90 CC')
+        self.assertEqual(len(batch.searchers), 2)
+        self.assertTrue(
+            all(
+                isinstance(searcher, sigmaker.SignatureSearcher)
+                for searcher in batch.searchers
+            )
+        )
+        self.assertEqual(batch.searchers[0].input_signature, "48 8B C4")
+        self.assertEqual(batch.searchers[0].name, "print")
+        self.assertEqual(batch.searchers[1].input_signature, "90 90 CC")
+        self.assertIsNone(batch.searchers[1].name)
 
     def test_search_reuses_normalized_match_results(self):
         calls: list[str] = []

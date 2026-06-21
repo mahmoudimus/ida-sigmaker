@@ -2531,17 +2531,6 @@ class SearchResults:
                 idaapi.msg(f"Match @ {ea}\n")
 
 
-@dataclasses.dataclass(slots=True, frozen=True)
-class BatchSignatureQuery:
-    """One raw pattern from a pasted batch search input."""
-
-    #: Exact pattern text for this batch entry.
-    raw_pattern: str
-    #: Optional user-supplied pattern name.
-    name: str = ""
-    #: One-based source line in the pasted batch input.
-    source_line: int = 0
-
 @dataclasses.dataclass(slots=True)
 class BatchSearchResults:
     """Result container for batch signature searches."""
@@ -2826,13 +2815,13 @@ class BatchSignatureParser:
     _NAMED_PATTERN_RE = re.compile(r"^([A-Za-z_]\w*)\s*(?::=|=)\s*(.+)$")
 
     @classmethod
-    def parse_many(cls, text: str) -> list[BatchSignatureQuery]:
-        queries: list[BatchSignatureQuery] = []
+    def parse_many(cls, text: str) -> list["SignatureSearcher"]:
+        searchers: list[SignatureSearcher] = []
         for source_line, statement in cls._split_statements(text):
-            query = cls._parse_statement(statement, source_line)
-            if query is not None:
-                queries.append(query)
-        return queries
+            searcher = cls._parse_statement(statement, source_line)
+            if searcher is not None:
+                searchers.append(searcher)
+        return searchers
 
     @classmethod
     def _split_statements(cls, text: str) -> list[tuple[int, str]]:
@@ -2865,7 +2854,7 @@ class BatchSignatureParser:
     @classmethod
     def _parse_statement(
         cls, statement: str, source_line: int
-    ) -> typing.Optional[BatchSignatureQuery]:
+    ) -> typing.Optional["SignatureSearcher"]:
         line = statement.strip()
         if not line or cls._FENCE_RE.match(line):
             return None
@@ -2874,13 +2863,13 @@ class BatchSignatureParser:
         if named_pattern:
             pattern = cls._strip_optional_quotes(named_pattern.group(2).strip())
             if pattern:
-                return BatchSignatureQuery(
-                    raw_pattern=pattern,
+                return SignatureSearcher.from_signature(
+                    pattern,
                     name=named_pattern.group(1),
                     source_line=source_line,
                 )
 
-        return BatchSignatureQuery(raw_pattern=line, source_line=source_line)
+        return SignatureSearcher.from_signature(line, source_line=source_line)
 
     @staticmethod
     def _strip_comments(line: str) -> str:
@@ -3003,10 +2992,24 @@ class SignatureSearcher:
     """Parses a signature string and searches the DB for matches."""
 
     input_signature: str = ""
+    #: Optional user-supplied pattern name.
+    name: typing.Optional[str] = dataclasses.field(default=None, kw_only=True)
+    #: One-based source line in batch input, or zero when unknown.
+    source_line: int = dataclasses.field(default=0, kw_only=True)
 
     @classmethod
-    def from_signature(cls, input_signature: str) -> "SignatureSearcher":
-        return cls(input_signature=input_signature)
+    def from_signature(
+        cls,
+        input_signature: str,
+        *,
+        name: typing.Optional[str] = None,
+        source_line: int = 0,
+    ) -> "SignatureSearcher":
+        return cls(
+            input_signature=input_signature,
+            name=name,
+            source_line=source_line,
+        )
 
     @staticmethod
     def _has_nibble_wildcards(ida_signature: str) -> bool:
@@ -3049,6 +3052,8 @@ class SignatureSearcher:
                 [],
                 "",
                 raw_pattern=self.input_signature,
+                name=self.name or "",
+                source_line=self.source_line,
                 error=str(exc),
             )
 
@@ -3064,6 +3069,8 @@ class SignatureSearcher:
             matches,
             sig_str,
             raw_pattern=self.input_signature,
+            name=self.name or "",
+            source_line=self.source_line,
             imagebase=SearchResults.current_imagebase(),
             canonical_pattern=canonical_pattern,
         )
@@ -3233,26 +3240,32 @@ class SignatureSearcher:
 class BatchSignatureSearcher:
     """Search multiple pasted signatures in one operation."""
 
+    #: Original pasted batch input.
     input_text: str
+    #: Parsed per-entry signature searchers.
+    searchers: list[SignatureSearcher] = dataclasses.field(default_factory=list)
 
     @classmethod
     def from_text(cls, input_text: str) -> "BatchSignatureSearcher":
-        return cls(input_text=input_text)
+        return cls(
+            input_text=input_text,
+            searchers=BatchSignatureParser.parse_many(input_text),
+        )
 
     def search(
         self,
         buf: typing.Optional["InMemoryBuffer"] = None,
     ) -> BatchSearchResults:
-        queries = BatchSignatureParser.parse_many(self.input_text)
+        searchers = self.searchers or BatchSignatureParser.parse_many(self.input_text)
         results: list[SearchResults] = []
         match_cache: dict[str, list[Match]] = {}
         file_offset_cache: dict[int, int] = {}
         imagebase = SearchResults.current_imagebase(buf)
 
-        for query in queries:
+        for searcher in searchers:
             try:
                 signature_str, normalized = SignatureSearcher._parse_search_signature(
-                    query.raw_pattern
+                    searcher.input_signature
                 )
 
                 matches = match_cache.get(normalized)
@@ -3267,9 +3280,9 @@ class BatchSignatureSearcher:
                 result = SearchResults(
                     matches=list(matches),
                     signature_str=signature_str,
-                    raw_pattern=query.raw_pattern,
-                    name=query.name,
-                    source_line=query.source_line,
+                    raw_pattern=searcher.input_signature,
+                    name=searcher.name or "",
+                    source_line=searcher.source_line,
                     imagebase=imagebase,
                     file_offsets=file_offsets,
                     canonical_pattern=normalized,
@@ -3280,9 +3293,9 @@ class BatchSignatureSearcher:
                 result = SearchResults(
                     [],
                     "",
-                    raw_pattern=query.raw_pattern,
-                    name=query.name,
-                    source_line=query.source_line,
+                    raw_pattern=searcher.input_signature,
+                    name=searcher.name or "",
+                    source_line=searcher.source_line,
                     imagebase=imagebase,
                     error=str(exc),
                 )

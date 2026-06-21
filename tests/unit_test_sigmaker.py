@@ -1626,8 +1626,7 @@ class TestBatchSignatureParser(CoveredUnitTest):
 
     def test_parse_named_quoted_and_plain_patterns(self):
         text = """
-        constexpr const char* print = "48 8B ?? ??";
-        update: E8 ? ? ? ? 48 89 C7
+        print = "48 8B ?? ??"; update: E8 ? ? ? ? 48 89 C7
         90 90 CC
         """
 
@@ -1639,10 +1638,28 @@ class TestBatchSignatureParser(CoveredUnitTest):
         self.assertEqual(queries[0].source_line, 2)
         self.assertEqual(queries[1].name, "update")
         self.assertEqual(queries[1].raw_pattern, "E8 ? ? ? ? 48 89 C7")
-        self.assertEqual(queries[1].source_line, 3)
+        self.assertEqual(queries[1].source_line, 2)
         self.assertEqual(queries[2].name, "")
         self.assertEqual(queries[2].raw_pattern, "90 90 CC")
-        self.assertEqual(queries[2].source_line, 4)
+        self.assertEqual(queries[2].source_line, 3)
+
+    def test_parse_does_not_infer_c_declarations_or_join_lines(self):
+        text = """
+        constexpr const char* print = "48 8B ?? ??";
+        split =
+          "90 90 CC";
+        """
+
+        queries = sigmaker.BatchSignatureParser.parse_many(text)
+
+        self.assertEqual(
+            [(query.name, query.raw_pattern, query.source_line) for query in queries],
+            [
+                ("", 'constexpr const char* print = "48 8B ?? ??"', 2),
+                ("", "split =", 3),
+                ("", '"90 90 CC"', 4),
+            ],
+        )
 
     def test_parse_ignores_blank_comment_and_fence_lines(self):
         text = """
@@ -1798,7 +1815,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             side_effect=sigmaker.UserCanceledError("Canceled"),
         ):
             with self.assertRaises(sigmaker.UserCanceledError):
-                sigmaker.BatchSignatureSearcher.from_text('"48 8B C4"').search()
+                sigmaker.BatchSignatureSearcher.from_text("48 8B C4").search()
 
     def test_search_propagates_unexpected_search_errors(self):
         with patch.object(
@@ -1807,7 +1824,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             side_effect=RuntimeError("database unavailable"),
         ):
             with self.assertRaises(RuntimeError):
-                sigmaker.BatchSignatureSearcher.from_text('"48 8B C4"').search()
+                sigmaker.BatchSignatureSearcher.from_text("48 8B C4").search()
 
 
 class TestBatchSearchFormatters(CoveredUnitTest):

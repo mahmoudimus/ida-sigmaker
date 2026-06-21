@@ -2799,8 +2799,7 @@ class BatchSignatureParser:
     """Parse a pasted list of named or unnamed signature patterns."""
 
     _FENCE_RE = re.compile(r"^```")
-    _ASSIGNMENT_RE = re.compile(r"(.+?)(?:[:=])\s*(.+)$")
-    _IDENTIFIER_RE = re.compile(r"[A-Za-z_]\w*")
+    _NAMED_PATTERN_RE = re.compile(r"^([A-Za-z_]\w*)\s*[:=]\s*(.+)$")
 
     @classmethod
     def parse_many(cls, text: str) -> list[BatchSignatureQuery]:
@@ -2814,76 +2813,46 @@ class BatchSignatureParser:
     @classmethod
     def _split_statements(cls, text: str) -> list[tuple[int, str]]:
         statements: list[tuple[int, str]] = []
-        current: list[str] = []
-        start_line = 1
-        line_number = 1
-        in_quote = False
-        escaped = False
+        for source_line, raw_line in enumerate(text.splitlines(), start=1):
+            line = cls._strip_comments(raw_line)
+            current: list[str] = []
+            in_quote = False
+            escaped = False
 
-        for ch in text:
-            if not current and ch.isspace():
-                if ch == "\n":
-                    line_number += 1
-                escaped = False
-                continue
-            if not current:
-                start_line = line_number
-            if ch == "\n":
-                if not in_quote:
+            for ch in line:
+                if ch == ";" and not in_quote:
                     statement = "".join(current).strip()
                     if statement:
-                        statements.append((start_line, statement))
+                        statements.append((source_line, statement))
                     current = []
-                    line_number += 1
                     escaped = False
                     continue
+
                 current.append(ch)
-                line_number += 1
-                escaped = False
-                continue
-            if ch == ";" and not in_quote:
-                statement = "".join(current).strip()
-                if statement:
-                    statements.append((start_line, statement))
-                current = []
-                escaped = False
-                continue
+                if ch == '"' and not escaped:
+                    in_quote = not in_quote
+                escaped = ch == "\\" and not escaped
 
-            current.append(ch)
-            if ch == '"' and not escaped:
-                in_quote = not in_quote
-            escaped = ch == "\\" and not escaped
-
-        statement = "".join(current).strip()
-        if statement:
-            statements.append((start_line, statement))
+            statement = "".join(current).strip()
+            if statement:
+                statements.append((source_line, statement))
         return statements
 
     @classmethod
     def _parse_statement(
         cls, statement: str, source_line: int
     ) -> typing.Optional[BatchSignatureQuery]:
-        line = cls._strip_comments(statement).strip()
+        line = statement.strip()
         if not line or cls._FENCE_RE.match(line):
             return None
 
-        quoted = re.search(r'"([^"\n]+)"', line)
-        if quoted:
-            prefix = line[: quoted.start()].strip()
-            return BatchSignatureQuery(
-                raw_pattern=quoted.group(1).strip(),
-                name=cls._extract_name(prefix),
-                source_line=source_line,
-            )
-
-        assignment = cls._ASSIGNMENT_RE.match(line)
-        if assignment:
-            prefix = assignment.group(1).strip()
-            pattern = assignment.group(2).strip().strip('"')
+        named_pattern = cls._NAMED_PATTERN_RE.match(line)
+        if named_pattern:
+            pattern = cls._strip_optional_quotes(named_pattern.group(2).strip())
             if pattern:
                 return BatchSignatureQuery(
                     raw_pattern=pattern,
-                    name=cls._extract_name(prefix),
+                    name=named_pattern.group(1),
                     source_line=source_line,
                 )
 
@@ -2904,10 +2873,11 @@ class BatchSignatureParser:
             escaped = ch == "\\" and not escaped
         return line
 
-    @classmethod
-    def _extract_name(cls, prefix: str) -> str:
-        tokens = cls._IDENTIFIER_RE.findall(prefix)
-        return tokens[-1] if tokens else ""
+    @staticmethod
+    def _strip_optional_quotes(pattern: str) -> str:
+        if len(pattern) >= 2 and pattern[0] == '"' and pattern[-1] == '"':
+            return pattern[1:-1].strip()
+        return pattern
 
 
 class SignatureParser:
@@ -4145,7 +4115,8 @@ class SigMakerPlugin(idaapi.plugin_t):
             (
                 "Paste one or more signatures or named patterns.\n\n"
                 'Examples:\nprint = "4C 8B DC ?? ??"\n'
-                'constexpr const char* print = "4C 8B DC ?? ??";\n'
+                "update: E8 ? ? ? ? 48 89 C7\n"
+                'tick = "90 90 CC"; draw = 48 89 C7\n'
                 "48 8B ?? ?? 89\n"
             ),
         )

@@ -177,18 +177,18 @@ If the matched address is not a function name or has no function name, it falls 
 
 ### Batch signature search
 
-To search several signatures at once, choose **Batch search signatures** from the main SigMaker dialog. Paste one signature per line, or paste semicolon-separated declarations.
+To search several signatures at once, choose **Batch search signatures** from the main SigMaker dialog. Paste one signature per line, or separate entries with semicolons.
 
 Batch search accepts named and unnamed patterns:
 
 ```text
 print = "48 8B ?? ??"
 update: E8 ? ? ? ? 48 89 C7
-constexpr const char* tick = "90 90 CC";
+tick = 90 90 CC; draw = "48 89 C7"
 48 8B ?? ?? 89
 ```
 
-Names are optional. If a pattern has no name, SigMaker labels it by source line in the result list. `#` and `//` comments are ignored outside quoted strings, and Markdown fence lines are skipped so you can paste snippets from issues or notes.
+Names are optional and must use `name: pattern` or `name = pattern`. Quoted patterns are supported only as the right-hand side of a named pattern. SigMaker does not parse C declarations or join patterns across multiple lines. If a pattern has no name, SigMaker labels it by source line in the result list. `#` and `//` comments are ignored outside quoted strings, and Markdown fence lines are skipped so you can paste snippets from issues or notes.
 
 Each pattern is normalized through the same parser used by regular signature search. Invalid patterns are reported per entry instead of aborting the whole batch. Patterns must contain at least one exact byte; an all-wildcard pattern such as `?? ?? ??` is rejected because it matches almost everywhere and is not a useful search key.
 

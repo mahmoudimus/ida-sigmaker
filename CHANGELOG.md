@@ -2,6 +2,22 @@
 
 All notable user-visible changes to this plugin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Batch signature search API** supports several named or unnamed signatures at once, using `foo = "48 8B ?? ??"`, `foo := 48 8B ?? ??`, plain signature lines, or semicolons to separate entries on the same line. The batch parser does not infer C declarations or join entries across multiple lines. Each pattern is normalized and searched independently; invalid patterns are reported per entry instead of aborting the whole batch.
+- **Batch result formatting** supports text, CSV, and JSON. Results include normalized signatures, status, match counts, absolute EAs, RVAs relative to the imagebase, file offsets when IDA can resolve them, and per-entry errors.
+- **Batch search formatters are extensible.** Power users can register custom renderers with `@BatchSearchFormatter.register("name", suffixes=(...))`, then use `results.format("name")` or export to a registered suffix.
+- **Search results now expose structured metadata.** `SearchResults` keeps the existing `matches` and `signature_str` fields while adding raw pattern, name/source-line context, status/error helpers, imagebase, and file-offset lookup. `Match` supports f-string fields like `ea`, `rva`, and `fileoffset`. Batch search uses the same result type per pattern.
+- **Batch search reuses the copied segment buffer** when SIMD speedups are available, so a batch does not reload the database for every pattern.
+
+### Documentation
+
+- README now documents the batch search workflow, accepted input forms, export formats, batch search API, and custom formatter registration. A C-style formatter example lives in `examples/batch_search_c_formatter.py`.
+
+[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.9.2...HEAD
+
 ## [1.9.2] - 2026-06-19
 
 ### Fixed

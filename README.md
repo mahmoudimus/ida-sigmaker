@@ -24,6 +24,7 @@ Background reading on [mahmoudimus.com](https://mahmoudimus.com):
 - [Usage](#usage)
   - [Finding XREFs](#finding-xrefs)
   - [Signature searching](#signature-searching)
+  - [Batch signature search](#batch-signature-search)
   - [Signature Configuration](#signature-configuration)
 - [Performance](#performance)
   - [Benchmarks](#benchmarks)
@@ -173,6 +174,29 @@ Match(es) of your signature will be printed to console alongside the containing 
 If the matched address is not a function name or has no function name, it falls back to just printing the address:
 
 ![](./assets/matches_console_no_func.png)
+
+### Batch signature search
+
+To search several signatures at once from IDA, choose **Batch search signatures** from the main SigMaker dialog. Paste one signature per line, or separate entries with semicolons. Named entries use the same syntax as the scripting API, for example:
+
+```text
+print = "48 8B ?? ??"
+update := E8 ? ? ? ? 48 89 C7
+tick = 90 90 CC; draw = "48 89 C7"
+48 8B ?? ?? 89
+```
+
+Results are printed to the IDA output window with the parsed search pattern, match count, address preview, containing function names when IDA can resolve them, RVAs, and file offsets.
+
+After the search, SigMaker can export the batch result list:
+
+| Extension | Format |
+| --- | --- |
+| `.txt` | Human-readable text report |
+| `.csv` | Quoted CSV with name, source line, status, signature, EAs, RVAs, file offsets, and errors |
+| `.json` | Structured JSON with imagebase and per-match `ea`, `rva`, and `file_offset` records |
+
+Unknown export suffixes default to the text formatter. SigMaker does not currently write automatic batch history; exports happen only when you choose to write a file.
 
 ### Signature Configuration
 

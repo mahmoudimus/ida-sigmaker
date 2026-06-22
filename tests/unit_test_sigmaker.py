@@ -2771,17 +2771,81 @@ class TestActionEnum(CoveredUnitTest):
     def test_action_values_match_form_order(self):
         # Order is locked by SignatureMakerForm.rAction:
         #   ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode",
-        #    "rSearchSignature", "rFindFunctionSig")
+        #    "rSearchSignature", "rFindFunctionSig",
+        #    "rBatchSearchSignatures")
         self.assertEqual(int(sigmaker.Action.CREATE_UNIQUE), 0)
         self.assertEqual(int(sigmaker.Action.FIND_XREF), 1)
         self.assertEqual(int(sigmaker.Action.COPY_RANGE), 2)
         self.assertEqual(int(sigmaker.Action.SEARCH), 3)
         self.assertEqual(int(sigmaker.Action.FIND_FUNCTION_SIG), 4)
+        self.assertEqual(int(sigmaker.Action.BATCH_SEARCH), 5)
 
     def test_action_is_intenum(self):
         import enum as _enum
 
         self.assertTrue(issubclass(sigmaker.Action, _enum.IntEnum))
+
+
+class TestBatchSearchUiHelpers(CoveredUnitTest):
+    """Batch search dialog helpers keep IDA UI glue thin."""
+
+    def setUp(self):
+        self._orig_ask_yn = sigmaker.idaapi.ask_yn
+        self._orig_ask_file = sigmaker.idaapi.ask_file
+        self._orig_msg = sigmaker.idaapi.msg
+        self._orig_yes = getattr(sigmaker.idaapi, "ASKBTN_YES", None)
+        self._orig_no = getattr(sigmaker.idaapi, "ASKBTN_NO", None)
+        self.msgs: list[str] = []
+        sigmaker.idaapi.ASKBTN_YES = 1
+        sigmaker.idaapi.ASKBTN_NO = 0
+        sigmaker.idaapi.msg = lambda s: self.msgs.append(s)
+
+    def tearDown(self):
+        sigmaker.idaapi.ask_yn = self._orig_ask_yn
+        sigmaker.idaapi.ask_file = self._orig_ask_file
+        sigmaker.idaapi.msg = self._orig_msg
+        sigmaker.idaapi.ASKBTN_YES = self._orig_yes
+        sigmaker.idaapi.ASKBTN_NO = self._orig_no
+
+    def test_export_decline_does_not_prompt_for_path(self):
+        sigmaker.idaapi.ask_yn = MagicMock(return_value=sigmaker.idaapi.ASKBTN_NO)
+        sigmaker.idaapi.ask_file = MagicMock()
+
+        sigmaker._maybe_export_batch_results(MagicMock())
+
+        sigmaker.idaapi.ask_file.assert_not_called()
+
+    def test_export_writes_selected_formatter_to_path(self):
+        class FakeResults:
+            def __init__(self):
+                self.formatter = None
+
+            def display(self, output=None, formatter=None):
+                self.formatter = formatter
+                output.write("payload\n")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = pathlib.Path(tmpdir) / "out.json"
+            sigmaker.idaapi.ask_yn = MagicMock(return_value=sigmaker.idaapi.ASKBTN_YES)
+            sigmaker.idaapi.ask_file = MagicMock(return_value=str(path))
+
+            results = FakeResults()
+            sigmaker._maybe_export_batch_results(results)
+
+            self.assertEqual(path.read_text(encoding="utf-8"), "payload\n")
+            self.assertIsInstance(results.formatter, sigmaker.BatchSearchJsonFormatter)
+            self.assertIn("Batch search results exported", "".join(self.msgs))
+
+    def test_empty_batch_search_input_does_not_search(self):
+        with patch.object(
+            sigmaker,
+            "_ask_batch_search_text",
+            return_value="   ",
+        ), patch.object(sigmaker.BatchSignatureSearcher, "from_text") as from_text:
+            sigmaker._run_batch_search()
+
+        from_text.assert_not_called()
+        self.assertIn("No signatures entered!", "".join(self.msgs))
 
 
 class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
@@ -3880,7 +3944,6 @@ class TestSignatureSearcherBufferCache(CoveredUnitTest):
         ), patch.object(sigmaker, "ProgressDialog"):
             sigmaker.SignatureSearcher._find_all_simd("48 8B C4")
         mp_load.assert_called_once()
-
 
 class TestGeneratedSignatureOrdering(CoveredUnitTest):
     """GeneratedSignature.__lt__ ranks by (size, wildcards) ascending."""

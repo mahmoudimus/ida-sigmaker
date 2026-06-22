@@ -2412,19 +2412,14 @@ class SearchResults:
 
     @staticmethod
     def _file_offset_for_ea(ea: int) -> typing.Optional[int]:
-        for provider in (idaapi, idc):
-            get_fileregion_offset = getattr(provider, "get_fileregion_offset", None)
-            if not callable(get_fileregion_offset):
-                continue
-            with contextlib.suppress(BaseException):
-                file_offset = get_fileregion_offset(ea)
-                badaddr = getattr(idaapi, "BADADDR", None)
-                if (
-                    isinstance(file_offset, int)
-                    and file_offset >= 0
-                    and not (isinstance(badaddr, int) and file_offset == badaddr)
-                ):
-                    return file_offset
+        with contextlib.suppress(Exception):
+            file_offset = idaapi.get_fileregion_offset(ea)
+            if (
+                isinstance(file_offset, int)
+                and file_offset >= 0
+                and file_offset != idaapi.BADADDR
+            ):
+                return file_offset
         return None
 
     @classmethod
@@ -2511,7 +2506,7 @@ class SearchResults:
 
     def display(self) -> None:
         """Display the search results to the user."""
-        idaapi.msg(f"Signature: {self.signature_str}\n")
+        idaapi.msg(f"Signature: {self.search_pattern}\n")
 
         if self.error:
             idaapi.msg(f"Error: {self.error}\n")

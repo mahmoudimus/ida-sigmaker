@@ -1273,7 +1273,15 @@ class OperandProcessor:
         for op in ins:
             if op.type in policy.allowed_types:
                 off[0] = op.offb
-                length[0] = 3 if ins.size == 4 else (7 if ins.size == 8 else 0)
+                # Wildcard the low ins.size-1 bytes, which hold the immediate /
+                # offset fields on little-endian ARM/Thumb, keeping the high
+                # opcode+condition byte. Thumb-1 is 2 bytes (length 1); ARM and
+                # Thumb-2 are 4 (length 3); 8 covers double-width encodings.
+                # op.offb is 0 for these bit-field operands, which is why the
+                # 4- and 8-byte paths already work. Previously ins.size == 2
+                # fell through to 0, so no Thumb operand was ever wildcarded
+                # (issue #61).
+                length[0] = ins.size - 1 if ins.size in (2, 4, 8) else 0
                 return True
         return False
 

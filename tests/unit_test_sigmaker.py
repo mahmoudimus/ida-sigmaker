@@ -4359,6 +4359,89 @@ class TestPluginManifestVersion(unittest.TestCase):
         )
 
 
+class TestArmThumbOperandWildcard(unittest.TestCase):
+    """Issue #61: operands of 2-byte Thumb instructions must be wildcarded.
+
+    _get_operand_offset_arm only mapped ins.size 4->3 and 8->7, so every 16-bit
+    Thumb-1 instruction got length 0 and was emitted unwildcarded.
+    """
+
+    _OP_TYPE = 991  # stand-in for an allowed ARM operand type (e.g. o_mem)
+
+    class _Op:
+        def __init__(self, type_, offb):
+            self.type = type_
+            self.offb = offb
+
+    class _Ins:
+        def __init__(self, size, ops):
+            self.size = size
+            self._ops = ops
+
+        def __iter__(self):
+            return iter(self._ops)
+
+    def _arm_processor(self):
+        proc = sigmaker.OperandProcessor()
+        proc._is_arm = True  # bypass idaapi.ph_get_id() under the mock
+        return proc
+
+    def _with_policy(self):
+        policy = sigmaker.WildcardPolicy(frozenset({self._OP_TYPE}))
+        return sigmaker.WildcardPolicy.set_current(policy)
+
+    def test_thumb_2byte_operand_wildcards_low_byte(self):
+        proc = self._arm_processor()
+        tok = self._with_policy()
+        try:
+            off, length = [0], [0]
+            ins = self._Ins(2, [self._Op(self._OP_TYPE, 0)])
+            found = proc.get_operand(ins, off, length, wildcard_optimized=True)
+            self.assertTrue(found)
+            self.assertEqual((off[0], length[0]), (0, 1))
+        finally:
+            sigmaker.WildcardPolicy.reset_current(tok)
+
+    def test_4byte_arm_operand_length_unchanged(self):
+        proc = self._arm_processor()
+        tok = self._with_policy()
+        try:
+            off, length = [0], [0]
+            ins = self._Ins(4, [self._Op(self._OP_TYPE, 0)])
+            proc.get_operand(ins, off, length, wildcard_optimized=True)
+            self.assertEqual((off[0], length[0]), (0, 3))
+        finally:
+            sigmaker.WildcardPolicy.reset_current(tok)
+
+    def test_thumb_ldr_literal_produces_wildcarded_signature(self):
+        # RibShark #61: LDR R5, off (bytes 1B 4D) must become "?? 4D".
+        proc = self._arm_processor()
+        instr = b"\x1B\x4D"
+        ea = 0x1000
+        orig_get_bytes = sigmaker.idaapi.get_bytes
+        sigmaker.idaapi.get_bytes = (
+            lambda addr, count: instr[addr - ea: addr - ea + count]
+        )
+        tok = self._with_policy()
+        try:
+            iproc = sigmaker.InstructionProcessor(proc)
+            sig = sigmaker.Signature()
+            ins = self._Ins(2, [self._Op(self._OP_TYPE, 0)])
+            iproc.append_instruction_to_sig(
+                sig, ea, ins, wildcard_operands=True, wildcard_optimized=True
+            )
+            self.assertEqual(
+                list(sig),
+                [
+                    sigmaker.SignatureByte(0x1B, True),
+                    sigmaker.SignatureByte(0x4D, False),
+                ],
+            )
+        finally:
+            sigmaker.WildcardPolicy.reset_current(tok)
+            sigmaker.idaapi.get_bytes = orig_get_bytes
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

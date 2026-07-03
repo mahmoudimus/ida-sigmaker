@@ -1269,18 +1269,31 @@ class OperandProcessor:
     def _get_operand_offset_arm(
         self, ins: idaapi.insn_t, off: typing.List[int], length: typing.List[int]
     ) -> bool:
-        policy = WildcardPolicy.current()
+        # Wildcard the low bytes only when the instruction carries a
+        # build-varying address, which appears in one of three forms:
+        #   - an operand IDA marked as an offset reference (is_off): on AArch64
+        #     these are o_imm (ADRP #sym@PAGE) and o_displ (LDR #sym@PAGEOFF);
+        #   - a direct memory reference (o_mem), e.g. an ARM/Thumb PC-relative
+        #     literal load "LDR Rt, off_X";
+        #   - a branch/call target (o_near / o_far).
+        # Register lists, bare immediates, and stack/struct displacements are
+        # stable across builds and stay exact so signatures remain selective.
+        #
+        # Byte length: wildcard the low ins.size-1 bytes, keeping the high
+        # opcode+condition byte (little-endian). Thumb-1 is 2 bytes (length 1);
+        # ARM and Thumb-2 are 4 (length 3); 8 covers double-width encodings.
+        # Previously ins.size == 2 fell through to 0, so no Thumb operand was
+        # ever wildcarded (issue #61).
+        flags = idaapi.get_flags(ins.ea)
         for op in ins:
-            if op.type in policy.allowed_types:
+            if op.type == idaapi.o_void:
+                continue
+            if idaapi.is_off(flags, op.n) or op.type in (
+                idaapi.o_mem,
+                idaapi.o_near,
+                idaapi.o_far,
+            ):
                 off[0] = op.offb
-                # Wildcard the low ins.size-1 bytes, which hold the immediate /
-                # offset fields on little-endian ARM/Thumb, keeping the high
-                # opcode+condition byte. Thumb-1 is 2 bytes (length 1); ARM and
-                # Thumb-2 are 4 (length 3); 8 covers double-width encodings.
-                # op.offb is 0 for these bit-field operands, which is why the
-                # 4- and 8-byte paths already work. Previously ins.size == 2
-                # fell through to 0, so no Thumb operand was ever wildcarded
-                # (issue #61).
                 length[0] = ins.size - 1 if ins.size in (2, 4, 8) else 0
                 return True
         return False
@@ -1292,9 +1305,9 @@ class OperandProcessor:
         length: typing.List[int],
         wildcard_optimized: bool,
     ) -> bool:
-        policy = WildcardPolicy.current()
         if self._is_arm:
             return self._get_operand_offset_arm(ins, off, length)
+        policy = WildcardPolicy.current()
         for op in ins:
             if op.type == idaapi.o_void:
                 continue

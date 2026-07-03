@@ -2,6 +2,19 @@
 
 All notable user-visible changes to this plugin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.10.0] - 2026-07-03
+
+### Fixed
+
+- **ARM Thumb operands are now wildcarded.** Operand wildcarding sized the mask only for 4- and 8-byte instructions, so every 16-bit Thumb-1 instruction got a wildcard length of 0 and was left fully literal (a PC-relative literal load like `LDR R5, off_X` kept its build-varying offset byte). 2-byte Thumb now wildcards the offset while keeping the opcode byte. ([#61](https://github.com/mahmoudimus/ida-sigmaker/issues/61), [#62](https://github.com/mahmoudimus/ida-sigmaker/pull/62))
+- **ARM/Thumb branch and `ADRP` offsets that reach the high byte are fully masked.** Thumb-2 `BL`/`BLX`, long `B`, and AArch64 `ADRP` place offset bits in the high opcode byte; masking only the low bytes left those bits literal, so a signature could miss other builds (the reporter saw an offset nibble change from `FF` to `F8`). These instructions now wildcard the whole instruction. ([#61](https://github.com/mahmoudimus/ida-sigmaker/issues/61), [#65](https://github.com/mahmoudimus/ida-sigmaker/pull/65))
+
+### Changed
+
+- **ARM operand wildcarding is address-aware and driven by the operand dialog.** The default now wildcards only address-bearing operands (memory references, displacements, immediates, and branch targets), refined by IDA's offset flag so real addresses (`ADRP #x@PAGE`, `LDR #x@PAGEOFF`) are masked while bare constants (`#0x40`) and stack slots (`[SP,#var]`) stay exact. For targets where registers move between builds, enable "General Register" and/or "Register list" in the "Configure operand wildcarding" dialog. ([#65](https://github.com/mahmoudimus/ida-sigmaker/pull/65))
+
+[1.10.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.9.2...v1.10.0
+
 ## [1.9.2] - 2026-06-19
 
 ### Fixed

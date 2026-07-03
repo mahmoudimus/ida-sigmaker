@@ -516,6 +516,22 @@ class InMemoryBuffer:
 
         return _map
 
+    def _load_single_segment(self, ea: int):
+        """Load only the segment containing ``ea`` (issue #64), recording it in
+        the segment map so offset_mapper resolves match addresses correctly.
+
+        Falls back to loading all segments when ``ea`` is not inside any
+        segment, so callers never end up with an empty corpus by accident.
+        """
+        seg = idaapi.getseg(ea)
+        if seg is None:
+            self._load_segments()
+            return
+        data = idaapi.get_bytes(seg.start_ea, seg.end_ea - seg.start_ea)
+        if data:
+            self._segments.append((len(self._buffer), int(seg.start_ea), len(data)))
+            self._buffer.extend(data)
+
     def _load_input_file(self):
         """Load the original input file into a buffer."""
         if not self.file_path.exists():
@@ -528,10 +544,13 @@ class InMemoryBuffer:
         cls,
         file_path: str | pathlib.Path | None = None,
         mode: "InMemoryBuffer.LoadMode" = LoadMode.SEGMENTS,
+        scope_ea: typing.Optional[int] = None,
     ) -> "InMemoryBuffer":
         """
         Load the buffer using the specified mode.
         mode: _LoadMode.SEGMENTS (default) or _LoadMode.FILE
+        scope_ea: in SEGMENTS mode, load only the segment containing this
+            address instead of all segments (issue #64). Ignored in FILE mode.
         """
         if file_path is None:
             file_path = idaapi.get_input_file_path()
@@ -540,6 +559,8 @@ class InMemoryBuffer:
         instance = cls(file_path=file_path, mode=mode)
         if mode == cls.LoadMode.FILE:
             instance._load_input_file()
+        elif scope_ea is not None:
+            instance._load_single_segment(scope_ea)
         else:
             instance._load_segments()
         return instance
@@ -621,6 +642,11 @@ class SigMakerConfig:
     # Issue #22: when True, cancelling a unique-signature search emits the
     # partial signature with its match count instead of nothing. Default off.
     output_partial_on_cancel: bool = False
+    # Issue #64: when True, scope uniqueness to the segment containing the
+    # anchor instead of the whole database. Lets you sign functions that are
+    # duplicated across segments (e.g. a boot section and a main section) as
+    # long as the eventual search is scoped to the same segment. Default off.
+    scope_to_segment: bool = False
 
 
 @dataclasses.dataclass(slots=True, frozen=True, repr=False)
@@ -1553,6 +1579,12 @@ class UniqueSignatureGenerator:
         # first scan; buf holds the segment buffer the offsets index into.
         offsets: typing.Optional[list[int]] = None
         buf: typing.Optional["InMemoryBuffer"] = None
+        if cfg.scope_to_segment:
+            # Issue #64: scope uniqueness to the anchor's segment. Pre-load it so
+            # the seed scan and every refinement stay within the segment.
+            buf = InMemoryBuffer.load(
+                mode=InMemoryBuffer.LoadMode.SEGMENTS, scope_ea=ea
+            )
 
         def build_partial() -> GeneratedSignature:
             # Trim trailing wildcards, mirror the success path.
@@ -1616,11 +1648,13 @@ class UniqueSignatureGenerator:
                 if not SIMD_SPEEDUP_AVAILABLE:
                     # Non-SIMD builds have no in-memory buffer to refine
                     # against, so fall back to the per-step rescan.
-                    count = SignatureSearcher.count_matches(f"{sig:ida}")
+                    count = SignatureSearcher.count_matches(f"{sig:ida}", buf=buf)
                 elif offsets is None:
                     # Seed once: scan the whole database, keep every match
                     # offset. The candidate count is the exact match count.
-                    offsets, buf = SignatureSearcher.find_all_offsets(f"{sig:ida}")
+                    offsets, buf = SignatureSearcher.find_all_offsets(
+                        f"{sig:ida}", buf=buf
+                    )
                     count = len(offsets)
                 else:
                     # Refine the surviving candidates in memory for each byte
@@ -1931,7 +1965,10 @@ class MinimalFunctionSignatureGenerator:
         index: typing.Optional["_ByteIndex"] = None
         if SIMD_SPEEDUP_AVAILABLE:
             with ProgressDialog("Please stand by, copying segments..."):
-                buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
+                buf = InMemoryBuffer.load(
+                    mode=InMemoryBuffer.LoadMode.SEGMENTS,
+                    scope_ea=int(pfn.start_ea) if cfg.scope_to_segment else None,
+                )
             # Build the 2-byte position index once for the whole search so each
             # anchor seeds with an O(1) lookup instead of a full-buffer scan.
             index = _ByteIndex.build(buf.data())
@@ -3245,7 +3282,8 @@ Quick Options:
 <#Don't stop signature generation when reaching end of function#Continue when leaving function scope:{cContinueOutside}>
 <#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>
 <#Opt-in -- show periodic 'Continue?' prompts while generating. Default is a wait-box with a Cancel button.#Enable continue prompt (opt-in):{cEnablePrompt}>
-<#Opt-in -- when you cancel a unique-signature search, output the partial signature (with match count) instead of nothing. Default off. (Issue #22)#Output partial signature on cancel (opt-in):{cOutputPartialOnCancel}>{cGroupOptions}>
+<#Opt-in -- when you cancel a unique-signature search, output the partial signature (with match count) instead of nothing. Default off. (Issue #22)#Output partial signature on cancel (opt-in):{cOutputPartialOnCancel}>
+<#Opt-in -- scope uniqueness to the segment containing the anchor instead of the whole database, so functions duplicated across segments (e.g. a boot section and a main section) can be signed. Scope your search to the same segment. (Issue #64)#Limit uniqueness to the containing segment (opt-in):{cScopeToSegment}>{cGroupOptions}>
 
 <Operand types...:{bOperandTypes}><Other options...:{bOtherOptions}>
 """
@@ -3272,6 +3310,7 @@ Quick Options:
                     "cWildcardOptimized",
                     "cEnablePrompt",
                     "cOutputPartialOnCancel",
+                    "cScopeToSegment",
                 ),
                 # Bits: 1 (wildcards) + 4 (wildcard optimized). Bit 8 (enable
                 # prompt) and bit 16 (output partial on cancel) default OFF.
@@ -3457,6 +3496,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             wildcard_optimized = bool(form.cGroupOptions.value & 4)  # type: ignore
             enable_continue_prompt = bool(form.cGroupOptions.value & 8)  # type: ignore
             output_partial_on_cancel = bool(form.cGroupOptions.value & 16)  # type: ignore
+            scope_to_segment = bool(form.cGroupOptions.value & 32)  # type: ignore
 
         # Create SigMakerConfig
         config = SigMakerConfig(
@@ -3466,6 +3506,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             wildcard_optimized=wildcard_optimized,
             enable_continue_prompt=enable_continue_prompt,
             output_partial_on_cancel=output_partial_on_cancel,
+            scope_to_segment=scope_to_segment,
         )
 
         try:

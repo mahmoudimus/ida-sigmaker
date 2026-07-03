@@ -4359,87 +4359,124 @@ class TestPluginManifestVersion(unittest.TestCase):
         )
 
 
-class TestArmThumbOperandWildcard(unittest.TestCase):
-    """Issue #61: operands of 2-byte Thumb instructions must be wildcarded.
-
-    _get_operand_offset_arm only mapped ins.size 4->3 and 8->7, so every 16-bit
-    Thumb-1 instruction got length 0 and was emitted unwildcarded.
+class TestArmReferenceAwareWildcard(unittest.TestCase):
+    """ARM/Thumb wildcards an instruction's low bytes only for build-varying
+    address operands: offsets IDA marks with is_off, or o_near/o_far branch
+    targets. Register lists, bare immediates, and stack displacements stay exact
+    so signatures remain selective. Issue #61's Thumb literal load still
+    wildcards because it is a resolved offset.
     """
 
-    _OP_TYPE = 991  # stand-in for an allowed ARM operand type (e.g. o_mem)
-
     class _Op:
-        def __init__(self, type_, offb):
+        def __init__(self, type_, offb, n):
             self.type = type_
             self.offb = offb
+            self.n = n
 
     class _Ins:
-        def __init__(self, size, ops):
+        def __init__(self, size, ops, ea=0x1000):
             self.size = size
             self._ops = ops
+            self.ea = ea
 
         def __iter__(self):
             return iter(self._ops)
 
-    def _arm_processor(self):
+    def setUp(self):
+        self._saved = {
+            k: getattr(sigmaker.idaapi, k, None)
+            for k in ("get_flags", "is_off", "get_bytes")
+        }
+        sigmaker.idaapi.get_flags = MagicMock(return_value=0)
+        self._offset_ops = set()  # operand indices IDA marks as offsets
+        sigmaker.idaapi.is_off = lambda flags, n: n in self._offset_ops
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(sigmaker.idaapi, k, v)
+
+    def _proc(self):
         proc = sigmaker.OperandProcessor()
         proc._is_arm = True  # bypass idaapi.ph_get_id() under the mock
         return proc
 
-    def _with_policy(self):
-        policy = sigmaker.WildcardPolicy(frozenset({self._OP_TYPE}))
-        return sigmaker.WildcardPolicy.set_current(policy)
+    def test_is_off_thumb_2byte_length_1(self):
+        self._offset_ops = {0}
+        off, length = [0], [0]
+        ins = self._Ins(2, [self._Op(5, 0, 0)])
+        self.assertTrue(self._proc().get_operand(ins, off, length, True))
+        self.assertEqual((off[0], length[0]), (0, 1))
 
-    def test_thumb_2byte_operand_wildcards_low_byte(self):
-        proc = self._arm_processor()
-        tok = self._with_policy()
-        try:
-            off, length = [0], [0]
-            ins = self._Ins(2, [self._Op(self._OP_TYPE, 0)])
-            found = proc.get_operand(ins, off, length, wildcard_optimized=True)
-            self.assertTrue(found)
-            self.assertEqual((off[0], length[0]), (0, 1))
-        finally:
-            sigmaker.WildcardPolicy.reset_current(tok)
+    def test_is_off_arm_4byte_length_3(self):
+        self._offset_ops = {1}  # second operand is the address reference
+        off, length = [0], [0]
+        ins = self._Ins(4, [self._Op(1, 0, 0), self._Op(4, 0, 1)])
+        self.assertTrue(self._proc().get_operand(ins, off, length, True))
+        self.assertEqual((off[0], length[0]), (0, 3))
 
-    def test_4byte_arm_operand_length_unchanged(self):
-        proc = self._arm_processor()
-        tok = self._with_policy()
-        try:
-            off, length = [0], [0]
-            ins = self._Ins(4, [self._Op(self._OP_TYPE, 0)])
-            proc.get_operand(ins, off, length, wildcard_optimized=True)
-            self.assertEqual((off[0], length[0]), (0, 3))
-        finally:
-            sigmaker.WildcardPolicy.reset_current(tok)
-
-    def test_thumb_ldr_literal_produces_wildcarded_signature(self):
-        # RibShark #61: LDR R5, off (bytes 1B 4D) must become "?? 4D".
-        proc = self._arm_processor()
+    def test_thumb_ldr_literal_still_wildcards(self):
+        # #61 stays fixed: LDR R5, off (1B 4D, a resolved offset) -> ?? 4D.
+        self._offset_ops = {0}
         instr = b"\x1B\x4D"
         ea = 0x1000
-        orig_get_bytes = sigmaker.idaapi.get_bytes
-        sigmaker.idaapi.get_bytes = (
-            lambda addr, count: instr[addr - ea: addr - ea + count]
+        sigmaker.idaapi.get_bytes = lambda a, c: instr[a - ea: a - ea + c]
+        sig = sigmaker.Signature()
+        ins = self._Ins(2, [self._Op(5, 0, 0)], ea=ea)
+        sigmaker.InstructionProcessor(self._proc()).append_instruction_to_sig(
+            sig, ea, ins, wildcard_operands=True, wildcard_optimized=True
         )
-        tok = self._with_policy()
-        try:
-            iproc = sigmaker.InstructionProcessor(proc)
-            sig = sigmaker.Signature()
-            ins = self._Ins(2, [self._Op(self._OP_TYPE, 0)])
-            iproc.append_instruction_to_sig(
-                sig, ea, ins, wildcard_operands=True, wildcard_optimized=True
-            )
-            self.assertEqual(
-                list(sig),
-                [
-                    sigmaker.SignatureByte(0x1B, True),
-                    sigmaker.SignatureByte(0x4D, False),
-                ],
-            )
-        finally:
-            sigmaker.WildcardPolicy.reset_current(tok)
-            sigmaker.idaapi.get_bytes = orig_get_bytes
+        self.assertEqual(
+            list(sig),
+            [
+                sigmaker.SignatureByte(0x1B, True),
+                sigmaker.SignatureByte(0x4D, False),
+            ],
+        )
+
+    def test_branch_target_wildcards_without_is_off(self):
+        # o_near/o_far are always addresses even though IDA marks them with a
+        # code xref rather than is_off.
+        self._offset_ops = set()
+        off, length = [0], [0]
+        ins = self._Ins(4, [self._Op(sigmaker.idaapi.o_near, 0, 0)])
+        self.assertTrue(self._proc().get_operand(ins, off, length, True))
+        self.assertEqual(length[0], 3)
+
+    def test_o_mem_literal_wildcards_without_is_off(self):
+        # ARM/Thumb PC-relative literal load "LDR Rt, off_X" is a direct memory
+        # reference (o_mem); wildcard it even if IDA does not set is_off. This
+        # keeps #61 fixed regardless of how the Thumb literal load is typed.
+        self._offset_ops = set()
+        off, length = [0], [0]
+        ins = self._Ins(2, [self._Op(sigmaker.idaapi.o_mem, 0, 0)])
+        self.assertTrue(self._proc().get_operand(ins, off, length, True))
+        self.assertEqual(length[0], 1)
+
+    def test_register_list_not_wildcarded(self):
+        # PUSH {R4-R6,LR}: reg-list is stable across builds -> left exact.
+        self._offset_ops = set()
+        off, length = [0], [0]
+        ins = self._Ins(2, [self._Op(777, 0, 0)])  # not is_off, not near/far
+        self.assertFalse(self._proc().get_operand(ins, off, length, True))
+
+    def test_bare_immediate_not_wildcarded(self):
+        # MOV R0, #0x40 style bare constant: whole instruction stays exact.
+        self._offset_ops = set()
+        instr = b"\x40\x20"
+        ea = 0x2000
+        sigmaker.idaapi.get_bytes = lambda a, c: instr[a - ea: a - ea + c]
+        sig = sigmaker.Signature()
+        ins = self._Ins(2, [self._Op(5, 0, 0)], ea=ea)  # o_imm, not is_off
+        sigmaker.InstructionProcessor(self._proc()).append_instruction_to_sig(
+            sig, ea, ins, wildcard_operands=True, wildcard_optimized=True
+        )
+        self.assertEqual(
+            list(sig),
+            [
+                sigmaker.SignatureByte(0x40, False),
+                sigmaker.SignatureByte(0x20, False),
+            ],
+        )
 
 
 if __name__ == "__main__":

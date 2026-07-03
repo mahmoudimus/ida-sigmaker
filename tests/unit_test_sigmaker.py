@@ -4359,87 +4359,141 @@ class TestPluginManifestVersion(unittest.TestCase):
         )
 
 
-class TestArmThumbOperandWildcard(unittest.TestCase):
-    """Issue #61: operands of 2-byte Thumb instructions must be wildcarded.
-
-    _get_operand_offset_arm only mapped ins.size 4->3 and 8->7, so every 16-bit
-    Thumb-1 instruction got length 0 and was emitted unwildcarded.
+class TestArmReferenceAwareWildcard(unittest.TestCase):
+    """ARM/Thumb wildcarding respects the operand-wildcard policy, refines the
+    ambiguous imm/displ types to real addresses via is_off, and wildcards the
+    whole instruction where the offset reaches the high byte (branch targets,
+    ADRP). Register-bearing operands stay exact unless the user selects them.
     """
 
-    _OP_TYPE = 991  # stand-in for an allowed ARM operand type (e.g. o_mem)
-
     class _Op:
-        def __init__(self, type_, offb):
+        def __init__(self, type_, offb, n):
             self.type = type_
             self.offb = offb
+            self.n = n
 
     class _Ins:
-        def __init__(self, size, ops):
+        def __init__(self, size, ops, ea=0x1000):
             self.size = size
             self._ops = ops
+            self.ea = ea
 
         def __iter__(self):
             return iter(self._ops)
 
-    def _arm_processor(self):
+    def setUp(self):
+        ia = sigmaker.idaapi
+        self._saved = {
+            k: getattr(ia, k, None) for k in ("get_flags", "is_off", "get_bytes")
+        }
+        ia.get_flags = MagicMock(return_value=0)
+        self._offset_ops = set()  # operand indices IDA marks as offsets
+        ia.is_off = lambda flags, n: n in self._offset_ops
+        # Default test policy: addresses only, matching WildcardPolicy.for_arm.
+        self._addr_types = {ia.o_mem, ia.o_displ, ia.o_imm, ia.o_near, ia.o_far}
+        self._tok = sigmaker.WildcardPolicy.set_current(
+            sigmaker.WildcardPolicy(frozenset(self._addr_types))
+        )
+
+    def tearDown(self):
+        sigmaker.WildcardPolicy.reset_current(self._tok)
+        for k, v in self._saved.items():
+            setattr(sigmaker.idaapi, k, v)
+
+    def _proc(self):
         proc = sigmaker.OperandProcessor()
         proc._is_arm = True  # bypass idaapi.ph_get_id() under the mock
         return proc
 
-    def _with_policy(self):
-        policy = sigmaker.WildcardPolicy(frozenset({self._OP_TYPE}))
-        return sigmaker.WildcardPolicy.set_current(policy)
+    def _run(self, size, ops):
+        off, length = [0], [0]
+        found = self._proc().get_operand(self._Ins(size, ops), off, length, True)
+        return found, off[0], length[0]
 
-    def test_thumb_2byte_operand_wildcards_low_byte(self):
-        proc = self._arm_processor()
-        tok = self._with_policy()
-        try:
-            off, length = [0], [0]
-            ins = self._Ins(2, [self._Op(self._OP_TYPE, 0)])
-            found = proc.get_operand(ins, off, length, wildcard_optimized=True)
-            self.assertTrue(found)
-            self.assertEqual((off[0], length[0]), (0, 1))
-        finally:
-            sigmaker.WildcardPolicy.reset_current(tok)
+    def test_address_immediate_adrp_wildcards_whole_instruction(self):
+        ia = sigmaker.idaapi
+        self._offset_ops = {1}  # ADRP: op1 is the address immediate (is_off)
+        found, off, length = self._run(
+            4, [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_imm, 0, 1)]
+        )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 4))  # immlo reaches the high byte
 
-    def test_4byte_arm_operand_length_unchanged(self):
-        proc = self._arm_processor()
-        tok = self._with_policy()
-        try:
-            off, length = [0], [0]
-            ins = self._Ins(4, [self._Op(self._OP_TYPE, 0)])
-            proc.get_operand(ins, off, length, wildcard_optimized=True)
-            self.assertEqual((off[0], length[0]), (0, 3))
-        finally:
-            sigmaker.WildcardPolicy.reset_current(tok)
+    def test_address_displacement_pageoff_keeps_high_byte(self):
+        ia = sigmaker.idaapi
+        self._offset_ops = {1}  # LDR [X8,#sym@PAGEOFF]: offset in the low bytes
+        found, off, length = self._run(
+            4, [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_displ, 0, 1)]
+        )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 3))
+
+    def test_branch_target_wildcards_whole_instruction(self):
+        # RibShark #61 follow-up: Thumb-2 BL/BLX and long B put offset bits in
+        # the high byte, so the whole instruction must be masked.
+        ia = sigmaker.idaapi
+        self._offset_ops = set()  # near targets carry a code xref, not is_off
+        found, off, length = self._run(4, [self._Op(ia.o_near, 0, 0)])
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 4))
+
+    def test_o_mem_literal_keeps_opcode_byte(self):
+        # Thumb "LDR Rt, off_X" (o_mem): imm8 is the low byte, opcode the high.
+        ia = sigmaker.idaapi
+        self._offset_ops = set()
+        found, off, length = self._run(2, [self._Op(ia.o_mem, 0, 0)])
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 1))
 
     def test_thumb_ldr_literal_produces_wildcarded_signature(self):
-        # RibShark #61: LDR R5, off (bytes 1B 4D) must become "?? 4D".
-        proc = self._arm_processor()
+        # #61 stays fixed and specific: 1B 4D -> ?? 4D.
+        ia = sigmaker.idaapi
+        self._offset_ops = set()
         instr = b"\x1B\x4D"
         ea = 0x1000
-        orig_get_bytes = sigmaker.idaapi.get_bytes
-        sigmaker.idaapi.get_bytes = (
-            lambda addr, count: instr[addr - ea: addr - ea + count]
+        ia.get_bytes = lambda a, c: instr[a - ea: a - ea + c]
+        sig = sigmaker.Signature()
+        ins = self._Ins(2, [self._Op(ia.o_mem, 0, 0)], ea=ea)
+        sigmaker.InstructionProcessor(self._proc()).append_instruction_to_sig(
+            sig, ea, ins, wildcard_operands=True, wildcard_optimized=True
         )
-        tok = self._with_policy()
-        try:
-            iproc = sigmaker.InstructionProcessor(proc)
-            sig = sigmaker.Signature()
-            ins = self._Ins(2, [self._Op(self._OP_TYPE, 0)])
-            iproc.append_instruction_to_sig(
-                sig, ea, ins, wildcard_operands=True, wildcard_optimized=True
-            )
-            self.assertEqual(
-                list(sig),
-                [
-                    sigmaker.SignatureByte(0x1B, True),
-                    sigmaker.SignatureByte(0x4D, False),
-                ],
-            )
-        finally:
-            sigmaker.WildcardPolicy.reset_current(tok)
-            sigmaker.idaapi.get_bytes = orig_get_bytes
+        self.assertEqual(
+            list(sig),
+            [
+                sigmaker.SignatureByte(0x1B, True),
+                sigmaker.SignatureByte(0x4D, False),
+            ],
+        )
+
+    def test_bare_immediate_not_wildcarded(self):
+        # o_imm without is_off is a stable constant (#0x40) -> stays exact.
+        ia = sigmaker.idaapi
+        self._offset_ops = set()
+        found, _, _ = self._run(4, [self._Op(ia.o_imm, 0, 0)])
+        self.assertFalse(found)
+
+    def test_stack_displacement_not_wildcarded(self):
+        # o_displ without is_off is a stack slot ([SP,#var]) -> stays exact.
+        ia = sigmaker.idaapi
+        self._offset_ops = set()
+        found, _, _ = self._run(4, [self._Op(ia.o_displ, 0, 0)])
+        self.assertFalse(found)
+
+    def test_register_list_exact_by_default(self):
+        # Not in the addresses-only default policy -> PUSH {R4-R6,LR} stays 70 B5.
+        reglist = sigmaker.WildcardPolicy.ARMKind.REGLIST
+        found, _, _ = self._run(2, [self._Op(reglist, 0, 0)])
+        self.assertFalse(found)
+
+    def test_register_list_wildcarded_when_selected(self):
+        # User enables "Register list" in the operand dialog (broad mode).
+        reglist = sigmaker.WildcardPolicy.ARMKind.REGLIST
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset(self._addr_types | {reglist}))
+        ):
+            found, off, length = self._run(2, [self._Op(reglist, 0, 0)])
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 1))
 
 
 if __name__ == "__main__":

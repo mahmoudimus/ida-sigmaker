@@ -964,7 +964,21 @@ class WildcardPolicy:
 
     @classmethod
     def for_arm(cls) -> "WildcardPolicy":
-        return cls(frozenset(cls.BaseKind) | frozenset(cls.ARMKind))
+        # Default to address-bearing operands only: direct memory references,
+        # displacements, immediates, and near/far branch targets. is_off refines
+        # the ambiguous imm/displ operands to actual addresses at match time
+        # (see OperandProcessor._get_operand_offset_arm), so bare constants and
+        # stack slots are not wildcarded. Register lists, coprocessor registers,
+        # ARM conditions, arbitrary text, and plain registers are stable across
+        # builds and are left out of the default; users who need register-
+        # tolerant matching enable them in the operand-wildcard dialog.
+        return cls(frozenset({
+            cls.BaseKind.MEM,
+            cls.BaseKind.DISPL,
+            cls.BaseKind.IMM,
+            cls.BaseKind.NEAR,
+            cls.BaseKind.FAR,
+        }))
 
     @classmethod
     def for_mips(cls) -> "WildcardPolicy":
@@ -1269,20 +1283,48 @@ class OperandProcessor:
     def _get_operand_offset_arm(
         self, ins: idaapi.insn_t, off: typing.List[int], length: typing.List[int]
     ) -> bool:
+        # Which operands to wildcard is driven by the user's operand-wildcard
+        # policy (the "Configure operand wildcarding" dialog); the default is
+        # address-bearing types only (see WildcardPolicy.for_arm). On top of the
+        # policy we apply an is_off refinement for the two ambiguous types:
+        # o_imm and o_displ carry both build-varying addresses (ADRP #x@PAGE,
+        # LDR #x@PAGEOFF) and stable constants (#0x40) / stack slots ([SP,#var]).
+        # We wildcard only the ones IDA resolved to an address (is_off), so
+        # selecting "Immediate"/"Displacement" never masks a stable constant.
+        #
+        # Byte range: little-endian ARM/Thumb keeps the opcode+condition in the
+        # high byte and the immediate/offset in the low bytes, so wildcarding the
+        # low ins.size-1 bytes usually suffices (Thumb-1 = 2 bytes -> length 1;
+        # ARM/Thumb-2 = 4 -> 3; 8 -> 7). But some offsets reach into the high
+        # byte: branch targets (Thumb-2 BL/BLX and long B span all bytes) and
+        # AArch64 ADRP (immlo sits in the high byte). For those we must wildcard
+        # the whole instruction, or the offset bits left in the high byte make
+        # the signature miss other builds (issue #61 follow-up).
         policy = WildcardPolicy.current()
+        flags = idaapi.get_flags(ins.ea)
         for op in ins:
-            if op.type in policy.allowed_types:
+            if op.type == idaapi.o_void:
+                continue
+            if op.type not in policy.allowed_types:
+                continue
+            if op.type in (idaapi.o_imm, idaapi.o_displ) and not idaapi.is_off(
+                flags, op.n
+            ):
+                continue
+            # o_imm reaching here is is_off (an address immediate, e.g. ADRP);
+            # together with branch targets its offset can span the high byte.
+            spans_high_byte = op.type in (
+                idaapi.o_near,
+                idaapi.o_far,
+                idaapi.o_imm,
+            )
+            if spans_high_byte:
+                off[0] = 0
+                length[0] = ins.size
+            else:
                 off[0] = op.offb
-                # Wildcard the low ins.size-1 bytes, which hold the immediate /
-                # offset fields on little-endian ARM/Thumb, keeping the high
-                # opcode+condition byte. Thumb-1 is 2 bytes (length 1); ARM and
-                # Thumb-2 are 4 (length 3); 8 covers double-width encodings.
-                # op.offb is 0 for these bit-field operands, which is why the
-                # 4- and 8-byte paths already work. Previously ins.size == 2
-                # fell through to 0, so no Thumb operand was ever wildcarded
-                # (issue #61).
                 length[0] = ins.size - 1 if ins.size in (2, 4, 8) else 0
-                return True
+            return True
         return False
 
     def get_operand(
@@ -1292,9 +1334,9 @@ class OperandProcessor:
         length: typing.List[int],
         wildcard_optimized: bool,
     ) -> bool:
-        policy = WildcardPolicy.current()
         if self._is_arm:
             return self._get_operand_offset_arm(ins, off, length)
+        policy = WildcardPolicy.current()
         for op in ins:
             if op.type == idaapi.o_void:
                 continue

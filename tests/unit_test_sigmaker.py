@@ -2269,7 +2269,7 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
         with patch.object(
             sigmaker.SignatureSearcher,
             "count_matches",
-            side_effect=lambda *_: next(counts),
+            side_effect=lambda *_, **__: next(counts),
         ):
             result = gen.generate(
                 0x1000, self._make_cfg(), policy=sigmaker.GenerationPolicy.permissive()
@@ -2306,7 +2306,7 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
         counts = iter([100, 50, 0])
         user_canceled_state = {"value": False}
 
-        def fake_count_matches(_ida_sig):
+        def fake_count_matches(_ida_sig, buf=None):
             v = next(counts)
             if v == 0:
                 # Simulate find_all bailing because the user just clicked Cancel.
@@ -2350,7 +2350,7 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
         gen = self._make_generator(cancel_after_iterations=1)
         user_canceled_state = {"value": False}
 
-        def fake_count_matches(_ida_sig):
+        def fake_count_matches(_ida_sig, buf=None):
             # First (and only) call returns 0 with cancel flag already set.
             user_canceled_state["value"] = True
             return 0
@@ -2390,7 +2390,7 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
         with patch.object(
             sigmaker.SignatureSearcher,
             "count_matches",
-            side_effect=lambda *_: next(counts),
+            side_effect=lambda *_, **__: next(counts),
         ):
             gen.generate(
                 0x1000,
@@ -4557,6 +4557,67 @@ class TestSearchAddressMapping(unittest.TestCase):
         buf = self._two_segment_buffer()
         matches = sigmaker.SignatureSearcher._find_all_simd("F1 B5 04 00", buf=buf)
         self.assertEqual([int(m.address) for m in matches], [0x1F78000])
+
+
+class TestSegmentScope(unittest.TestCase):
+    """Issue #64: scope_to_segment loads only the anchor's segment as the
+    uniqueness corpus, so functions duplicated across segments can be signed."""
+
+    _SEG_KEYS = (
+        "getseg", "get_bytes", "get_first_seg", "get_next_seg",
+        "get_input_file_path", "get_imagebase",
+    )
+
+    def setUp(self):
+        self._saved = {k: getattr(sigmaker.idaapi, k, None) for k in self._SEG_KEYS}
+        sigmaker.idaapi.get_input_file_path = MagicMock(return_value="/x")
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(sigmaker.idaapi, k, v)
+
+    def _load(self, **kw):
+        return sigmaker.InMemoryBuffer.load(
+            mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS, **kw
+        )
+
+    def test_scope_ea_loads_only_containing_segment(self):
+        seg = MagicMock(start_ea=0x2000, end_ea=0x2010)
+        sigmaker.idaapi.getseg = MagicMock(return_value=seg)
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=b"\xAA" * 0x10)
+        buf = self._load(scope_ea=0x2008)
+        self.assertEqual(bytes(buf.data()), b"\xAA" * 0x10)
+        sigmaker.idaapi.getseg.assert_called_once_with(0x2008)
+        sigmaker.idaapi.get_bytes.assert_called_once_with(0x2000, 0x10)
+
+    def test_no_scope_loads_all_segments(self):
+        s1 = MagicMock(start_ea=0, end_ea=4)
+        sigmaker.idaapi.get_first_seg = MagicMock(return_value=s1)
+        sigmaker.idaapi.get_next_seg = MagicMock(return_value=None)
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=b"\x01\x02\x03\x04")
+        sigmaker.idaapi.getseg = MagicMock(
+            side_effect=AssertionError("getseg must not be used without scope_ea")
+        )
+        buf = self._load()
+        self.assertEqual(bytes(buf.data()), b"\x01\x02\x03\x04")
+
+    def test_scope_ea_without_segment_falls_back_to_all(self):
+        sigmaker.idaapi.getseg = MagicMock(return_value=None)
+        s1 = MagicMock(start_ea=0, end_ea=2)
+        sigmaker.idaapi.get_first_seg = MagicMock(return_value=s1)
+        sigmaker.idaapi.get_next_seg = MagicMock(return_value=None)
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=b"\x09\x09")
+        buf = self._load(scope_ea=0x9999)
+        self.assertEqual(bytes(buf.data()), b"\x09\x09")
+
+    def test_config_scope_to_segment_defaults_false(self):
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+        self.assertFalse(cfg.scope_to_segment)
 
 
 if __name__ == "__main__":

@@ -1556,7 +1556,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
                 "E8 ? ? ? ? 48"
             ).search()
 
-        find_all.assert_called_once_with("E8 ?? ?? ?? ?? 48")
+        find_all.assert_called_once_with("E8 ?? ?? ?? ?? 48", scope=None)
         self.assertEqual(result.signature_str, "E8 ? ? ? ? 48")
         self.assertEqual(result.search_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(result.normalized_signature, "E8 ?? ?? ?? ?? 48")
@@ -1583,7 +1583,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
             ) as find_all:
                 result = sigmaker.SignatureSearcher.from_signature(raw).search()
 
-            find_all.assert_called_once_with("48 8B ?? 48 89")
+            find_all.assert_called_once_with("48 8B ?? 48 89", scope=None)
             self.assertEqual(result.signature_str, "48 8B ? 48 89")
             self.assertEqual(result.search_pattern, "48 8B ? 48 89")
             self.assertEqual(result.normalized_signature, "48 8B ?? 48 89")
@@ -1602,7 +1602,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
             ) as find_all:
                 result = sigmaker.SignatureSearcher.from_signature(raw).search()
 
-            find_all.assert_called_once_with(normalized)
+            find_all.assert_called_once_with(normalized, scope=None)
             self.assertEqual(result.raw_pattern, raw)
             self.assertEqual(result.signature_str, search_pattern)
             self.assertEqual(result.search_pattern, search_pattern)

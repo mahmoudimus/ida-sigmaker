@@ -4496,6 +4496,69 @@ class TestArmReferenceAwareWildcard(unittest.TestCase):
         self.assertEqual((off, length), (0, 1))
 
 
+class TestSearchAddressMapping(unittest.TestCase):
+    """Issue #68: a SIMD-search match maps back to its real IDA address even
+    when segments are non-contiguous (e.g. an extra binary loaded at a distant
+    address). Previously the address was inf_get_min_ea() + buffer_offset, which
+    is wrong past the first non-contiguous segment."""
+
+    _KEYS = (
+        "get_first_seg", "get_next_seg", "get_bytes", "get_input_file_path",
+        "get_imagebase", "inf_get_min_ea",
+    )
+
+    def setUp(self):
+        self._saved = {k: getattr(sigmaker.idaapi, k, None) for k in self._KEYS}
+        sigmaker.idaapi.get_input_file_path = MagicMock(return_value="/x")
+        sigmaker.idaapi.get_imagebase = MagicMock(return_value=0x1000)
+        sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(sigmaker.idaapi, k, v)
+
+    def _two_segment_buffer(self):
+        # seg1 @ 0x1000 (4 bytes) then seg2 @ 0x1F78000 (4 bytes): the second is
+        # far from the first, exactly the "extra binary loaded at 0x1F78000" case.
+        s1 = MagicMock(start_ea=0x1000, end_ea=0x1004)
+        s2 = MagicMock(start_ea=0x1F78000, end_ea=0x1F78004)
+        sigmaker.idaapi.get_first_seg = MagicMock(return_value=s1)
+        sigmaker.idaapi.get_next_seg = MagicMock(
+            side_effect=lambda ea: s2 if ea == 0x1000 else None
+        )
+
+        def gb(ea, size):
+            return {0x1000: b"\xAA\xBB\xCC\xDD", 0x1F78000: b"\xF1\xB5\x04\x00"}.get(
+                ea, b""
+            )
+
+        sigmaker.idaapi.get_bytes = MagicMock(side_effect=gb)
+        return sigmaker.InMemoryBuffer.load(
+            mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS
+        )
+
+    def test_offset_mapper_across_noncontiguous_segments(self):
+        buf = self._two_segment_buffer()
+        m = buf.offset_mapper()
+        # buffer: AA BB CC DD | F1 B5 04 00  (offsets 0-3 seg1, 4-7 seg2). The
+        # mapper walks a forward cursor, so it expects ascending offsets (as
+        # match positions are).
+        self.assertEqual(m(0), 0x1000)
+        self.assertEqual(m(3), 0x1003)
+        self.assertEqual(m(4), 0x1F78000)  # not 0x1004
+        self.assertEqual(m(6), 0x1F78002)
+
+    def test_offset_mapper_fallback_without_map(self):
+        buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
+        self.assertEqual(buf.offset_mapper()(0x40), 0x1000 + 0x40)
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_find_all_simd_reports_real_address_in_second_segment(self):
+        buf = self._two_segment_buffer()
+        matches = sigmaker.SignatureSearcher._find_all_simd("F1 B5 04 00", buf=buf)
+        self.assertEqual([int(m.address) for m in matches], [0x1F78000])
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

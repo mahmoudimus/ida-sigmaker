@@ -461,6 +461,13 @@ class InMemoryBuffer:
     _buffer: bytearray = dataclasses.field(
         default_factory=bytearray, init=False, repr=False
     )
+    # (buffer_offset, seg_start_ea, size) per loaded segment, in buffer order.
+    # Segments are concatenated tightly, so a buffer offset does not equal an
+    # address once segments are non-contiguous (e.g. an extra binary loaded at a
+    # distant address). This maps a match offset back to its real address (#68).
+    _segments: list = dataclasses.field(
+        default_factory=list, init=False, repr=False
+    )
 
     @property
     def file_size(self) -> int:
@@ -471,15 +478,43 @@ class InMemoryBuffer:
         return idaapi.get_imagebase()
 
     def _load_segments(self):
-        """Load all IDA segments into a single contiguous bytearray buffer."""
+        """Load all IDA segments into a single contiguous bytearray buffer,
+        recording each segment's buffer offset so a match offset can be mapped
+        back to its real address (segments need not be contiguous, #68)."""
         buf = self._buffer
         seg = idaapi.get_first_seg()
         while seg:
             size = seg.end_ea - seg.start_ea
             data = idaapi.get_bytes(seg.start_ea, size)
             if data:
+                self._segments.append((len(buf), int(seg.start_ea), len(data)))
                 buf.extend(data)
             seg = idaapi.get_next_seg(seg.start_ea)
+
+    def offset_mapper(self) -> typing.Callable[[int], int]:
+        """Return a callable that maps ASCENDING buffer offsets to real IDA
+        addresses. Segments are concatenated tightly even when their addresses
+        are not contiguous, so ``imagebase + offset`` is wrong past the first
+        non-contiguous segment (#68). The callable walks the segment map with a
+        forward cursor, so mapping a run of ascending match offsets costs
+        amortized O(1) each (vs a per-match binary search). Falls back to
+        ``imagebase + offset`` when there is no segment map (FILE mode).
+        """
+        segs = self._segments
+        if not segs:
+            imagebase = self.imagebase
+            return lambda offset: imagebase + offset
+        state = [0]
+
+        def _map(offset: int) -> int:
+            i = state[0]
+            while i + 1 < len(segs) and segs[i + 1][0] <= offset:
+                i += 1
+            state[0] = i
+            buf_off, seg_ea, _size = segs[i]
+            return seg_ea + (offset - buf_off)
+
+        return _map
 
     def _load_input_file(self):
         """Load the original input file into a buffer."""
@@ -2517,6 +2552,10 @@ class SignatureSearcher:
 
         n = len(data_mv)
         off = 0
+        # Matches arrive in ascending offset order, so map each offset to its
+        # real address with a forward cursor (amortized O(1) per match); see
+        # InMemoryBuffer.offset_mapper.
+        to_addr = buf.offset_mapper()
         # Poll cancellation every _CANCEL_POLL_STRIDE matches (see
         # find_all_offsets) so per-match user_cancelled() overhead does not
         # dominate a scan over a short, common pattern.
@@ -2532,8 +2571,7 @@ class SignatureSearcher:
             idx = _simd_scan_bytes(data_mv[off:], sig)
             if idx < 0:
                 break
-            ea = base + off + idx
-            results.append(Match(ea))
+            results.append(Match(to_addr(off + idx)))
             if skip_more_than_one and len(results) > 1:
                 break
             off += idx + 1

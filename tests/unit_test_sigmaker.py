@@ -2038,11 +2038,11 @@ class TestBatchSearchFormatters(CoveredUnitTest):
             "out.c": sigmaker.BatchSearchTextFormatter,
         }
         for path, formatter_type in cases.items():
-            formatter = sigmaker.batch_search_formatter_for_path(pathlib.Path(path))
+            formatter = sigmaker._batch_search_formatter_for_path(pathlib.Path(path))
             self.assertIsInstance(formatter, formatter_type)
 
     def test_format_accepts_registered_format_name(self):
-        old_formatter = sigmaker.BATCH_SEARCH_FORMATTERS.get("test")
+        old_formatter = sigmaker._BATCH_SEARCH_FORMATTERS.get("test")
         try:
             @sigmaker.BatchSearchFormatter.register("test")
             class TestFormatter:
@@ -2052,30 +2052,30 @@ class TestBatchSearchFormatters(CoveredUnitTest):
             self.assertEqual(self._results().format("test"), "entries=3\n")
         finally:
             if old_formatter is None:
-                sigmaker.BATCH_SEARCH_FORMATTERS.pop("test", None)
+                sigmaker._BATCH_SEARCH_FORMATTERS.pop("test", None)
             else:
-                sigmaker.BATCH_SEARCH_FORMATTERS["test"] = old_formatter
+                sigmaker._BATCH_SEARCH_FORMATTERS["test"] = old_formatter
 
     def test_formatter_register_decorator_can_bind_suffix(self):
-        old_formatter = sigmaker.BATCH_SEARCH_FORMATTERS.get("c")
-        old_suffix = sigmaker.BATCH_SEARCH_FORMAT_SUFFIXES.get(".c")
+        old_formatter = sigmaker._BATCH_SEARCH_FORMATTERS.get("c")
+        old_suffix = sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES.get(".c")
         try:
             @sigmaker.BatchSearchFormatter.register("c", suffixes=(".c",))
             class TestFormatter:
                 def format(self, results):
                     return "custom\n"
 
-            formatter = sigmaker.batch_search_formatter_for_path(pathlib.Path("out.c"))
+            formatter = sigmaker._batch_search_formatter_for_path(pathlib.Path("out.c"))
             self.assertEqual(formatter.format(self._results()), "custom\n")
         finally:
             if old_formatter is None:
-                sigmaker.BATCH_SEARCH_FORMATTERS.pop("c", None)
+                sigmaker._BATCH_SEARCH_FORMATTERS.pop("c", None)
             else:
-                sigmaker.BATCH_SEARCH_FORMATTERS["c"] = old_formatter
+                sigmaker._BATCH_SEARCH_FORMATTERS["c"] = old_formatter
             if old_suffix is None:
-                sigmaker.BATCH_SEARCH_FORMAT_SUFFIXES.pop(".c", None)
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES.pop(".c", None)
             else:
-                sigmaker.BATCH_SEARCH_FORMAT_SUFFIXES[".c"] = old_suffix
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES[".c"] = old_suffix
 
 
 class TestSIMDScannerEquivalence(CoveredUnitTest):

@@ -279,7 +279,7 @@ results.display(output=buf, formatter="json")
 payload = buf.getvalue()
 ```
 
-The built-in batch formats are `text`, `csv`, and `json`. Export suffix lookup uses `batch_search_formatter_for_path(path)`, so `.txt`, `.csv`, and `.json` select the matching built-in formatter. Loadable formatter examples live in [`examples/`](./examples/).
+The built-in batch formats are `text`, `csv`, and `json`. Export suffixes such as `.txt`, `.csv`, and `.json` select the matching built-in formatter. Loadable formatter examples live in [`examples/`](./examples/).
 
 ### Custom batch search formatters
 

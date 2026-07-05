@@ -2691,7 +2691,7 @@ class BatchSearchResults:
             typing.Union[str, "BatchSearchFormatter"]
         ] = None,
     ) -> str:
-        formatter = batch_search_formatter(formatter)
+        formatter = _batch_search_formatter(formatter)
         return formatter.format(self)
 
     def display(
@@ -2757,9 +2757,9 @@ class BatchSearchFormatter(typing.Protocol):
 
 
 #: Registered batch-search formatter instances, keyed by lowercase name.
-BATCH_SEARCH_FORMATTERS: dict[str, BatchSearchFormatter] = {}
+_BATCH_SEARCH_FORMATTERS: dict[str, BatchSearchFormatter] = {}
 #: Mapping from lowercase file suffix to registered formatter name.
-BATCH_SEARCH_FORMAT_SUFFIXES: dict[str, str] = {}
+_BATCH_SEARCH_FORMAT_SUFFIXES: dict[str, str] = {}
 
 
 def _register_batch_search_formatter(
@@ -2770,14 +2770,14 @@ def _register_batch_search_formatter(
     normalized_name = name.strip().lower()
     if not normalized_name:
         raise ValueError("Batch search formatter name cannot be empty")
-    BATCH_SEARCH_FORMATTERS[normalized_name] = formatter
+    _BATCH_SEARCH_FORMATTERS[normalized_name] = formatter
     for suffix in suffixes:
         normalized_suffix = suffix.strip().lower()
         if not normalized_suffix:
             continue
         if not normalized_suffix.startswith("."):
             normalized_suffix = "." + normalized_suffix
-        BATCH_SEARCH_FORMAT_SUFFIXES[normalized_suffix] = normalized_name
+        _BATCH_SEARCH_FORMAT_SUFFIXES[normalized_suffix] = normalized_name
 
 
 def _hex_or_none(value: typing.Optional[int]) -> typing.Optional[str]:
@@ -2906,23 +2906,23 @@ class BatchSearchJsonFormatter:
         return json.dumps(results.to_record(), indent=2, ensure_ascii=True) + "\n"
 
 
-def batch_search_formatter(
+def _batch_search_formatter(
     formatter: typing.Optional[typing.Union[str, BatchSearchFormatter]] = None,
 ) -> BatchSearchFormatter:
     if formatter is None:
-        return BATCH_SEARCH_FORMATTERS["text"]
+        return _BATCH_SEARCH_FORMATTERS["text"]
     if not isinstance(formatter, str):
         return formatter
     name = formatter.strip().lower()
     try:
-        return BATCH_SEARCH_FORMATTERS[name]
+        return _BATCH_SEARCH_FORMATTERS[name]
     except KeyError:
         raise ValueError(f"Unknown batch search format: {formatter}") from None
 
 
-def batch_search_formatter_for_path(path: pathlib.Path) -> BatchSearchFormatter:
-    format_name = BATCH_SEARCH_FORMAT_SUFFIXES.get(path.suffix.lower(), "text")
-    return batch_search_formatter(format_name)
+def _batch_search_formatter_for_path(path: pathlib.Path) -> BatchSearchFormatter:
+    format_name = _BATCH_SEARCH_FORMAT_SUFFIXES.get(path.suffix.lower(), "text")
+    return _batch_search_formatter(format_name)
 
 
 class SignatureParser:

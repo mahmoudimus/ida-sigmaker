@@ -2543,19 +2543,33 @@ class SignatureSearcher:
     def from_signature(cls, input_signature: str) -> "SignatureSearcher":
         return cls(input_signature=input_signature)
 
-    def search(self) -> SearchResults:
+    def search(self, scope_ea: typing.Optional[int] = None) -> SearchResults:
+        """Parse the signature and scan for matches.
+
+        When ``scope_ea`` is given, the scan is limited to the segment
+        containing it (issue #64: search a segment-scoped signature within the
+        same segment). Falls back to the whole database when ``scope_ea`` is in
+        no segment, so a scoped request never silently returns nothing.
+        """
         sig_str = SignatureParser.parse(self.input_signature)
         if not sig_str:
             idaapi.msg("Unrecognized signature type\n")
             return SearchResults([], "")
 
+        scope = None
+        if scope_ea is not None:
+            seg = idaapi.getseg(scope_ea)
+            if seg is not None:
+                scope = (int(seg.start_ea), int(seg.end_ea))
+
+        where = "the current segment" if scope else "the whole database"
         # Wrap the search in a ProgressDialog to allow cancellation
         with ProgressDialog(
             "Search for a signature\n\n"
-            "Scanning the whole database for your pattern.\n\n"
+            f"Scanning {where} for your pattern.\n\n"
             "Press Cancel to stop"
         ):
-            matches = self.find_all(sig_str)
+            matches = self.find_all(sig_str, scope=scope)
 
         return SearchResults(matches, sig_str)
 
@@ -2659,17 +2673,29 @@ class SignatureSearcher:
         ida_signature: str,
         buf: typing.Optional["InMemoryBuffer"] = None,
         skip_more_than_one: bool = False,
+        scope: typing.Optional[tuple[int, int]] = None,
     ) -> list[Match]:
         # Use SIMD if available
         if SIMD_SPEEDUP_AVAILABLE:
+            if buf is None and scope is not None:
+                # Scope the SIMD scan to one segment by loading only its bytes;
+                # offset_mapper resolves the match offsets back to real
+                # addresses (issue #64 search-scope, on top of #68).
+                with ProgressDialog("Please stand by, copying the segment..."):
+                    buf = InMemoryBuffer.load(
+                        mode=InMemoryBuffer.LoadMode.SEGMENTS, scope_ea=scope[0]
+                    )
             return SignatureSearcher._find_all_simd(
                 ida_signature, skip_more_than_one=skip_more_than_one, buf=buf
             )
         binary = idaapi.compiled_binpat_vec_t()
         idaapi.parse_binpat_str(binary, idaapi.inf_get_min_ea(), ida_signature, 16)
         out: list[Match] = []
-        ea = idaapi.inf_get_min_ea()
-        max_ea = idaapi.inf_get_max_ea()
+        if scope is not None:
+            ea, max_ea = scope
+        else:
+            ea = idaapi.inf_get_min_ea()
+            max_ea = idaapi.inf_get_max_ea()
         _bin_search = getattr(idaapi, "bin_search", None) or getattr(
             idaapi, "bin_search3"
         )
@@ -3283,7 +3309,7 @@ Quick Options:
 <#Wildcard the whole instruction when the operand (usually a register) is encoded into the operator#Wildcard optimized / combined instructions:{cWildcardOptimized}>
 <#Opt-in -- show periodic 'Continue?' prompts while generating. Default is a wait-box with a Cancel button.#Enable continue prompt (opt-in):{cEnablePrompt}>
 <#Opt-in -- when you cancel a unique-signature search, output the partial signature (with match count) instead of nothing. Default off. (Issue #22)#Output partial signature on cancel (opt-in):{cOutputPartialOnCancel}>
-<#Opt-in -- scope uniqueness to the segment containing the anchor instead of the whole database, so functions duplicated across segments (e.g. a boot section and a main section) can be signed. Scope your search to the same segment. (Issue #64)#Limit uniqueness to the containing segment (opt-in):{cScopeToSegment}>{cGroupOptions}>
+<#Opt-in -- scope to the segment containing the anchor instead of the whole database, so functions duplicated across segments (e.g. a boot section and a main section) can be signed. Creation checks uniqueness within that segment; Search is scoped to the segment under your cursor. (Issue #64)#Limit uniqueness and search to the containing segment (opt-in):{cScopeToSegment}>{cGroupOptions}>
 
 <Operand types...:{bOperandTypes}><Other options...:{bOtherOptions}>
 """
@@ -3547,8 +3573,15 @@ class SigMakerPlugin(idaapi.plugin_t):
                     "", idaapi.HIST_SRCH, "Enter a signature"
                 )
                 if input_signature:
+                    # Reuse the "containing segment" opt-in to scope the search
+                    # to the segment under the cursor (issue #64).
+                    scope_ea = (
+                        idaapi.get_screen_ea()
+                        if config.scope_to_segment
+                        else None
+                    )
                     searcher = SignatureSearcher.from_signature(input_signature)
-                    results = searcher.search()
+                    results = searcher.search(scope_ea=scope_ea)
                     results.display()
                 else:
                     idaapi.msg("No signature entered!\n")

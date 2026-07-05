@@ -4620,6 +4620,92 @@ class TestSegmentScope(unittest.TestCase):
         self.assertFalse(cfg.scope_to_segment)
 
 
+class TestSearchScope(unittest.TestCase):
+    """Issue #64 follow-up: 'Search for a signature' honors the containing-
+    segment scope, so a segment-scoped signature can be searched within just
+    that segment instead of the whole database."""
+
+    def setUp(self):
+        self._saved_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        self._saved_canceled = sigmaker.idaapi_user_canceled
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+
+    def tearDown(self):
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = self._saved_simd
+        sigmaker.idaapi_user_canceled = self._saved_canceled
+
+    def test_find_all_scope_bounds_binsearch_to_segment(self):
+        # non-SIMD path: bin_search runs over [scope_start, scope_end), not the
+        # whole [min_ea, max_ea).
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
+        sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFFFF)
+        sigmaker.idaapi.compiled_binpat_vec_t = MagicMock
+        sigmaker.idaapi.parse_binpat_str = MagicMock()
+        sigmaker.idaapi.BIN_SEARCH_NOCASE = 0
+        sigmaker.idaapi.BIN_SEARCH_FORWARD = 0
+        bs = MagicMock(
+            side_effect=[(0x2100, None), (sigmaker.idaapi.BADADDR, None)]
+        )
+        sigmaker.idaapi.bin_search = bs
+        results = sigmaker.SignatureSearcher.find_all(
+            "48 8B C4", scope=(0x2000, 0x2200)
+        )
+        self.assertEqual([int(m) for m in results], [0x2100])
+        first_call = bs.call_args_list[0]
+        self.assertEqual(first_call.args[0], 0x2000)  # starts at scope start
+        self.assertEqual(first_call.args[1], 0x2200)  # bounded by scope end
+
+    def test_find_all_scope_loads_single_segment_for_simd(self):
+        # SIMD path: a scoped search with no buffer loads only that segment and
+        # threads it into the scan.
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = True
+        with patch.object(sigmaker, "ProgressDialog", MagicMock()), \
+                patch.object(sigmaker.InMemoryBuffer, "load") as load, \
+                patch.object(
+                    sigmaker.SignatureSearcher, "_find_all_simd", return_value=[]
+                ) as simd:
+            sigmaker.SignatureSearcher.find_all("48 8B C4", scope=(0x2000, 0x2200))
+        load.assert_called_once()
+        self.assertEqual(load.call_args.kwargs.get("scope_ea"), 0x2000)
+        self.assertIs(simd.call_args.kwargs.get("buf"), load.return_value)
+
+    def test_search_resolves_scope_ea_to_its_segment(self):
+        seg = MagicMock(start_ea=0x3000, end_ea=0x3400)
+        sigmaker.idaapi.getseg = MagicMock(return_value=seg)
+        with patch.object(sigmaker, "ProgressDialog", MagicMock()), \
+                patch.object(sigmaker, "SignatureParser") as sp, \
+                patch.object(
+                    sigmaker.SignatureSearcher, "find_all", return_value=[]
+                ) as fa:
+            sp.parse.return_value = "48 8B C4"
+            sigmaker.SignatureSearcher.from_signature("x").search(scope_ea=0x3200)
+        sigmaker.idaapi.getseg.assert_called_once_with(0x3200)
+        self.assertEqual(fa.call_args.kwargs.get("scope"), (0x3000, 0x3400))
+
+    def test_search_without_scope_ea_scans_whole_db(self):
+        with patch.object(sigmaker, "ProgressDialog", MagicMock()), \
+                patch.object(sigmaker, "SignatureParser") as sp, \
+                patch.object(
+                    sigmaker.SignatureSearcher, "find_all", return_value=[]
+                ) as fa:
+            sp.parse.return_value = "48 8B C4"
+            sigmaker.SignatureSearcher.from_signature("x").search()
+        self.assertIsNone(fa.call_args.kwargs.get("scope"))
+
+    def test_search_scope_ea_without_segment_falls_back_to_whole_db(self):
+        sigmaker.idaapi.getseg = MagicMock(return_value=None)
+        with patch.object(sigmaker, "ProgressDialog", MagicMock()), \
+                patch.object(sigmaker, "SignatureParser") as sp, \
+                patch.object(
+                    sigmaker.SignatureSearcher, "find_all", return_value=[]
+                ) as fa:
+            sp.parse.return_value = "48 8B C4"
+            sigmaker.SignatureSearcher.from_signature("x").search(scope_ea=0x9999)
+        self.assertIsNone(fa.call_args.kwargs.get("scope"))
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the base class)
     unittest.main(verbosity=2)

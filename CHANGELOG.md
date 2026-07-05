@@ -2,6 +2,18 @@
 
 All notable user-visible changes to this plugin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.11.0] - 2026-07-05
+
+### Added
+
+- **Opt-in "Limit uniqueness and search to the containing segment".** A new checkbox scopes both signature creation and the "Search for a signature" action to a single segment (the segment containing the anchor for creation, the segment under the cursor for search) instead of the whole database. This lets you sign functions that are duplicated across segments, for example a boot section and a main section, where no whole-database-unique signature exists, and then search for that signature within the same segment. Off by default, so existing behavior is unchanged. ([#64](https://github.com/mahmoudimus/ida-sigmaker/issues/64), [#67](https://github.com/mahmoudimus/ida-sigmaker/pull/67), [#70](https://github.com/mahmoudimus/ida-sigmaker/pull/70))
+
+### Fixed
+
+- **Signature search reports the correct address across non-contiguous segments.** The SIMD search mapped a match's buffer offset to `min_ea + offset`, which is wrong once segments are not contiguous: an extra binary loaded at a distant address such as `0x1F78000` was reported around `0x570000`. Matches now map back to their real address through a recorded segment map. Making signatures was never affected (it uses the function address, not the scan buffer). ([#68](https://github.com/mahmoudimus/ida-sigmaker/issues/68), [#69](https://github.com/mahmoudimus/ida-sigmaker/pull/69))
+
+[1.11.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.10.0...v1.11.0
+
 ## [1.10.0] - 2026-07-03
 
 ### Fixed

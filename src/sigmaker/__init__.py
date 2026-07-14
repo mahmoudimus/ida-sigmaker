@@ -717,14 +717,6 @@ class Match:
             return format(value, nested_spec)
         return f"0x{value:X}"
 
-    def to_record(self) -> dict[str, typing.Optional[int]]:
-        return {
-            "ea": self.address,
-            "rva": self.rva,
-            "file_offset": self.file_offset,
-        }
-
-
 class SignatureType(enum.Enum):
     """Enumeration representing the various supported signature output formats."""
 

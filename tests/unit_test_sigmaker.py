@@ -1558,6 +1558,16 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         self.assertEqual(repr(result.matches[0]), "Match(address=0x1000)")
         self.assertEqual(hash(result.matches[0]), hash(sigmaker.Match(0x1000)))
 
+    def test_result_models_omit_redundant_batch_helpers(self):
+        batch_result_names = {
+            field.name for field in dataclasses.fields(sigmaker.BatchSearchResults)
+        }
+
+        self.assertNotIn("rva_for_match", dir(sigmaker.SearchResults))
+        self.assertNotIn("match_record", dir(sigmaker.SearchResults))
+        self.assertIn("_match_record", dir(sigmaker.SearchResults))
+        self.assertNotIn("source_text", batch_result_names)
+
     def test_file_offset_lookup_does_not_replace_matches(self):
         result = sigmaker.SearchResults([sigmaker.Match(0x1000)], "90")
         original = result.matches[0]
@@ -1632,7 +1642,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         self.assertEqual(result.raw_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(result.status, "matched")
         self.assertEqual(result.match_count, 1)
-        self.assertEqual(result.rva_for_match(result.matches[0]), 0)
+        self.assertEqual(result.matches[0].rva, 0)
         self.assertEqual(result.matches[0], sigmaker.Match(0x1000))
         self.assertEqual(result.matches[0].rva, 0)
         self.assertFalse(hasattr(result, "imagebase"))
@@ -2103,7 +2113,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             second_file_offset = results[0].file_offset_for_match(
                 results[0].matches[0]
             )
-            match_record = results[0].match_record(results[0].matches[0])
+            match_record = results[0]._match_record(results[0].matches[0])
             get_fileregion_offset.assert_called_once_with(0x140001000)
 
         self.assertEqual(calls, ["48 8B C4", "E8 ?? ?? ?? ?? 48"])
@@ -2124,7 +2134,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         self.assertEqual(results[2].search_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(results[2].normalized_signature, "E8 ?? ?? ?? ?? 48")
         self.assertEqual(
-            results[0].rva_for_match(results[0].matches[0]),
+            results[0].matches[0].rva,
             0x1000,
         )
         self.assertEqual(first_file_offset, 0x401000)
@@ -2345,7 +2355,6 @@ class TestBatchSearchFormatters(CoveredUnitTest):
         )
         return sigmaker.BatchSearchResults(
             [matched, multi, error],
-            source_text="",
             imagebase=0x140000000,
         )
 
@@ -2362,7 +2371,6 @@ class TestBatchSearchFormatters(CoveredUnitTest):
         )
         return sigmaker.BatchSearchResults(
             [entry],
-            source_text="90",
             imagebase=0x140000000,
         )
 
@@ -2436,7 +2444,6 @@ class TestBatchSearchFormatters(CoveredUnitTest):
                         name="tick",
                     )
                 ],
-                source_text="90",
                 imagebase=0x140000000,
             )
             with patch.object(
@@ -2605,6 +2612,145 @@ class TestBatchSearchFormatters(CoveredUnitTest):
                 sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES.pop(".c", None)
             else:
                 sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES[".c"] = old_suffix
+
+    def test_formatter_registration_rejects_duplicate_name_atomically(self):
+        class ExistingFormatter:
+            def format(self, results):
+                return "existing\n"
+
+        class ReplacementFormatter:
+            def format(self, results):
+                return "replacement\n"
+
+        existing = ExistingFormatter()
+        with patch.dict(
+            sigmaker._BATCH_SEARCH_FORMATTERS,
+            {"taken": existing},
+            clear=True,
+        ), patch.dict(
+            sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+            {".old": "taken"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, r"override=True"):
+                sigmaker.BatchSearchFormatter.register(
+                    "taken",
+                    suffixes=(".new",),
+                )(ReplacementFormatter)
+
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMATTERS,
+                {"taken": existing},
+            )
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+                {".old": "taken"},
+            )
+
+    def test_formatter_registration_rejects_duplicate_suffix_atomically(self):
+        class ExistingFormatter:
+            def format(self, results):
+                return "existing\n"
+
+        class ReplacementFormatter:
+            def format(self, results):
+                return "replacement\n"
+
+        existing = ExistingFormatter()
+        with patch.dict(
+            sigmaker._BATCH_SEARCH_FORMATTERS,
+            {"existing": existing},
+            clear=True,
+        ), patch.dict(
+            sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+            {".taken": "existing"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, r"override=True"):
+                sigmaker.BatchSearchFormatter.register(
+                    "replacement",
+                    suffixes=("new", ".taken"),
+                )(ReplacementFormatter)
+
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMATTERS,
+                {"existing": existing},
+            )
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+                {".taken": "existing"},
+            )
+
+    def test_formatter_registration_override_replaces_name(self):
+        class ExistingFormatter:
+            def format(self, results):
+                return "existing\n"
+
+        class ReplacementFormatter:
+            def format(self, results):
+                return "replacement\n"
+
+        with patch.dict(
+            sigmaker._BATCH_SEARCH_FORMATTERS,
+            {"taken": ExistingFormatter()},
+            clear=True,
+        ), patch.dict(
+            sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+            {".old": "taken"},
+            clear=True,
+        ):
+            decorated = sigmaker.BatchSearchFormatter.register(
+                "taken",
+                override=True,
+            )(ReplacementFormatter)
+
+            self.assertIs(decorated, ReplacementFormatter)
+            self.assertIsInstance(
+                sigmaker._BATCH_SEARCH_FORMATTERS["taken"],
+                ReplacementFormatter,
+            )
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+                {".old": "taken"},
+            )
+
+    def test_formatter_registration_override_rebinds_suffix(self):
+        class ExistingFormatter:
+            def format(self, results):
+                return "existing\n"
+
+        class ReplacementFormatter:
+            def format(self, results):
+                return "replacement\n"
+
+        existing = ExistingFormatter()
+        with patch.dict(
+            sigmaker._BATCH_SEARCH_FORMATTERS,
+            {"existing": existing},
+            clear=True,
+        ), patch.dict(
+            sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+            {".taken": "existing"},
+            clear=True,
+        ):
+            sigmaker.BatchSearchFormatter.register(
+                "replacement",
+                suffixes=("taken",),
+                override=True,
+            )(ReplacementFormatter)
+
+            self.assertIs(
+                sigmaker._BATCH_SEARCH_FORMATTERS["existing"],
+                existing,
+            )
+            self.assertIsInstance(
+                sigmaker._BATCH_SEARCH_FORMATTERS["replacement"],
+                ReplacementFormatter,
+            )
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES[".taken"],
+                "replacement",
+            )
 
 
 class TestSIMDScannerEquivalence(CoveredUnitTest):

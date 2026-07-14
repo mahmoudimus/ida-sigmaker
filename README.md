@@ -325,6 +325,20 @@ class LabelFormatter:
 
 After registration, `results.format("labels")` and `f"{results:labels}"` use the formatter by name, and exporting to `something.labels` uses it by suffix. Formatter classes are instantiated once at registration time; formatter objects can be registered the same way.
 
+Formatter names and export suffixes must be unique. Registering a name or suffix that is already in use raises `ValueError` without changing either registry. When replacing an existing registration is intentional, opt in explicitly:
+
+```python
+@sigmaker.BatchSearchFormatter.register(
+    "labels",
+    suffixes=(".labels",),
+    override=True,
+)
+class ReplacementLabelFormatter:
+    ...
+```
+
+One `override=True` allows both replacing the formatter registered under that name and rebinding the listed suffixes. Existing suffixes that already point to the replaced name remain valid.
+
 To install a formatter permanently, paste the same formatter registration code into `$IDAUSR/idapythonrc.py`. IDA sources that file during startup, so the formatter is available in each new IDA session.
 
 If `sigmaker` is not already importable from your IDA Python environment, add the SigMaker plugin directory to `sys.path` before the formatter code.

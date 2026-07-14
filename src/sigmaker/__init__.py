@@ -2535,9 +2535,6 @@ class SearchResults:
                 return file_offset
         return None
 
-    def rva_for_match(self, hit: Match) -> typing.Optional[int]:
-        return hit.rva
-
     def file_offset_for_match(self, hit: Match) -> typing.Optional[int]:
         if hit.file_offset is not None:
             return hit.file_offset
@@ -2546,7 +2543,7 @@ class SearchResults:
             self._file_offset_cache[ea] = self._file_offset_for_ea(ea)
         return self._file_offset_cache[ea]
 
-    def match_record(self, hit: Match) -> dict[str, typing.Optional[int]]:
+    def _match_record(self, hit: Match) -> dict[str, typing.Optional[int]]:
         return {
             "ea": int(hit),
             "rva": hit.rva,
@@ -2563,7 +2560,7 @@ class SearchResults:
             "status": self.status,
             "match_count": self.match_count,
             "matches": [
-                self.match_record(hit) for hit in self.matches
+                self._match_record(hit) for hit in self.matches
             ],
             "error": self.error,
         }
@@ -2596,8 +2593,6 @@ class BatchSearchResults:
 
     #: Per-entry search results, in input order.
     results: list[SearchResults]
-    #: Original pasted batch input.
-    source_text: str
     #: Imagebase shared by the batch search, when known.
     imagebase: typing.Optional[int] = None
 
@@ -2677,6 +2672,8 @@ class BatchSearchFormatter(typing.Protocol):
         cls,
         name: str,
         suffixes: typing.Iterable[str] = (),
+        *,
+        override: bool = False,
     ) -> typing.Callable[[typing.Any], typing.Any]:
         """Register a batch formatter class or formatter object.
 
@@ -2684,11 +2681,20 @@ class BatchSearchFormatter(typing.Protocol):
             @BatchSearchFormatter.register("myfmt", suffixes=(".mine",))
             class MyFormatter:
                 def format(self, results): ...
+
+        Duplicate names or suffixes raise ValueError without changing either
+        registry. Pass override=True only when intentionally replacing an
+        existing name or rebinding a suffix.
         """
 
         def decorator(formatter: typing.Any) -> typing.Any:
             instance = formatter() if isinstance(formatter, type) else formatter
-            _register_batch_search_formatter(name, instance, suffixes)
+            _register_batch_search_formatter(
+                name,
+                instance,
+                suffixes,
+                override=override,
+            )
             return formatter
 
         return decorator
@@ -2708,17 +2714,42 @@ def _register_batch_search_formatter(
     name: str,
     formatter: BatchSearchFormatter,
     suffixes: typing.Iterable[str] = (),
+    *,
+    override: bool = False,
 ) -> None:
     normalized_name = name.strip().lower()
     if not normalized_name:
         raise ValueError("Batch search formatter name cannot be empty")
-    _BATCH_SEARCH_FORMATTERS[normalized_name] = formatter
+
+    normalized_suffixes: list[str] = []
     for suffix in suffixes:
         normalized_suffix = suffix.strip().lower()
         if not normalized_suffix:
             continue
         if not normalized_suffix.startswith("."):
             normalized_suffix = "." + normalized_suffix
+        if normalized_suffix not in normalized_suffixes:
+            normalized_suffixes.append(normalized_suffix)
+
+    collisions: list[str] = []
+    if normalized_name in _BATCH_SEARCH_FORMATTERS:
+        collisions.append(f"name {normalized_name!r}")
+    for normalized_suffix in normalized_suffixes:
+        existing_name = _BATCH_SEARCH_FORMAT_SUFFIXES.get(normalized_suffix)
+        if existing_name is not None:
+            collisions.append(
+                f"suffix {normalized_suffix!r} registered to {existing_name!r}"
+            )
+    if collisions and not override:
+        details = ", ".join(collisions)
+        raise ValueError(
+            "Batch search formatter registration conflicts with "
+            f"{details}; pass override=True if you are sure you want to "
+            "replace the existing registration"
+        )
+
+    _BATCH_SEARCH_FORMATTERS[normalized_name] = formatter
+    for normalized_suffix in normalized_suffixes:
         _BATCH_SEARCH_FORMAT_SUFFIXES[normalized_suffix] = normalized_name
 
 
@@ -3471,7 +3502,6 @@ class BatchSignatureSearcher:
 
         return BatchSearchResults(
             results=results,
-            source_text=self.input_text,
             imagebase=imagebase,
         )
 

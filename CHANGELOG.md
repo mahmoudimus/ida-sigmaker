@@ -8,7 +8,7 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 - **Batch signature search API** supports several named or unnamed signatures at once, using one `foo = "48 8B ?? ??"`, `foo := 48 8B ?? ??`, or plain signature per non-empty line. The batch parser does not infer C declarations or join entries across multiple lines. Each pattern is normalized and searched independently; invalid patterns are reported per entry instead of aborting the whole batch.
 - **Batch result formatting** supports text, CSV, and JSON. Results include normalized signatures, status, match counts, absolute EAs, RVAs relative to the imagebase, lazily resolved file offsets, and per-entry errors.
-- **Batch search formatters are extensible.** Power users can register custom renderers with `@BatchSearchFormatter.register("name", suffixes=(...))`, then use `results.format("name")` or export to a registered suffix.
+- **Batch search formatters are extensible.** Power users can register custom renderers with `@BatchSearchFormatter.register("name", suffixes=(...))`, then use `results.format("name")` or export to a registered suffix. Duplicate names and suffixes are rejected atomically unless the registration explicitly passes `override=True`.
 - **Search results now expose structured metadata.** `SearchResults` keeps the existing `matches` and `signature_str` fields while adding raw pattern, name/source-line context, status/error helpers, and lazy file-offset lookup. `Match` supports f-string fields like `ea`, `rva`, and `fileoffset`. Batch search uses the same result type per pattern.
 - **Batch search loads and reuses one copied segment buffer** when SIMD speedups are available, so a batch does not reload the database for every pattern.
 

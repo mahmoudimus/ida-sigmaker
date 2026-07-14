@@ -11,7 +11,9 @@ file into IDA's Python console after loading the plugin for one-off testing.
 
 Executing this module registers `.c`, `.h`, `.hpp`, and `.cpp` export handling
 without making C output a built-in sigmaker format. It is an example template,
-not a file users need to import directly.
+not a file users need to import directly. Registration rejects an existing
+formatter name or suffix; add ``override=True`` to the decorator only when the
+replacement is intentional.
 """
 
 import re

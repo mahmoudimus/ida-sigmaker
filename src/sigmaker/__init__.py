@@ -3182,6 +3182,7 @@ class SignatureSearcher:
         buf: typing.Optional["InMemoryBuffer"] = None,
         *,
         imagebase: typing.Optional[int] = None,
+        raise_on_cancel: bool = False,
     ) -> list[Match]:
         simd_signature, _ = SigText.normalize(ida_signature)
         if buf is None:
@@ -3226,6 +3227,8 @@ class SignatureSearcher:
                 since_poll = 0
                 if idaapi_user_canceled():
                     LOGGER.info("Search canceled by user")
+                    if raise_on_cancel:
+                        raise UserCanceledError("Search canceled by user")
                     break
 
             idx = _simd_scan_bytes(data_mv[off:], sig)
@@ -3291,6 +3294,7 @@ class SignatureSearcher:
         scope: typing.Optional[tuple[int, int]] = None,
         *,
         imagebase: typing.Optional[int] = None,
+        raise_on_cancel: bool = False,
     ) -> list[Match]:
         # Use SIMD if available
         if SIMD_SPEEDUP_AVAILABLE:
@@ -3307,6 +3311,7 @@ class SignatureSearcher:
                 skip_more_than_one=skip_more_than_one,
                 buf=buf,
                 imagebase=imagebase,
+                raise_on_cancel=raise_on_cancel,
             )
         if SignatureSearcher._has_nibble_wildcards(ida_signature):
             raise ValueError("Nibble wildcard search requires SIMD speedups")
@@ -3326,6 +3331,8 @@ class SignatureSearcher:
             # Check for user cancellation
             if idaapi_user_canceled():
                 LOGGER.info("Search canceled by user")
+                if raise_on_cancel:
+                    raise UserCanceledError("Search canceled by user")
                 break
 
             hit, _ = _bin_search(ea, max_ea, binary, flags)
@@ -3434,6 +3441,7 @@ class BatchSignatureSearcher:
                         buf=active_buf,
                         scope=None if SIMD_SPEEDUP_AVAILABLE else scope,
                         imagebase=imagebase,
+                        raise_on_cancel=True,
                     )
                     match_cache[normalized] = matches
 

@@ -1871,6 +1871,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             self.assertIs(call.kwargs["buf"], loaded)
             self.assertIsNone(call.kwargs["scope"])
             self.assertEqual(call.kwargs["imagebase"], 0x140000000)
+            self.assertIs(call.kwargs["raise_on_cancel"], True)
         self.assertEqual(results.imagebase, 0x140000000)
 
     def test_search_does_not_load_simd_buffer_for_invalid_or_empty_batch(self):
@@ -1921,6 +1922,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             buf=None,
             scope=(0x3000, 0x3400),
             imagebase=0x1000,
+            raise_on_cancel=True,
         )
 
     def test_search_scope_without_segment_falls_back_to_whole_database(self):
@@ -1981,6 +1983,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         for call in find_all.call_args_list:
             self.assertIs(call.kwargs["buf"], loaded)
             self.assertIsNone(call.kwargs["scope"])
+            self.assertIs(call.kwargs["raise_on_cancel"], True)
 
     def test_search_reuses_normalized_match_results(self):
         calls: list[str] = []
@@ -1993,11 +1996,13 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             scope=None,
             *,
             imagebase=None,
+            raise_on_cancel=False,
         ):
             calls.append(ida_signature)
             self.assertIs(buf, shared_buf)
             self.assertIsNone(scope)
             self.assertEqual(imagebase, 0x140000000)
+            self.assertIs(raise_on_cancel, True)
             return [sigmaker.Match(0x140001000, rva=0x1000)]
 
         text = """
@@ -2094,6 +2099,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             buf=shared_buf,
             scope=None,
             imagebase=0x1000,
+            raise_on_cancel=True,
         )
         self.assertEqual(results[0].raw_pattern, "4? ?F ?? 7A")
         self.assertEqual(results[0].signature_str, "4? ?F ? 7A")
@@ -2129,16 +2135,80 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         self.assertEqual(results[0].status, "error")
         self.assertIn("Unrecognized", results[0].error)
 
-    def test_search_propagates_user_cancellation(self):
-        shared_buf = MagicMock()
-        shared_buf.imagebase = 0x1000
+    def test_search_propagates_real_ida_scan_cancellation(self):
         with patch.object(
-            sigmaker.SignatureSearcher,
-            "find_all",
-            side_effect=sigmaker.UserCanceledError("Canceled"),
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            False,
+        ), patch.object(
+            sigmaker,
+            "idaapi_user_canceled",
+            side_effect=[False, True],
+        ), patch.object(
+            sigmaker.idaapi,
+            "BADADDR",
+            0xFFFFFFFFFFFFFFFF,
+        ), patch.object(
+            sigmaker.idaapi,
+            "inf_get_min_ea",
+            return_value=0x1000,
+        ), patch.object(
+            sigmaker.idaapi,
+            "inf_get_max_ea",
+            return_value=0xFFFF,
+        ), patch.object(
+            sigmaker.idaapi,
+            "compiled_binpat_vec_t",
+            MagicMock,
+        ), patch.object(
+            sigmaker.idaapi,
+            "parse_binpat_str",
+        ), patch.object(
+            sigmaker.idaapi,
+            "BIN_SEARCH_NOCASE",
+            0,
+        ), patch.object(
+            sigmaker.idaapi,
+            "BIN_SEARCH_FORWARD",
+            0,
+        ), patch.object(
+            sigmaker.idaapi,
+            "bin_search",
+            return_value=(0x1000, None),
         ):
             with self.assertRaises(sigmaker.UserCanceledError):
-                sigmaker.BatchSignatureSearcher.from_text("48 8B C4").search(
+                sigmaker.BatchSignatureSearcher.from_text("48 8B C4").search()
+
+    def test_search_propagates_real_simd_scan_cancellation(self):
+        shared_buf = MagicMock()
+        shared_buf.imagebase = 0x1000
+        shared_buf.file_size = 2
+        shared_buf.data.return_value = memoryview(b"\x90\x90")
+        shared_buf.offset_mapper.return_value = lambda offset: 0x1000 + offset
+
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            True,
+        ), patch.object(
+            sigmaker,
+            "_CANCEL_POLL_STRIDE",
+            1,
+        ), patch.object(
+            sigmaker,
+            "idaapi_user_canceled",
+            side_effect=[False, True],
+        ), patch.object(
+            sigmaker,
+            "_simd_scan_bytes",
+            return_value=0,
+        ), patch.object(
+            sigmaker.idaapi,
+            "inf_get_min_ea",
+            return_value=0x1000,
+        ):
+            with self.assertRaises(sigmaker.UserCanceledError):
+                sigmaker.BatchSignatureSearcher.from_text("90").search(
                     buf=shared_buf
                 )
 
@@ -2986,6 +3056,38 @@ class TestSearchCancellation(CoveredUnitTest):
         finally:
             # Restore SIMD setting
             sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+
+    def test_simd_cancellation_returns_partial_results_by_default(self):
+        shared_buf = MagicMock()
+        shared_buf.imagebase = 0x1000
+        shared_buf.file_size = 2
+        shared_buf.data.return_value = memoryview(b"\x90\x90")
+        shared_buf.offset_mapper.return_value = lambda offset: 0x1000 + offset
+
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            True,
+        ), patch.object(
+            sigmaker,
+            "_CANCEL_POLL_STRIDE",
+            1,
+        ), patch.object(
+            sigmaker,
+            "idaapi_user_canceled",
+            side_effect=[False, True],
+        ), patch.object(
+            sigmaker,
+            "_simd_scan_bytes",
+            return_value=0,
+        ), patch.object(
+            sigmaker.idaapi,
+            "inf_get_min_ea",
+            return_value=0x1000,
+        ):
+            results = sigmaker.SignatureSearcher.find_all("90", buf=shared_buf)
+
+        self.assertEqual(results, [sigmaker.Match(0x1000)])
 
 
 class TestSigMakerConfigDefaults(CoveredUnitTest):

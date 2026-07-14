@@ -2557,7 +2557,7 @@ class SearchResults:
     def match_record(self, hit: Match) -> dict[str, typing.Optional[int]]:
         return {
             "ea": int(hit),
-            "rva": self.rva_for_match(hit),
+            "rva": hit.rva,
             "file_offset": self.file_offset_for_match(hit),
         }
 
@@ -2749,7 +2749,7 @@ class BatchSearchTextFormatter:
     def _format_match(self, entry: SearchResults, hit: Match) -> str:
         label = str(hit)
         details: list[str] = []
-        rva = _hex_or_none(entry.rva_for_match(hit))
+        rva = _hex_or_none(hit.rva)
         if rva is not None:
             details.append(f"rva {rva}")
         file_offset = _hex_or_none(entry.file_offset_for_match(hit))
@@ -2805,7 +2805,7 @@ class BatchSearchCsvFormatter:
     @classmethod
     def _format_rvas(cls, entry: SearchResults, hits: list[Match]) -> str:
         return " | ".join(
-            _hex_or_none(entry.rva_for_match(hit)) or ""
+            _hex_or_none(hit.rva) or ""
             for hit in hits
         )
 

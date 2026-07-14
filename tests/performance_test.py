@@ -191,6 +191,35 @@ class TestBenchmarkPerformance(unittest.TestCase):
             "total_matches_found": total_matches,
         }
 
+    def test_batch_search_does_not_resolve_file_offsets_for_many_hits(self):
+        """Batch search metadata work stays linear and excludes IDA offsets."""
+        hits = [
+            sigmaker.Match(0x140000000 + index, rva=index)
+            for index in range(100_000)
+        ]
+        shared_buf = unittest.mock.MagicMock()
+        shared_buf.imagebase = 0x140000000
+
+        with unittest.mock.patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=hits,
+        ), unittest.mock.patch.object(
+            sigmaker.SearchResults,
+            "_file_offset_for_ea",
+        ) as lookup:
+            started = time.perf_counter()
+            results = sigmaker.BatchSignatureSearcher.from_text("90").search(
+                buf=shared_buf
+            )
+            elapsed = time.perf_counter() - started
+
+        lookup.assert_not_called()
+        self.assertEqual(results[0].match_count, 100_000)
+        self.assertIs(results[0].matches[0], hits[0])
+        self.assertIs(results[0].matches[-1], hits[-1])
+        print(f"\n100k-hit batch result construction: {elapsed:.6f}s")
+
     def benchmark_simd_vs_python_scanning(self, iterations: int = 10) -> dict:
         """Benchmark SIMD-accelerated scanning vs regular Python scanning."""
         if not sigmaker.SIMD_SPEEDUP_AVAILABLE:

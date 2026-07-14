@@ -71,10 +71,11 @@ class CBatchSearchFormatter:
             lines.append(f"static const uint64_t {name}_ea = {hit:ea}ULL;")
             if hit.rva is not None:
                 lines.append(f"static const uint64_t {name}_rva = {hit:rva}ULL;")
-            if hit.file_offset is not None:
+            file_offset = entry.file_offset_for_match(hit)
+            if file_offset is not None:
                 lines.append(
                     f"static const uint64_t {name}_file_offset = "
-                    f"{hit:fileoffset}ULL;"
+                    f"0x{file_offset:X}ULL;"
                 )
 
         return "\n".join(lines).rstrip() + "\n"

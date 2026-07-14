@@ -2276,6 +2276,115 @@ class TestBatchSearchFormatters(CoveredUnitTest):
             imagebase=0x140000000,
         )
 
+    def _lazy_results(self):
+        entry = sigmaker.SearchResults(
+            matches=[
+                sigmaker.Match(0x140001000, rva=0x1000),
+                sigmaker.Match(0x140002000, rva=0x2000),
+            ],
+            signature_str="90",
+            raw_pattern="90",
+            name="tick",
+            source_line=1,
+        )
+        return sigmaker.BatchSearchResults(
+            [entry],
+            source_text="90",
+            imagebase=0x140000000,
+        )
+
+    def test_text_formatter_resolves_only_previewed_file_offsets(self):
+        results = self._lazy_results()
+
+        with patch.object(
+            sigmaker.SearchResults,
+            "_file_offset_for_ea",
+            side_effect=lambda ea: ea - 0x140000000 + 0x400000,
+        ) as lookup:
+            output = results.format(
+                sigmaker.BatchSearchTextFormatter(max_preview_matches=1)
+            )
+
+        lookup.assert_called_once_with(0x140001000)
+        self.assertIn("file 0x401000", output)
+        self.assertIn("(+1 more)", output)
+
+    def test_csv_and_json_reuse_lazy_file_offset_cache(self):
+        results = self._lazy_results()
+
+        with patch.object(
+            sigmaker.SearchResults,
+            "_file_offset_for_ea",
+            side_effect=lambda ea: ea - 0x140000000 + 0x400000,
+        ) as lookup:
+            csv_output = results.format("csv")
+            json_output = results.format("json")
+
+        self.assertEqual(lookup.call_count, 2)
+        self.assertIn("0x401000 | 0x402000", csv_output)
+        matches = json.loads(json_output)["entries"][0]["matches"]
+        self.assertEqual(
+            [match["file_offset"] for match in matches],
+            [0x401000, 0x402000],
+        )
+
+    def test_formatter_reuses_unavailable_file_offset_cache(self):
+        results = self._lazy_results()
+
+        with patch.object(
+            sigmaker.SearchResults,
+            "_file_offset_for_ea",
+            return_value=None,
+        ) as lookup:
+            results.format(sigmaker.BatchSearchTextFormatter(max_preview_matches=1))
+            results.format(sigmaker.BatchSearchTextFormatter(max_preview_matches=1))
+
+        lookup.assert_called_once_with(0x140001000)
+
+    def test_c_example_resolves_file_offset_lazily(self):
+        old_formatter = sigmaker._BATCH_SEARCH_FORMATTERS.get("c")
+        old_suffixes = {
+            suffix: sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES.get(suffix)
+            for suffix in (".c", ".h", ".hpp", ".cpp")
+        }
+        try:
+            with patch.dict("sys.modules", {"sigmaker": sigmaker}):
+                from examples.batch_search_c_formatter import CBatchSearchFormatter
+
+            results = sigmaker.BatchSearchResults(
+                [
+                    sigmaker.SearchResults(
+                        [sigmaker.Match(0x140001000, rva=0x1000)],
+                        "90",
+                        name="tick",
+                    )
+                ],
+                source_text="90",
+                imagebase=0x140000000,
+            )
+            with patch.object(
+                sigmaker.SearchResults,
+                "_file_offset_for_ea",
+                return_value=0x401000,
+            ) as lookup:
+                output = CBatchSearchFormatter().format(results)
+
+            lookup.assert_called_once_with(0x140001000)
+            self.assertIn(
+                "static const uint64_t tick_file_offset = 0x401000ULL;",
+                output,
+            )
+        finally:
+            if old_formatter is None:
+                sigmaker._BATCH_SEARCH_FORMATTERS.pop("c", None)
+            else:
+                sigmaker._BATCH_SEARCH_FORMATTERS["c"] = old_formatter
+            for suffix, old_name in old_suffixes.items():
+                if old_name is None:
+                    sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES.pop(suffix, None)
+                else:
+                    sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES[suffix] = old_name
+
     def test_render_text_includes_names_and_statuses(self):
         out = self._results().format(sigmaker.BatchSearchTextFormatter())
         self.assertIn("[print]", out)

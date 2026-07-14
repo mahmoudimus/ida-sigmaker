@@ -2883,6 +2883,7 @@ class SignatureParser:
       - Hex escapes:     "\x48\x8b\x05 ..."
       - 0x-prefixed:     "0x48 0x8B 0x05 ..."
       - Explicit tokens: "48 8B 05 ? ? 4? ?F"
+      - Compact tokens:  "488B05??4??F"
 
     Output is a SigMaker search pattern string (space-separated, '?' for
     full-byte wildcards, nibble wildcards preserved), or an empty string on
@@ -2894,6 +2895,7 @@ class SignatureParser:
     _EXPLICIT_TOKEN = re.compile(
         r"(?:[0-9A-Fa-f]{2}|[0-9A-Fa-f]\?|\?[0-9A-Fa-f]|\?\??)"
     )
+    _COMPACT_PATTERN = re.compile(r"(?:[0-9A-Fa-f?]{2})+")
     _ESCAPED_RUN = re.compile(r"(?:\\x[0-9A-Fa-f]{2})+")
     _ESCAPED_EXPRESSION = re.compile(r"(?:\\x[0-9A-Fa-f]{2}|[\s,;])+")
     _PREFIXED_EXPRESSION = re.compile(r"(?:0x[0-9A-Fa-f]{2}|[\s,;])+")
@@ -2913,7 +2915,16 @@ class SignatureParser:
         if mask_match is None:
             mask_match = cls._BINARY_MASK_REGEX.search(text)
         if mask_match is not None:
-            return cls._parse_masked_pattern(text, mask_match)
+            masked_pattern = cls._parse_masked_pattern(text, mask_match)
+            if masked_pattern:
+                return masked_pattern
+        if cls._COMPACT_PATTERN.fullmatch(text):
+            cells = [
+                text[index : index + 2] for index in range(0, len(text), 2)
+            ]
+            return " ".join(
+                "?" if cell == "??" else cell.upper() for cell in cells
+            )
         return cls._normalize_explicit_pattern(text)
 
     # ---- internals ----

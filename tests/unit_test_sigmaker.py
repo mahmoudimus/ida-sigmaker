@@ -1495,6 +1495,11 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         cases = {
             "48 8B 00": "48 8B 00",
             "48,8B;00": "48 8B 00",
+            "488B9090": "48 8B 90 90",
+            "488b??9090": "48 8B ? 90 90",
+            "488B4??F90": "48 8B 4? ?F 90",
+            "[488B??9090]": "48 8B ? 90 90",
+            "0b1010": "0B 10 10",
             "(48 8B ? ?? 4? ?F)": "48 8B ? ? 4? ?F",
             "[48 8B ?]": "48 8B ?",
             r"\x48\x8B\x00": "48 8B 00",
@@ -1511,7 +1516,10 @@ class TestSignatureSearcherInput(CoveredUnitTest):
     def test_parser_rejects_ambiguous_or_random_input(self):
         invalid = (
             "E 8 4 ? C",
-            "488B9090",
+            "488B?9090",
+            "488B9",
+            "488B ?? 90",
+            "488BGG9090",
             "0x488B9090",
             "48:8B:90",
             "48|8B|90",
@@ -1526,6 +1534,12 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         for raw in invalid:
             with self.subTest(raw=raw):
                 self.assertEqual(sigmaker.SignatureParser.parse(raw), "")
+
+    def test_parser_handles_large_compact_pattern(self):
+        raw = "48??4??F" * 1024
+        expected = " ".join(["48", "?", "4?", "?F"] * 1024)
+
+        self.assertEqual(sigmaker.SignatureParser.parse(raw), expected)
 
     def test_searcher_does_not_expose_parser_api(self):
         self.assertFalse(
@@ -1622,6 +1636,29 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         self.assertEqual(result.matches[0], sigmaker.Match(0x1000))
         self.assertEqual(result.matches[0].rva, 0)
         self.assertFalse(hasattr(result, "imagebase"))
+
+    def test_search_accepts_compact_signature(self):
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all, patch.object(
+            sigmaker.idaapi,
+            "get_imagebase",
+            return_value=None,
+        ):
+            result = sigmaker.SignatureSearcher.from_signature(
+                "488b??9090"
+            ).search()
+
+        find_all.assert_called_once_with(
+            "48 8B ?? 90 90",
+            scope=None,
+            imagebase=None,
+        )
+        self.assertEqual(result.signature_str, "48 8B ? 90 90")
+        self.assertEqual(result.search_pattern, "48 8B ? 90 90")
+        self.assertEqual(result.normalized_signature, "48 8B ?? 90 90")
 
     def test_search_preserves_search_pattern_signature_string(self):
         cases = (
@@ -1839,6 +1876,33 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         self.assertEqual(batch.searchers[0].name, "print")
         self.assertEqual(batch.searchers[1].input_signature, "90 90 CC")
         self.assertIsNone(batch.searchers[1].name)
+
+    def test_search_accepts_named_compact_signature(self):
+        buf = MagicMock()
+        buf.imagebase = 0x140000000
+
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all:
+            results = sigmaker.BatchSignatureSearcher.from_text(
+                "handler := 488b??9090"
+            ).search(buf=buf)
+
+        find_all.assert_called_once_with(
+            "48 8B ?? 90 90",
+            buf=buf,
+            scope=None,
+            imagebase=0x140000000,
+            raise_on_cancel=True,
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].name, "handler")
+        self.assertEqual(results[0].source_line, 1)
+        self.assertEqual(results[0].signature_str, "48 8B ? 90 90")
+        self.assertEqual(results[0].search_pattern, "48 8B ? 90 90")
+        self.assertEqual(results[0].normalized_signature, "48 8B ?? 90 90")
 
     def test_search_rejects_buffer_and_scope_together(self):
         with self.assertRaisesRegex(ValueError, "buf.*scope_ea"):

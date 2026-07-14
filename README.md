@@ -273,13 +273,15 @@ Each line is parsed through the same strict parser used by regular signature sea
 
 ```text
 48 8B ? ?? 4? ?F
+488B??9090
+488B4??F90
 48,8B;?;90
 \x48\x8B\x00\x48\x89 xx?xx
 0x48, 0x8B, 0x00, 0x48, 0x89 0b11011
 (48 8B ? 90)
 ```
 
-Bytes and wildcards must be explicit. Single nibbles such as `E 8 4`, glued runs such as `488B9090` or `0x488B9090`, colon/pipe/hyphen separators, declaration text, and random prose are rejected rather than guessed. This is intentionally stricter than earlier search parsing. Invalid batch patterns are reported per entry instead of aborting the whole batch. Patterns must contain at least one exact byte; an all-wildcard pattern such as `?? ?? ??` is rejected because it matches almost everywhere and is not a useful search key.
+Compact input may omit separators when the complete pattern consists of fixed two-character cells: `HH`, `??`, `H?`, or `?H`. For example, `488B??9090` parses as `48 8B ? 90 90`. Single nibbles such as `E 8 4`, odd-length compact input such as `488B?9090`, hybrid glued input such as `488B ?? 90`, long integer notation such as `0x488B9090`, colon/pipe/hyphen separators, declaration text, and random prose are rejected rather than guessed. Invalid batch patterns are reported per entry instead of aborting the whole batch. Patterns must contain at least one exact byte; an all-wildcard pattern such as `?? ?? ??` is rejected because it matches almost everywhere and is not a useful search key.
 
 `BatchSearchResults` is iterable, so `list(results)` gives the per-pattern `SearchResults` objects. `SearchResults.raw_pattern` is the extracted user input, `SearchResults.search_pattern` is the parsed SigMaker search pattern, and `SearchResults.normalized_signature` is the canonical matcher/cache pattern. Nibble wildcard patterns such as `4? ?F ??` keep their nibble masks in both parsed and normalized forms; full-byte wildcards display as `?` in `search_pattern` and normalize to `??` in `normalized_signature`. `SearchResults.signature_str` remains available as a compatibility alias for the search pattern. `SearchResults.matches` remains the main match list, and each `Match` still acts like an int while carrying its optional RVA metadata.
 

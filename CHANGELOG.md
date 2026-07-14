@@ -14,7 +14,7 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ### Changed
 
-- **Signature search input parsing is stricter.** Explicit byte tokens, full-byte and nibble wildcards, escaped bytes, `0xHH` bytes, and existing mask forms remain supported. Single nibbles, glued hex runs, unsupported separators, declaration text, and other malformed input are rejected instead of being guessed or converted to wildcards.
+- **Signature search input parsing is explicit.** Spaced byte tokens, full-byte and nibble wildcards, escaped bytes, repeated `0xHH` bytes, and existing mask forms remain supported. Compact fixed-pair patterns such as `488B??9090` are split into `HH`, `??`, `H?`, or `?H` cells. Single nibbles, odd-length or hybrid glued input, unsupported separators, declaration text, and other malformed input are rejected instead of being guessed or converted to wildcards.
 - **File offsets are resolved only when output requests them.** Batch search performs no `get_fileregion_offset` calls. Text output resolves previewed hits, while CSV, JSON, and custom formatters resolve and cache the hits they emit.
 
 ### Fixed

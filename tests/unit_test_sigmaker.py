@@ -1543,23 +1543,37 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         self.assertEqual(repr(result.matches[0]), "Match(address=0x1000)")
         self.assertEqual(hash(result.matches[0]), hash(sigmaker.Match(0x1000)))
 
-    def test_metadata_lookup_does_not_replace_matches(self):
+    def test_file_offset_lookup_does_not_replace_matches(self):
         result = sigmaker.SearchResults([sigmaker.Match(0x1000)], "90")
         original = result.matches[0]
-        result.imagebase = 0x1000
 
         with patch.object(
             sigmaker.SearchResults,
             "_file_offset_for_ea",
             return_value=0x400,
-        ):
-            self.assertEqual(result.rva_for_match(original), 0)
+        ) as lookup:
+            self.assertEqual(result.file_offset_for_match(original), 0x400)
             self.assertEqual(result.file_offset_for_match(original), 0x400)
 
         self.assertIs(result.matches[0], original)
         self.assertIsNone(result.matches[0].rva)
         self.assertIsNone(result.matches[0].file_offset)
-        self.assertEqual(result.file_offsets[0x1000], 0x400)
+        self.assertFalse(hasattr(result, "imagebase"))
+        self.assertFalse(hasattr(result, "file_offsets"))
+        lookup.assert_called_once_with(0x1000)
+
+    def test_file_offset_lookup_caches_unavailable_results(self):
+        result = sigmaker.SearchResults([sigmaker.Match(0x1000)], "90")
+
+        with patch.object(
+            sigmaker.SearchResults,
+            "_file_offset_for_ea",
+            return_value=None,
+        ) as lookup:
+            self.assertIsNone(result.file_offset_for_match(result.matches[0]))
+            self.assertIsNone(result.file_offset_for_match(result.matches[0]))
+
+        lookup.assert_called_once_with(0x1000)
 
     def test_match_metadata_keeps_address_equality_and_hash(self):
         plain = sigmaker.Match(0x1000)
@@ -1582,7 +1596,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         with patch.object(
             sigmaker.SignatureSearcher,
             "find_all",
-            return_value=[sigmaker.Match(0x1000)],
+            return_value=[sigmaker.Match(0x1000, rva=0)],
         ) as find_all, patch.object(
             sigmaker.idaapi,
             "get_imagebase",
@@ -1592,17 +1606,21 @@ class TestSignatureSearcherInput(CoveredUnitTest):
                 "E8 ? ? ? ? 48"
             ).search()
 
-        find_all.assert_called_once_with("E8 ?? ?? ?? ?? 48", scope=None)
+        find_all.assert_called_once_with(
+            "E8 ?? ?? ?? ?? 48",
+            scope=None,
+            imagebase=0x1000,
+        )
         self.assertEqual(result.signature_str, "E8 ? ? ? ? 48")
         self.assertEqual(result.search_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(result.normalized_signature, "E8 ?? ?? ?? ?? 48")
         self.assertEqual(result.raw_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(result.status, "matched")
         self.assertEqual(result.match_count, 1)
-        self.assertEqual(result.imagebase, 0x1000)
-        self.assertEqual(result.rva_for_match(sigmaker.Match(0x1000)), 0)
+        self.assertEqual(result.rva_for_match(result.matches[0]), 0)
         self.assertEqual(result.matches[0], sigmaker.Match(0x1000))
         self.assertEqual(result.matches[0].rva, 0)
+        self.assertFalse(hasattr(result, "imagebase"))
 
     def test_search_preserves_search_pattern_signature_string(self):
         cases = (
@@ -1619,7 +1637,11 @@ class TestSignatureSearcherInput(CoveredUnitTest):
             ) as find_all:
                 result = sigmaker.SignatureSearcher.from_signature(raw).search()
 
-            find_all.assert_called_once_with("48 8B ?? 48 89", scope=None)
+            find_all.assert_called_once_with(
+                "48 8B ?? 48 89",
+                scope=None,
+                imagebase=None,
+            )
             self.assertEqual(result.signature_str, "48 8B ? 48 89")
             self.assertEqual(result.search_pattern, "48 8B ? 48 89")
             self.assertEqual(result.normalized_signature, "48 8B ?? 48 89")
@@ -1638,7 +1660,11 @@ class TestSignatureSearcherInput(CoveredUnitTest):
             ) as find_all:
                 result = sigmaker.SignatureSearcher.from_signature(raw).search()
 
-            find_all.assert_called_once_with(normalized, scope=None)
+            find_all.assert_called_once_with(
+                normalized,
+                scope=None,
+                imagebase=None,
+            )
             self.assertEqual(result.raw_pattern, raw)
             self.assertEqual(result.signature_str, search_pattern)
             self.assertEqual(result.search_pattern, search_pattern)
@@ -1810,10 +1836,11 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         shared_buf = MagicMock()
         shared_buf.imagebase = 0x140000000
 
-        def fake_find_all(ida_signature, buf=None):
+        def fake_find_all(ida_signature, buf=None, *, imagebase=None):
             calls.append(ida_signature)
             self.assertIs(buf, shared_buf)
-            return [sigmaker.Match(0x140001000)]
+            self.assertEqual(imagebase, 0x140000000)
+            return [sigmaker.Match(0x140001000, rva=0x1000)]
 
         text = """
         first = "48 8B C4"
@@ -1833,9 +1860,17 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             results = sigmaker.BatchSignatureSearcher.from_text(text).search(
                 buf=shared_buf
             )
+            get_fileregion_offset.assert_not_called()
+            first_file_offset = results[0].file_offset_for_match(
+                results[0].matches[0]
+            )
+            second_file_offset = results[0].file_offset_for_match(
+                results[0].matches[0]
+            )
+            match_record = results[0].match_record(results[0].matches[0])
+            get_fileregion_offset.assert_called_once_with(0x140001000)
 
         self.assertEqual(calls, ["48 8B C4", "E8 ?? ?? ?? ?? 48"])
-        get_fileregion_offset.assert_called_once_with(0x140001000)
         self.assertEqual(len(results), 3)
         result_list = list(results)
         self.assertEqual(len(result_list), 3)
@@ -1846,38 +1881,35 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             all(isinstance(entry, sigmaker.SearchResults) for entry in results)
         )
         self.assertEqual(results.imagebase, 0x140000000)
-        self.assertEqual(
-            results[0].file_offset_for_match(sigmaker.Match(0x140001000)),
-            0x401000,
-        )
+        self.assertFalse(hasattr(results[0], "imagebase"))
+        self.assertFalse(hasattr(results[0], "file_offsets"))
         self.assertEqual(results[0].normalized_signature, "48 8B C4")
         self.assertEqual(results[2].signature_str, "E8 ? ? ? ? 48")
         self.assertEqual(results[2].search_pattern, "E8 ? ? ? ? 48")
         self.assertEqual(results[2].normalized_signature, "E8 ?? ?? ?? ?? 48")
         self.assertEqual(
-            results[0].rva_for_match(sigmaker.Match(0x140001000)),
+            results[0].rva_for_match(results[0].matches[0]),
             0x1000,
         )
+        self.assertEqual(first_file_offset, 0x401000)
+        self.assertEqual(second_file_offset, 0x401000)
         self.assertEqual(
-            results[0].file_offset_for_match(sigmaker.Match(0x140001000)),
-            0x401000,
-        )
-        self.assertEqual(
-            results[0].match_record(sigmaker.Match(0x140001000)),
+            match_record,
             {"ea": 0x140001000, "rva": 0x1000, "file_offset": 0x401000},
         )
         self.assertEqual(results[0].matches[0], sigmaker.Match(0x140001000))
+        self.assertIs(results[0].matches[0], results[1].matches[0])
         hit = results[0].matches[0]
         self.assertEqual(hit.rva, 0x1000)
-        self.assertEqual(hit.file_offset, 0x401000)
+        self.assertIsNone(hit.file_offset)
         self.assertEqual(f"{hit}", "0x140001000")
         self.assertEqual(f"{hit:ea}", "0x140001000")
         self.assertEqual(f"{hit:address}", "0x140001000")
         self.assertEqual(f"{hit:rva}", "0x1000")
         self.assertEqual(f"{hit:rva:x}", "1000")
-        self.assertEqual(f"{hit:fileoffset}", "0x401000")
-        self.assertEqual(f"{hit:file_offset}", "0x401000")
-        self.assertEqual(f"{hit:file:X}", "401000")
+        self.assertEqual(f"{hit:fileoffset}", repr(hit))
+        self.assertEqual(f"{hit:file_offset}", repr(hit))
+        self.assertEqual(f"{hit:file:X}", repr(hit))
         self.assertEqual(f"{hit:#x}", "0x140001000")
         sparse_hit = sigmaker.Match(0x140001000)
         self.assertEqual(
@@ -1897,7 +1929,11 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
                 'nibble = "4? ?F ?? 7A"'
             ).search()
 
-        find_all.assert_called_once_with("4? ?F ?? 7A", buf=None)
+        find_all.assert_called_once_with(
+            "4? ?F ?? 7A",
+            buf=None,
+            imagebase=None,
+        )
         self.assertEqual(results[0].raw_pattern, "4? ?F ?? 7A")
         self.assertEqual(results[0].signature_str, "4? ?F ? 7A")
         self.assertEqual(results[0].search_pattern, "4? ?F ? 7A")
@@ -1952,26 +1988,36 @@ class TestBatchSearchFormatters(CoveredUnitTest):
 
     def _results(self):
         matched = sigmaker.SearchResults(
-            matches=[sigmaker.Match(0x140001000)],
+            matches=[
+                sigmaker.Match(
+                    0x140001000,
+                    rva=0x1000,
+                    file_offset=0x401000,
+                )
+            ],
             signature_str="48 8B ? 48 89",
             raw_pattern="\\x48\\x8B\\x00\\x48\\x89 xx?xx",
             name="print",
             source_line=1,
-            imagebase=0x140000000,
-            file_offsets={0x140001000: 0x401000},
             canonical_pattern="48 8B ?? 48 89",
         )
         multi = sigmaker.SearchResults(
-            matches=[sigmaker.Match(0x140002000), sigmaker.Match(0x140003000)],
+            matches=[
+                sigmaker.Match(
+                    0x140002000,
+                    rva=0x2000,
+                    file_offset=0x402000,
+                ),
+                sigmaker.Match(
+                    0x140003000,
+                    rva=0x3000,
+                    file_offset=0x403000,
+                ),
+            ],
             signature_str="90",
             raw_pattern="90",
             name="tick",
             source_line=2,
-            imagebase=0x140000000,
-            file_offsets={
-                0x140002000: 0x402000,
-                0x140003000: 0x403000,
-            },
         )
         error = sigmaker.SearchResults(
             matches=[],
@@ -2078,6 +2124,7 @@ class TestBatchSearchFormatters(CoveredUnitTest):
         )
         self.assertEqual(payload["entries"][0]["matches"][0]["ea"], 0x140001000)
         self.assertEqual(payload["entries"][0]["matches"][0]["rva"], 0x1000)
+        self.assertNotIn("imagebase", payload["entries"][0])
         self.assertEqual(
             payload["entries"][0]["matches"][0]["file_offset"],
             0x401000,

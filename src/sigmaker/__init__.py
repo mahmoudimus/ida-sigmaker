@@ -2479,15 +2479,14 @@ class SearchResults:
     source_line: int = 0
     #: Per-entry parse or search error; empty when the entry succeeded.
     error: str = ""
-    #: Imagebase used to compute match RVAs, when known.
-    imagebase: typing.Optional[int] = None
-    #: Mapping from effective address to input-file offset.
-    file_offsets: dict[int, int] = dataclasses.field(default_factory=dict)
     #: Canonical matcher/cache pattern, preserving supported wildcard detail.
     canonical_pattern: str = ""
-
-    def __post_init__(self) -> None:
-        self._apply_match_metadata()
+    #: Lazily resolved file offsets, including unavailable values.
+    _file_offset_cache: dict[int, typing.Optional[int]] = dataclasses.field(
+        default_factory=dict,
+        init=False,
+        repr=False,
+    )
 
     @property
     def search_pattern(self) -> str:
@@ -2544,44 +2543,16 @@ class SearchResults:
                 return file_offset
         return None
 
-    @classmethod
-    def file_offsets_for_matches(
-        cls,
-        hits: list[Match],
-        cache: typing.Optional[dict[int, int]] = None,
-    ) -> dict[int, int]:
-        file_offsets: dict[int, int] = {}
-        cache = cache if cache is not None else {}
-        for hit in hits:
-            ea = int(hit)
-            if ea in file_offsets:
-                continue
-            if ea in cache:
-                file_offsets[ea] = cache[ea]
-                continue
-            file_offset = cls._file_offset_for_ea(ea)
-            if file_offset is not None:
-                cache[ea] = file_offset
-                file_offsets[ea] = file_offset
-        return file_offsets
-
     def rva_for_match(self, hit: Match) -> typing.Optional[int]:
-        if hit.rva is not None:
-            return hit.rva
-        if self.imagebase is None:
-            return None
-        return int(hit) - self.imagebase
+        return hit.rva
 
     def file_offset_for_match(self, hit: Match) -> typing.Optional[int]:
         if hit.file_offset is not None:
             return hit.file_offset
         ea = int(hit)
-        if ea in self.file_offsets:
-            return self.file_offsets[ea]
-        file_offset = self._file_offset_for_ea(ea)
-        if file_offset is not None:
-            self.file_offsets[ea] = file_offset
-        return file_offset
+        if ea not in self._file_offset_cache:
+            self._file_offset_cache[ea] = self._file_offset_for_ea(ea)
+        return self._file_offset_cache[ea]
 
     def match_record(self, hit: Match) -> dict[str, typing.Optional[int]]:
         return {
@@ -2589,26 +2560,6 @@ class SearchResults:
             "rva": self.rva_for_match(hit),
             "file_offset": self.file_offset_for_match(hit),
         }
-
-    def _apply_match_metadata(self) -> None:
-        if self.imagebase is None and not self.file_offsets:
-            return
-        self.matches = [
-            Match(
-                int(hit),
-                rva=(
-                    hit.rva
-                    if hit.rva is not None or self.imagebase is None
-                    else int(hit) - self.imagebase
-                ),
-                file_offset=(
-                    hit.file_offset
-                    if hit.file_offset is not None
-                    else self.file_offsets.get(int(hit))
-                ),
-            )
-            for hit in self.matches
-        ]
 
     def to_record(self) -> dict[str, typing.Any]:
         return {
@@ -2619,7 +2570,6 @@ class SearchResults:
             "normalized_signature": self.normalized_signature,
             "status": self.status,
             "match_count": self.match_count,
-            "imagebase": self.imagebase,
             "matches": [
                 self.match_record(hit) for hit in self.matches
             ],
@@ -3196,13 +3146,18 @@ class SignatureSearcher:
                 scope = (int(seg.start_ea), int(seg.end_ea))
 
         where = "the current segment" if scope else "the whole database"
+        imagebase = SearchResults.current_imagebase()
         # Wrap the search in a ProgressDialog to allow cancellation
         with ProgressDialog(
             "Search for a signature\n\n"
             f"Scanning {where} for your pattern.\n\n"
             "Press Cancel to stop"
         ):
-            matches = self.find_all(canonical_pattern, scope=scope)
+            matches = self.find_all(
+                canonical_pattern,
+                scope=scope,
+                imagebase=imagebase,
+            )
 
         return SearchResults(
             matches,
@@ -3210,7 +3165,6 @@ class SignatureSearcher:
             raw_pattern=self.input_signature,
             name=self.name or "",
             source_line=self.source_line,
-            imagebase=SearchResults.current_imagebase(),
             canonical_pattern=canonical_pattern,
         )
 
@@ -3219,6 +3173,8 @@ class SignatureSearcher:
         ida_signature: str,
         skip_more_than_one: bool = False,
         buf: typing.Optional["InMemoryBuffer"] = None,
+        *,
+        imagebase: typing.Optional[int] = None,
     ) -> list[Match]:
         simd_signature, _ = SigText.normalize(ida_signature)
         if buf is None:
@@ -3240,7 +3196,12 @@ class SignatureSearcher:
         results: list[Match] = []
         base = idaapi.inf_get_min_ea()
         if (k := sig.size_bytes) == 0:
-            return [Match(base)]
+            return [
+                Match(
+                    base,
+                    rva=None if imagebase is None else base - imagebase,
+                )
+            ]
 
         n = len(data_mv)
         off = 0
@@ -3263,7 +3224,13 @@ class SignatureSearcher:
             idx = _simd_scan_bytes(data_mv[off:], sig)
             if idx < 0:
                 break
-            results.append(Match(to_addr(off + idx)))
+            address = to_addr(off + idx)
+            results.append(
+                Match(
+                    address,
+                    rva=None if imagebase is None else address - imagebase,
+                )
+            )
             if skip_more_than_one and len(results) > 1:
                 break
             off += idx + 1
@@ -3315,6 +3282,8 @@ class SignatureSearcher:
         buf: typing.Optional["InMemoryBuffer"] = None,
         skip_more_than_one: bool = False,
         scope: typing.Optional[tuple[int, int]] = None,
+        *,
+        imagebase: typing.Optional[int] = None,
     ) -> list[Match]:
         # Use SIMD if available
         if SIMD_SPEEDUP_AVAILABLE:
@@ -3327,7 +3296,10 @@ class SignatureSearcher:
                         mode=InMemoryBuffer.LoadMode.SEGMENTS, scope_ea=scope[0]
                     )
             return SignatureSearcher._find_all_simd(
-                ida_signature, skip_more_than_one=skip_more_than_one, buf=buf
+                ida_signature,
+                skip_more_than_one=skip_more_than_one,
+                buf=buf,
+                imagebase=imagebase,
             )
         if SignatureSearcher._has_nibble_wildcards(ida_signature):
             raise ValueError("Nibble wildcard search requires SIMD speedups")
@@ -3352,7 +3324,12 @@ class SignatureSearcher:
             hit, _ = _bin_search(ea, max_ea, binary, flags)
             if hit == idaapi.BADADDR:
                 break
-            out.append(Match(hit))
+            out.append(
+                Match(
+                    hit,
+                    rva=None if imagebase is None else hit - imagebase,
+                )
+            )
             # is_unique only needs to know if there is more than one match;
             # bail at 2 instead of enumerating every match in the database.
             if skip_more_than_one and len(out) > 1:
@@ -3413,7 +3390,6 @@ class BatchSignatureSearcher:
         searchers = self.searchers or SignatureSearcher.from_many(self.input_text)
         results: list[SearchResults] = []
         match_cache: dict[str, list[Match]] = {}
-        file_offset_cache: dict[int, int] = {}
         imagebase = SearchResults.current_imagebase(buf)
 
         for searcher in searchers:
@@ -3424,21 +3400,19 @@ class BatchSignatureSearcher:
 
                 matches = match_cache.get(normalized)
                 if matches is None:
-                    matches = SignatureSearcher.find_all(normalized, buf=buf)
+                    matches = SignatureSearcher.find_all(
+                        normalized,
+                        buf=buf,
+                        imagebase=imagebase,
+                    )
                     match_cache[normalized] = matches
 
-                file_offsets = SearchResults.file_offsets_for_matches(
-                    matches,
-                    cache=file_offset_cache,
-                )
                 result = SearchResults(
                     matches=list(matches),
                     signature_str=signature_str,
                     raw_pattern=searcher.input_signature,
                     name=searcher.name or "",
                     source_line=searcher.source_line,
-                    imagebase=imagebase,
-                    file_offsets=file_offsets,
                     canonical_pattern=normalized,
                 )
             except UserCanceledError:
@@ -3450,7 +3424,6 @@ class BatchSignatureSearcher:
                     raw_pattern=searcher.input_signature,
                     name=searcher.name or "",
                     source_line=searcher.source_line,
-                    imagebase=imagebase,
                     error=str(exc),
                 )
             results.append(result)

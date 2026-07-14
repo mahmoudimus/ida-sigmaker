@@ -6,11 +6,20 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ### Added
 
-- **Batch signature search API** supports several named or unnamed signatures at once, using `foo = "48 8B ?? ??"`, `foo := 48 8B ?? ??`, plain signature lines, or semicolons to separate entries on the same line. The batch parser does not infer C declarations or join entries across multiple lines. Each pattern is normalized and searched independently; invalid patterns are reported per entry instead of aborting the whole batch.
-- **Batch result formatting** supports text, CSV, and JSON. Results include normalized signatures, status, match counts, absolute EAs, RVAs relative to the imagebase, file offsets when IDA can resolve them, and per-entry errors.
+- **Batch signature search API** supports several named or unnamed signatures at once, using one `foo = "48 8B ?? ??"`, `foo := 48 8B ?? ??`, or plain signature per non-empty line. The batch parser does not infer C declarations or join entries across multiple lines. Each pattern is normalized and searched independently; invalid patterns are reported per entry instead of aborting the whole batch.
+- **Batch result formatting** supports text, CSV, and JSON. Results include normalized signatures, status, match counts, absolute EAs, RVAs relative to the imagebase, lazily resolved file offsets, and per-entry errors.
 - **Batch search formatters are extensible.** Power users can register custom renderers with `@BatchSearchFormatter.register("name", suffixes=(...))`, then use `results.format("name")` or export to a registered suffix.
-- **Search results now expose structured metadata.** `SearchResults` keeps the existing `matches` and `signature_str` fields while adding raw pattern, name/source-line context, status/error helpers, imagebase, and file-offset lookup. `Match` supports f-string fields like `ea`, `rva`, and `fileoffset`. Batch search uses the same result type per pattern.
-- **Batch search reuses the copied segment buffer** when SIMD speedups are available, so a batch does not reload the database for every pattern.
+- **Search results now expose structured metadata.** `SearchResults` keeps the existing `matches` and `signature_str` fields while adding raw pattern, name/source-line context, status/error helpers, and lazy file-offset lookup. `Match` supports f-string fields like `ea`, `rva`, and `fileoffset`. Batch search uses the same result type per pattern.
+- **Batch search loads and reuses one copied segment buffer** when SIMD speedups are available, so a batch does not reload the database for every pattern.
+
+### Changed
+
+- **Signature search input parsing is stricter.** Explicit byte tokens, full-byte and nibble wildcards, escaped bytes, `0xHH` bytes, and existing mask forms remain supported. Single nibbles, glued hex runs, unsupported separators, declaration text, and other malformed input are rejected instead of being guessed or converted to wildcards.
+- **File offsets are resolved only when output requests them.** Batch search performs no `get_fileregion_offset` calls. Text output resolves previewed hits, while CSV, JSON, and custom formatters resolve and cache the hits they emit.
+
+### Fixed
+
+- **Batch search now honors segment scope and cancellation.** A scoped batch uses the same containing-segment policy as ordinary search. Canceling an IDA or SIMD batch scan raises `UserCanceledError` instead of returning partial hits as a successful result; existing direct `find_all()` callers retain their partial-result behavior.
 
 ### Documentation
 

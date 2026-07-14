@@ -1,3 +1,4 @@
+import json
 import logging
 import pathlib
 import shutil
@@ -277,6 +278,26 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
         self.assertEqual(results.signature_str, "48 8B ? 48 89")
         self.assertEqual(len(results.matches), 4)
         self.assertIsInstance(results.matches[0], sigmaker.Match)
+
+    def test_batch_signature_search_against_real_binary(self):
+        results = sigmaker.BatchSignatureSearcher.from_text(
+            "first := 48 8B ? 48 89\n"
+            "second = 48 8B ?? 48 89\n"
+            "missing = DE AD BE EF 01 23 45 67 89 AB CD EF"
+        ).search()
+
+        self.assertEqual(len(results), 3)
+        self.assertEqual(results.error_count, 0)
+        self.assertEqual(results[0].status, "matched")
+        self.assertEqual(results[0].matches, results[1].matches)
+        self.assertIs(results[0].matches[0], results[1].matches[0])
+        self.assertTrue(all(hit.rva is not None for hit in results[0].matches))
+        self.assertEqual(results[2].status, "no_matches")
+
+        payload = json.loads(f"{results:json}")
+        self.assertEqual(payload["entry_count"], 3)
+        self.assertEqual(payload["entries"][0]["match_count"], 4)
+        self.assertIn("match_file_offsets", f"{results:csv}")
 
     def test_signature_occurrence_finding(self):
         test_signatures = [

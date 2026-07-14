@@ -3095,6 +3095,17 @@ class SignatureSearcher:
         )
 
     @staticmethod
+    def _scope_for_ea(
+        scope_ea: typing.Optional[int],
+    ) -> typing.Optional[tuple[int, int]]:
+        if scope_ea is None:
+            return None
+        seg = idaapi.getseg(scope_ea)
+        if seg is None:
+            return None
+        return int(seg.start_ea), int(seg.end_ea)
+
+    @staticmethod
     def _parse_search_signature(input_signature: str) -> tuple[str, str]:
         """Return the display signature and canonical search signature."""
         try:
@@ -3139,11 +3150,7 @@ class SignatureSearcher:
                 error=str(exc),
             )
 
-        scope = None
-        if scope_ea is not None:
-            seg = idaapi.getseg(scope_ea)
-            if seg is not None:
-                scope = (int(seg.start_ea), int(seg.end_ea))
+        scope = self._scope_for_ea(scope_ea)
 
         where = "the current segment" if scope else "the whole database"
         imagebase = SearchResults.current_imagebase()
@@ -3385,12 +3392,19 @@ class BatchSignatureSearcher:
 
     def search(
         self,
+        *,
         buf: typing.Optional["InMemoryBuffer"] = None,
+        scope_ea: typing.Optional[int] = None,
     ) -> BatchSearchResults:
+        if buf is not None and scope_ea is not None:
+            raise ValueError("buf and scope_ea cannot be provided together")
+
         searchers = self.searchers or SignatureSearcher.from_many(self.input_text)
         results: list[SearchResults] = []
         match_cache: dict[str, list[Match]] = {}
-        imagebase = SearchResults.current_imagebase(buf)
+        scope = SignatureSearcher._scope_for_ea(scope_ea)
+        active_buf = buf
+        imagebase = SearchResults.current_imagebase(active_buf)
 
         for searcher in searchers:
             try:
@@ -3400,9 +3414,25 @@ class BatchSignatureSearcher:
 
                 matches = match_cache.get(normalized)
                 if matches is None:
+                    if SIMD_SPEEDUP_AVAILABLE and active_buf is None:
+                        message = (
+                            "Please stand by, copying the segment..."
+                            if scope is not None
+                            else "Please stand by, copying segments..."
+                        )
+                        load_kwargs: dict[str, typing.Any] = {
+                            "mode": InMemoryBuffer.LoadMode.SEGMENTS,
+                        }
+                        if scope is not None:
+                            load_kwargs["scope_ea"] = scope[0]
+                        with ProgressDialog(message):
+                            active_buf = InMemoryBuffer.load(**load_kwargs)
+                        imagebase = SearchResults.current_imagebase(active_buf)
+
                     matches = SignatureSearcher.find_all(
                         normalized,
-                        buf=buf,
+                        buf=active_buf,
+                        scope=None if SIMD_SPEEDUP_AVAILABLE else scope,
                         imagebase=imagebase,
                     )
                     match_cache[normalized] = matches

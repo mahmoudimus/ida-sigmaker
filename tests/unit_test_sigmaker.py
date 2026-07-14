@@ -1831,14 +1831,172 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         self.assertEqual(batch.searchers[1].input_signature, "90 90 CC")
         self.assertIsNone(batch.searchers[1].name)
 
+    def test_search_rejects_buffer_and_scope_together(self):
+        with self.assertRaisesRegex(ValueError, "buf.*scope_ea"):
+            sigmaker.BatchSignatureSearcher.from_text("90").search(
+                buf=MagicMock(),
+                scope_ea=0x1010,
+            )
+
+    def test_search_reuses_one_automatic_simd_buffer(self):
+        loaded = MagicMock()
+        loaded.imagebase = 0x140000000
+
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            True,
+        ), patch.object(
+            sigmaker,
+            "ProgressDialog",
+            MagicMock(),
+        ), patch.object(
+            sigmaker.InMemoryBuffer,
+            "load",
+            return_value=loaded,
+        ) as load, patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all:
+            results = sigmaker.BatchSignatureSearcher.from_text(
+                "first = 90\nsecond = CC"
+            ).search()
+
+        load.assert_called_once_with(
+            mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS,
+        )
+        self.assertEqual(find_all.call_count, 2)
+        for call in find_all.call_args_list:
+            self.assertIs(call.kwargs["buf"], loaded)
+            self.assertIsNone(call.kwargs["scope"])
+            self.assertEqual(call.kwargs["imagebase"], 0x140000000)
+        self.assertEqual(results.imagebase, 0x140000000)
+
+    def test_search_does_not_load_simd_buffer_for_invalid_or_empty_batch(self):
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            True,
+        ), patch.object(
+            sigmaker.InMemoryBuffer,
+            "load",
+        ) as load:
+            invalid = sigmaker.BatchSignatureSearcher.from_text(
+                "bad = random prose"
+            ).search()
+            empty = sigmaker.BatchSignatureSearcher.from_text("").search()
+
+        load.assert_not_called()
+        self.assertEqual(invalid[0].status, "error")
+        self.assertEqual(len(empty), 0)
+
+    def test_search_passes_resolved_scope_to_non_simd_scan(self):
+        seg = MagicMock(start_ea=0x3000, end_ea=0x3400)
+
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            False,
+        ), patch.object(
+            sigmaker.idaapi,
+            "getseg",
+            return_value=seg,
+        ) as getseg, patch.object(
+            sigmaker.idaapi,
+            "get_imagebase",
+            return_value=0x1000,
+        ), patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all:
+            sigmaker.BatchSignatureSearcher.from_text("90").search(
+                scope_ea=0x3200
+            )
+
+        getseg.assert_called_once_with(0x3200)
+        find_all.assert_called_once_with(
+            "90",
+            buf=None,
+            scope=(0x3000, 0x3400),
+            imagebase=0x1000,
+        )
+
+    def test_search_scope_without_segment_falls_back_to_whole_database(self):
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            False,
+        ), patch.object(
+            sigmaker.idaapi,
+            "getseg",
+            return_value=None,
+        ), patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all:
+            sigmaker.BatchSignatureSearcher.from_text("90").search(
+                scope_ea=0x9999
+            )
+
+        self.assertIsNone(find_all.call_args.kwargs["scope"])
+
+    def test_search_loads_scoped_simd_buffer_once(self):
+        seg = MagicMock(start_ea=0x3000, end_ea=0x3400)
+        loaded = MagicMock()
+        loaded.imagebase = 0x1000
+
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            True,
+        ), patch.object(
+            sigmaker,
+            "ProgressDialog",
+            MagicMock(),
+        ), patch.object(
+            sigmaker.idaapi,
+            "getseg",
+            return_value=seg,
+        ), patch.object(
+            sigmaker.InMemoryBuffer,
+            "load",
+            return_value=loaded,
+        ) as load, patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all:
+            sigmaker.BatchSignatureSearcher.from_text(
+                "first = 90\nsecond = CC"
+            ).search(scope_ea=0x3200)
+
+        load.assert_called_once_with(
+            mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS,
+            scope_ea=0x3000,
+        )
+        self.assertEqual(find_all.call_count, 2)
+        for call in find_all.call_args_list:
+            self.assertIs(call.kwargs["buf"], loaded)
+            self.assertIsNone(call.kwargs["scope"])
+
     def test_search_reuses_normalized_match_results(self):
         calls: list[str] = []
         shared_buf = MagicMock()
         shared_buf.imagebase = 0x140000000
 
-        def fake_find_all(ida_signature, buf=None, *, imagebase=None):
+        def fake_find_all(
+            ida_signature,
+            buf=None,
+            scope=None,
+            *,
+            imagebase=None,
+        ):
             calls.append(ida_signature)
             self.assertIs(buf, shared_buf)
+            self.assertIsNone(scope)
             self.assertEqual(imagebase, 0x140000000)
             return [sigmaker.Match(0x140001000, rva=0x1000)]
 
@@ -1920,6 +2078,8 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         self.assertEqual(f"{sparse_hit:fileoffset}", repr(sparse_hit))
 
     def test_search_preserves_batch_nibble_wildcard_patterns(self):
+        shared_buf = MagicMock()
+        shared_buf.imagebase = 0x1000
         with patch.object(
             sigmaker.SignatureSearcher,
             "find_all",
@@ -1927,12 +2087,13 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         ) as find_all:
             results = sigmaker.BatchSignatureSearcher.from_text(
                 'nibble = "4? ?F ?? 7A"'
-            ).search()
+            ).search(buf=shared_buf)
 
         find_all.assert_called_once_with(
             "4? ?F ?? 7A",
-            buf=None,
-            imagebase=None,
+            buf=shared_buf,
+            scope=None,
+            imagebase=0x1000,
         )
         self.assertEqual(results[0].raw_pattern, "4? ?F ?? 7A")
         self.assertEqual(results[0].signature_str, "4? ?F ? 7A")
@@ -1944,11 +2105,15 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         good = "48 8B C4"
         bad = "not-a-signature"
         """
+        shared_buf = MagicMock()
+        shared_buf.imagebase = 0x1000
 
         with patch.object(
             sigmaker.SignatureSearcher, "find_all", return_value=[sigmaker.Match(0x1000)]
         ):
-            results = sigmaker.BatchSignatureSearcher.from_text(text).search()
+            results = sigmaker.BatchSignatureSearcher.from_text(text).search(
+                buf=shared_buf
+            )
 
         self.assertEqual(results[0].status, "matched")
         self.assertEqual(results[1].status, "error")
@@ -1965,22 +2130,30 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         self.assertIn("Unrecognized", results[0].error)
 
     def test_search_propagates_user_cancellation(self):
+        shared_buf = MagicMock()
+        shared_buf.imagebase = 0x1000
         with patch.object(
             sigmaker.SignatureSearcher,
             "find_all",
             side_effect=sigmaker.UserCanceledError("Canceled"),
         ):
             with self.assertRaises(sigmaker.UserCanceledError):
-                sigmaker.BatchSignatureSearcher.from_text("48 8B C4").search()
+                sigmaker.BatchSignatureSearcher.from_text("48 8B C4").search(
+                    buf=shared_buf
+                )
 
     def test_search_propagates_unexpected_search_errors(self):
+        shared_buf = MagicMock()
+        shared_buf.imagebase = 0x1000
         with patch.object(
             sigmaker.SignatureSearcher,
             "find_all",
             side_effect=RuntimeError("database unavailable"),
         ):
             with self.assertRaises(RuntimeError):
-                sigmaker.BatchSignatureSearcher.from_text("48 8B C4").search()
+                sigmaker.BatchSignatureSearcher.from_text("48 8B C4").search(
+                    buf=shared_buf
+                )
 
 
 class TestBatchSearchFormatters(CoveredUnitTest):

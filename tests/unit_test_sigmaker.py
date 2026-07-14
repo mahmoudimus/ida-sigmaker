@@ -17,6 +17,7 @@ import pathlib
 import platform
 import random
 import re
+import runpy
 import sys
 import tempfile
 import time
@@ -1634,7 +1635,11 @@ class TestSignatureSearcherInput(CoveredUnitTest):
                 sigmaker.SignatureSearcher,
                 "find_all",
                 return_value=[sigmaker.Match(0x1000)],
-            ) as find_all:
+            ) as find_all, patch.object(
+                sigmaker.idaapi,
+                "get_imagebase",
+                return_value=None,
+            ):
                 result = sigmaker.SignatureSearcher.from_signature(raw).search()
 
             find_all.assert_called_once_with(
@@ -1657,7 +1662,11 @@ class TestSignatureSearcherInput(CoveredUnitTest):
                 sigmaker.SignatureSearcher,
                 "find_all",
                 return_value=[sigmaker.Match(0x1000)],
-            ) as find_all:
+            ) as find_all, patch.object(
+                sigmaker.idaapi,
+                "get_imagebase",
+                return_value=None,
+            ):
                 result = sigmaker.SignatureSearcher.from_signature(raw).search()
 
             find_all.assert_called_once_with(
@@ -2349,7 +2358,11 @@ class TestBatchSearchFormatters(CoveredUnitTest):
         }
         try:
             with patch.dict("sys.modules", {"sigmaker": sigmaker}):
-                from examples.batch_search_c_formatter import CBatchSearchFormatter
+                namespace = runpy.run_path(
+                    str(TEST_DIR.parent / "examples" / "batch_search_c_formatter.py"),
+                    run_name="batch_search_c_formatter_test",
+                )
+            CBatchSearchFormatter = namespace["CBatchSearchFormatter"]
 
             results = sigmaker.BatchSearchResults(
                 [

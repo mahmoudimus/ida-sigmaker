@@ -1490,6 +1490,42 @@ class TestSigTextAndSignatureParsing(CoveredUnitTest):
 class TestSignatureSearcherInput(CoveredUnitTest):
     """Normal signature search owns single-pattern parse/validation policy."""
 
+    def test_parser_accepts_only_explicit_signature_tokens(self):
+        cases = {
+            "48 8B 00": "48 8B 00",
+            "48,8B;00": "48 8B 00",
+            "(48 8B ? ?? 4? ?F)": "48 8B ? ? 4? ?F",
+            "[48 8B ?]": "48 8B ?",
+            r"\x48\x8B\x00": "48 8B 00",
+            "0x48 0x8B 0x00": "48 8B 00",
+            "48 8B ? ?? 4? ?F ??": "48 8B ? ? 4? ?F ?",
+            r"\x48\x8B\x00\x48\x89 xx?xx": "48 8B ? 48 89",
+            "0x48, 0x8B, 0x00, 0x48, 0x89 0b11011": "48 8B ? 48 89",
+        }
+
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(sigmaker.SignatureParser.parse(raw), expected)
+
+    def test_parser_rejects_ambiguous_or_random_input(self):
+        invalid = (
+            "E 8 4 ? C",
+            "488B9090",
+            "0x488B9090",
+            "48:8B:90",
+            "48|8B|90",
+            "48-8B-90",
+            "48 GG 90",
+            "hello world",
+            "(48 8B 90",
+            r"prefix \x48\x8B xx",
+            "prefix 0x48 0x8B xx",
+        )
+
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                self.assertEqual(sigmaker.SignatureParser.parse(raw), "")
+
     def test_searcher_does_not_expose_parser_api(self):
         self.assertFalse(
             hasattr(sigmaker.SignatureSearcher, "parse_search_signature")
@@ -1664,7 +1700,8 @@ class TestSignatureSearcherFromMany(CoveredUnitTest):
 
     def test_parse_named_quoted_and_plain_patterns(self):
         text = """
-        print = "48 8B ?? ??"; update := E8 ? ? ? ? 48 89 C7
+        print = "48 8B ?? ??"
+        update := E8 ? ? ? ? 48 89 C7
         90 90 CC
         """
 
@@ -1676,10 +1713,26 @@ class TestSignatureSearcherFromMany(CoveredUnitTest):
         self.assertEqual(searchers[0].source_line, 2)
         self.assertEqual(searchers[1].name, "update")
         self.assertEqual(searchers[1].input_signature, "E8 ? ? ? ? 48 89 C7")
-        self.assertEqual(searchers[1].source_line, 2)
+        self.assertEqual(searchers[1].source_line, 3)
         self.assertIsNone(searchers[2].name)
         self.assertEqual(searchers[2].input_signature, "90 90 CC")
-        self.assertEqual(searchers[2].source_line, 3)
+        self.assertEqual(searchers[2].source_line, 4)
+
+    def test_semicolon_separates_bytes_not_batch_entries(self):
+        searchers = sigmaker.SignatureSearcher.from_many(
+            "first := 48;8B;90\nsecond = CC"
+        )
+
+        self.assertEqual(
+            [
+                (searcher.name, searcher.input_signature, searcher.source_line)
+                for searcher in searchers
+            ],
+            [
+                ("first", "48;8B;90", 1),
+                ("second", "CC", 2),
+            ],
+        )
 
     def test_parse_does_not_accept_bare_colon_names(self):
         searchers = sigmaker.SignatureSearcher.from_many("update: E8 ? ? ? ?")
@@ -1703,9 +1756,9 @@ class TestSignatureSearcherFromMany(CoveredUnitTest):
                 for searcher in searchers
             ],
             [
-                (None, 'constexpr const char* print = "48 8B ?? ??"', 2),
+                (None, 'constexpr const char* print = "48 8B ?? ??";', 2),
                 (None, "split =", 3),
-                (None, '"90 90 CC"', 4),
+                (None, '"90 90 CC";', 4),
             ],
         )
 

@@ -2931,8 +2931,8 @@ class SignatureParser:
     Supported inputs (examples):
       - Mask notation:   bytes + mask string like "xxxx?x" or binary mask "0b10101"
       - Hex escapes:     "\x48\x8b\x05 ..."
-      - 0x-prefixed run: "0x48 0x8B 0x05 ..." or "0x488B05..."
-      - Loose hex:       "48 8B 05 ? ? 00"
+      - 0x-prefixed:     "0x48 0x8B 0x05 ..."
+      - Explicit tokens: "48 8B 05 ? ? 4? ?F"
 
     Output is a SigMaker search pattern string (space-separated, '?' for
     full-byte wildcards, nibble wildcards preserved), or an empty string on
@@ -2941,6 +2941,12 @@ class SignatureParser:
 
     _ESCAPED_HEX = re.compile(r"\\x[0-9A-Fa-f]{2}")
     _RUN_0X = re.compile(r"(?:0x[0-9A-Fa-f]{2})+")
+    _EXPLICIT_TOKEN = re.compile(
+        r"(?:[0-9A-Fa-f]{2}|[0-9A-Fa-f]\?|\?[0-9A-Fa-f]|\?\??)"
+    )
+    _ESCAPED_RUN = re.compile(r"(?:\\x[0-9A-Fa-f]{2})+")
+    _ESCAPED_EXPRESSION = re.compile(r"(?:\\x[0-9A-Fa-f]{2}|[\s,;])+")
+    _PREFIXED_EXPRESSION = re.compile(r"(?:0x[0-9A-Fa-f]{2}|[\s,;])+")
 
     # Regex to match a mask string consisting of 'x' and '?' characters, starting with 'x'
     _MASK_REGEX = re.compile(r"x(?:x|\?)+")
@@ -2949,45 +2955,62 @@ class SignatureParser:
 
     @classmethod
     def parse(cls, input_str: str) -> str:
-        mask = cls._extract_mask(input_str)
-        parsed = ""
-        if mask:
-            # Try to pair mask with bytes from either escaped form or 0x run
-            bytestr: list[str] = []
-            if (bytestr := cls._ESCAPED_HEX.findall(input_str)) and len(bytestr) == len(
-                mask
-            ):
-                parsed = cls._masked_bytes_to_ida(bytestr, mask, slice_from=2)
+        text = cls._strip_outer_wrapper(input_str)
+        if text is None:
+            return ""
 
-            elif (bytestr := cls._RUN_0X.findall(input_str)) and len(bytestr) == len(
-                mask
-            ):
-                parsed = cls._masked_bytes_to_ida(bytestr, mask, slice_from=2)
-            else:
-                idaapi.msg(
-                    f'Detected mask "{mask}" but failed to match corresponding bytes\n'
-                )
-        else:
-            # Fallback: normalize a loose byte string into IDA format
-            parsed = cls._normalize_loose_hex(input_str)
-        return parsed.strip()
+        mask_match = cls._MASK_REGEX.search(text)
+        if mask_match is None:
+            mask_match = cls._BINARY_MASK_REGEX.search(text)
+        if mask_match is not None:
+            return cls._parse_masked_pattern(text, mask_match)
+        return cls._normalize_explicit_pattern(text)
 
     # ---- internals ----
 
     @classmethod
-    def _extract_mask(cls, s: str) -> str:
-        """Extract mask from patterns like 'xxx?x' or binary '0b10101'."""
+    def _strip_outer_wrapper(cls, input_str: str) -> typing.Optional[str]:
+        text = input_str.strip()
+        if len(text) >= 2 and (text[0], text[-1]) in {
+            ("(", ")"),
+            ("[", "]"),
+        }:
+            text = text[1:-1].strip()
+        if any(ch in text for ch in "()[]"):
+            return None
+        return text
 
-        m = cls._MASK_REGEX.search(s)
-        if m:
-            return m.group(0)
-
-        m = cls._BINARY_MASK_REGEX.search(s)
-        if not m:
+    @classmethod
+    def _parse_masked_pattern(
+        cls,
+        text: str,
+        mask_match: re.Match[str],
+    ) -> str:
+        if text[mask_match.end() :].strip():
             return ""
-        bits = m.group(0)[2:]
-        # Binary mask is LSB-first in original code; reverse to align with bytes
-        return "".join("x" if b == "1" else "?" for b in bits[::-1])
+
+        byte_expression = text[: mask_match.start()].strip()
+        byte_tokens: list[str]
+        if cls._ESCAPED_EXPRESSION.fullmatch(byte_expression):
+            byte_tokens = cls._ESCAPED_HEX.findall(byte_expression)
+        elif cls._PREFIXED_EXPRESSION.fullmatch(byte_expression):
+            byte_tokens = re.findall(r"0x[0-9A-Fa-f]{2}", byte_expression)
+        else:
+            return ""
+
+        mask_text = mask_match.group(0)
+        if mask_text.startswith("0b"):
+            mask = "".join(
+                "x" if bit == "1" else "?" for bit in mask_text[2:][::-1]
+            )
+        else:
+            mask = mask_text
+        if len(byte_tokens) != len(mask):
+            idaapi.msg(
+                f'Detected mask "{mask}" but failed to match corresponding bytes\n'
+            )
+            return ""
+        return cls._masked_bytes_to_ida(byte_tokens, mask, slice_from=2)
 
     @staticmethod
     def _masked_bytes_to_ida(
@@ -3002,21 +3025,26 @@ class SignatureParser:
         return f"{sig:ida}"
 
     @classmethod
-    def _normalize_loose_hex(cls, input_str: str) -> str:
-        """Best-effort cleanup into a trimmed SigMaker search pattern."""
-        s = input_str
-        s = re.sub(r"[\)\(\[\]]+", "", s)  # strip brackets
-        s = re.sub(r"^\s+", "", s)  # lstrip
-        s = s.strip() + " "  # ensure trailing space
-        s = re.sub(r"\\?\\x", "", s)  # drop any stray \x or escaped \x
-        s = re.sub(r"\s+", " ", s)  # collapse whitespace
-
-        try:
-            normalized, _ = SigText.normalize(s)
-        except ValueError:
-            return ""
-
-        return " ".join("?" if tok == "??" else tok for tok in normalized.split())
+    def _normalize_explicit_pattern(cls, input_str: str) -> str:
+        """Normalize a sequence of explicit byte and wildcard tokens."""
+        tokens: list[str] = []
+        for chunk in re.split(r"[\s,;]+", input_str):
+            if not chunk:
+                continue
+            if cls._ESCAPED_RUN.fullmatch(chunk):
+                tokens.extend(
+                    token[2:].upper() for token in cls._ESCAPED_HEX.findall(chunk)
+                )
+            elif cls._RUN_0X.fullmatch(chunk):
+                tokens.extend(
+                    token[2:].upper()
+                    for token in re.findall(r"0x[0-9A-Fa-f]{2}", chunk)
+                )
+            elif cls._EXPLICIT_TOKEN.fullmatch(chunk):
+                tokens.append("?" if chunk in {"?", "??"} else chunk.upper())
+            else:
+                return ""
+        return " ".join(tokens)
 
 
 @dataclasses.dataclass(slots=True)
@@ -3062,26 +3090,7 @@ class SignatureSearcher:
     def _split_statements(cls, text: str) -> list[tuple[int, str]]:
         statements: list[tuple[int, str]] = []
         for source_line, raw_line in enumerate(text.splitlines(), start=1):
-            line = cls._strip_comments(raw_line)
-            current: list[str] = []
-            in_quote = False
-            escaped = False
-
-            for ch in line:
-                if ch == ";" and not in_quote:
-                    statement = "".join(current).strip()
-                    if statement:
-                        statements.append((source_line, statement))
-                    current = []
-                    escaped = False
-                    continue
-
-                current.append(ch)
-                if ch == '"' and not escaped:
-                    in_quote = not in_quote
-                escaped = ch == "\\" and not escaped
-
-            statement = "".join(current).strip()
+            statement = cls._strip_comments(raw_line).strip()
             if statement:
                 statements.append((source_line, statement))
         return statements

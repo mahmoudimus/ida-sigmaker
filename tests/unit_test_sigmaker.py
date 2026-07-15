@@ -6,6 +6,7 @@ to ensure reliable testing across different platforms and architectures.
 """
 
 import array
+import contextlib
 import csv
 import dataclasses
 import gc
@@ -1740,25 +1741,30 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         self.assertIn("Unrecognized", result.error)
         msg.assert_called_once_with("Unrecognized signature type\n")
 
-    def test_search_reports_nibble_wildcard_error_without_simd(self):
-        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
-        try:
-            sigmaker.SIMD_SPEEDUP_AVAILABLE = False
-            with patch.object(sigmaker.idaapi, "msg") as msg, patch.object(
-                sigmaker.SignatureSearcher,
-                "find_all",
-            ) as find_all:
-                result = sigmaker.SignatureSearcher.from_signature("48 4? ?F").search()
+    def test_search_accepts_nibble_wildcards_without_simd(self):
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            False,
+        ), patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all, patch.object(
+            sigmaker.idaapi,
+            "get_imagebase",
+            return_value=None,
+        ), patch.object(sigmaker.idaapi, "msg") as msg:
+            result = sigmaker.SignatureSearcher.from_signature("48 4? ?F").search()
 
-            find_all.assert_not_called()
-            self.assertEqual(result.status, "error")
-            self.assertEqual(
-                result.error,
-                "Nibble wildcard search requires SIMD speedups",
-            )
-            msg.assert_called_once_with("Unrecognized signature type\n")
-        finally:
-            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+        find_all.assert_called_once_with(
+            "48 4? ?F",
+            scope=None,
+            imagebase=None,
+        )
+        self.assertEqual(result.status, "no_matches")
+        self.assertEqual(result.error, "")
+        msg.assert_not_called()
 
     def test_searcher_metadata_flows_to_results(self):
         with patch.object(
@@ -1921,41 +1927,79 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
                 scope_ea=0x1010,
             )
 
-    def test_search_reuses_one_automatic_simd_buffer(self):
+    def test_search_reuses_one_automatic_buffer(self):
+        cases = (
+            (True, "first = 90\nsecond = CC"),
+            (False, "first = 48 4? ?F\nsecond = 90 ?A CC"),
+        )
+        for simd_available, text in cases:
+            with self.subTest(simd_available=simd_available):
+                loaded = MagicMock(imagebase=0x140000000)
+                with patch.object(
+                    sigmaker,
+                    "SIMD_SPEEDUP_AVAILABLE",
+                    simd_available,
+                ), patch.object(
+                    sigmaker,
+                    "ProgressDialog",
+                    MagicMock(),
+                ), patch.object(
+                    sigmaker.InMemoryBuffer,
+                    "load",
+                    return_value=loaded,
+                ) as load, patch.object(
+                    sigmaker.SignatureSearcher,
+                    "find_all",
+                    return_value=[],
+                ) as find_all:
+                    results = sigmaker.BatchSignatureSearcher.from_text(text).search()
+
+                load.assert_called_once_with(
+                    mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS,
+                )
+                self.assertEqual(find_all.call_count, 2)
+                for call in find_all.call_args_list:
+                    self.assertIs(call.kwargs["buf"], loaded)
+                    self.assertIsNone(call.kwargs["scope"])
+                    self.assertEqual(call.kwargs["imagebase"], 0x140000000)
+                    self.assertIs(call.kwargs["raise_on_cancel"], True)
+                self.assertEqual(results.imagebase, 0x140000000)
+
+    def test_no_simd_batch_keeps_native_scope_after_loading_nibble_buffer(self):
+        seg = MagicMock(start_ea=0x3000, end_ea=0x3400)
         loaded = MagicMock()
-        loaded.imagebase = 0x140000000
+        loaded.imagebase = 0x1000
 
         with patch.object(
             sigmaker,
             "SIMD_SPEEDUP_AVAILABLE",
-            True,
+            False,
         ), patch.object(
             sigmaker,
             "ProgressDialog",
             MagicMock(),
         ), patch.object(
+            sigmaker.idaapi,
+            "getseg",
+            return_value=seg,
+        ), patch.object(
             sigmaker.InMemoryBuffer,
             "load",
             return_value=loaded,
-        ) as load, patch.object(
+        ), patch.object(
             sigmaker.SignatureSearcher,
             "find_all",
             return_value=[],
         ) as find_all:
-            results = sigmaker.BatchSignatureSearcher.from_text(
-                "first = 90\nsecond = CC"
-            ).search()
+            sigmaker.BatchSignatureSearcher.from_text(
+                "nibble = 48 4? ?F\nnormal = 90 90"
+            ).search(scope_ea=0x3200)
 
-        load.assert_called_once_with(
-            mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS,
-        )
-        self.assertEqual(find_all.call_count, 2)
-        for call in find_all.call_args_list:
-            self.assertIs(call.kwargs["buf"], loaded)
-            self.assertIsNone(call.kwargs["scope"])
-            self.assertEqual(call.kwargs["imagebase"], 0x140000000)
-            self.assertIs(call.kwargs["raise_on_cancel"], True)
-        self.assertEqual(results.imagebase, 0x140000000)
+        nibble_call, normal_call = find_all.call_args_list
+        self.assertIs(nibble_call.kwargs["buf"], loaded)
+        self.assertIsNone(nibble_call.kwargs["scope"])
+        self.assertIs(normal_call.kwargs["buf"], loaded)
+        self.assertEqual(normal_call.kwargs["scope"], (0x3000, 0x3400))
 
     def test_search_does_not_load_simd_buffer_for_invalid_or_empty_batch(self):
         with patch.object(
@@ -2224,10 +2268,6 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             "SIMD_SPEEDUP_AVAILABLE",
             False,
         ), patch.object(
-            sigmaker,
-            "idaapi_user_canceled",
-            side_effect=[False, True],
-        ), patch.object(
             sigmaker.idaapi,
             "BADADDR",
             0xFFFFFFFFFFFFFFFF,
@@ -2258,6 +2298,10 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             sigmaker.idaapi,
             "bin_search",
             return_value=(0x1000, None),
+        ), sigmaker.UIServices.use(
+            sigmaker.UIServices(
+                cancel_requested=MagicMock(side_effect=[False, True])
+            )
         ):
             with self.assertRaises(sigmaker.UserCanceledError):
                 sigmaker.BatchSignatureSearcher.from_text("48 8B C4").search()
@@ -2279,16 +2323,16 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
             1,
         ), patch.object(
             sigmaker,
-            "idaapi_user_canceled",
-            side_effect=[False, True],
-        ), patch.object(
-            sigmaker,
             "_simd_scan_bytes",
             return_value=0,
         ), patch.object(
             sigmaker.idaapi,
             "inf_get_min_ea",
             return_value=0x1000,
+        ), sigmaker.UIServices.use(
+            sigmaker.UIServices(
+                cancel_requested=MagicMock(side_effect=[False, True])
+            )
         ):
             with self.assertRaises(sigmaker.UserCanceledError):
                 sigmaker.BatchSignatureSearcher.from_text("90").search(
@@ -3256,7 +3300,6 @@ class TestSearchCancellation(CoveredUnitTest):
             return call_count[0] > 2
 
         # Setup idaapi mocks
-        sigmaker.idaapi_user_canceled = mock_user_canceled
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
         sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
         sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFF)
@@ -3280,7 +3323,10 @@ class TestSearchCancellation(CoveredUnitTest):
         sigmaker.SIMD_SPEEDUP_AVAILABLE = False
 
         try:
-            results = sigmaker.SignatureSearcher.find_all("48 8B C4")
+            with sigmaker.UIServices.use(
+                sigmaker.UIServices(cancel_requested=mock_user_canceled)
+            ):
+                results = sigmaker.SignatureSearcher.find_all("48 8B C4")
 
             # Should have found at least one match before cancellation
             self.assertGreater(len(results), 0)
@@ -3295,7 +3341,9 @@ class TestSearchCancellation(CoveredUnitTest):
     def test_find_all_no_cancellation(self):
         """Test that find_all works normally when not canceled."""
         # Setup idaapi mocks
-        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+        sigmaker.idaapi_user_canceled = MagicMock(
+            side_effect=AssertionError("headless search polled IDA UI")
+        )
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
         sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
         sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFF)
@@ -3330,21 +3378,6 @@ class TestSearchCancellation(CoveredUnitTest):
             # Restore SIMD setting
             sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
 
-    def test_find_all_rejects_nibble_wildcards_without_simd(self):
-        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
-        sigmaker.idaapi.parse_binpat_str = MagicMock()
-
-        try:
-            with self.assertRaisesRegex(
-                ValueError,
-                "Nibble wildcard search requires SIMD speedups",
-            ):
-                sigmaker.SignatureSearcher.find_all("48 4? ?F")
-            sigmaker.idaapi.parse_binpat_str.assert_not_called()
-        finally:
-            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
-
     def test_cancellation_returns_partial_results(self):
         """Test that cancellation returns partial results found so far."""
         # Mock user_canceled to cancel after finding 2 matches
@@ -3355,7 +3388,6 @@ class TestSearchCancellation(CoveredUnitTest):
             return call_count[0] > 3
 
         # Setup idaapi mocks
-        sigmaker.idaapi_user_canceled = mock_user_canceled
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
         sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
         sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFF)
@@ -3380,7 +3412,10 @@ class TestSearchCancellation(CoveredUnitTest):
         sigmaker.SIMD_SPEEDUP_AVAILABLE = False
 
         try:
-            results = sigmaker.SignatureSearcher.find_all("48 8B C4")
+            with sigmaker.UIServices.use(
+                sigmaker.UIServices(cancel_requested=mock_user_canceled)
+            ):
+                results = sigmaker.SignatureSearcher.find_all("48 8B C4")
 
             # Should return partial results (at least 1, but not all 4)
             self.assertGreater(len(results), 0)
@@ -3406,20 +3441,422 @@ class TestSearchCancellation(CoveredUnitTest):
             1,
         ), patch.object(
             sigmaker,
-            "idaapi_user_canceled",
-            side_effect=[False, True],
-        ), patch.object(
-            sigmaker,
             "_simd_scan_bytes",
             return_value=0,
         ), patch.object(
             sigmaker.idaapi,
             "inf_get_min_ea",
             return_value=0x1000,
+        ), sigmaker.UIServices.use(
+            sigmaker.UIServices(
+                cancel_requested=MagicMock(side_effect=[False, True])
+            )
         ):
             results = sigmaker.SignatureSearcher.find_all("90", buf=shared_buf)
 
         self.assertEqual(results, [sigmaker.Match(0x1000)])
+
+
+class TestUIServices(CoveredUnitTest):
+    @staticmethod
+    def _recording_progress(events):
+        @contextlib.contextmanager
+        def progress(message="", hide_cancel=False):
+            events.append(("init", message, hide_cancel))
+            events.append(("enter",))
+            try:
+                yield
+            finally:
+                events.append(("exit",))
+
+        return progress
+
+    def test_ida_cancel_wrapper_uses_safe_cached_binding(self):
+        cached = MagicMock(return_value=True)
+        with patch.object(sigmaker, "_IDA_USER_CANCELLED", cached), patch.object(
+            sigmaker.idaapi,
+            "user_cancelled",
+            side_effect=AssertionError("wrapper repeated the module lookup"),
+        ):
+            self.assertTrue(sigmaker.idaapi_user_canceled())
+        cached.assert_called_once_with()
+
+        with patch.object(sigmaker, "_IDA_USER_CANCELLED", None):
+            self.assertFalse(sigmaker.idaapi_user_canceled())
+
+        with patch.object(
+            sigmaker,
+            "_IDA_USER_CANCELLED",
+            side_effect=RuntimeError("no UI event loop"),
+        ):
+            self.assertFalse(sigmaker.idaapi_user_canceled())
+
+    def test_current_uses_environment_default_services(self):
+        services = sigmaker.UIServices(
+            cancel_requested=MagicMock(return_value=False)
+        )
+        with patch.object(sigmaker, "_DEFAULT_UI_SERVICES", services):
+            self.assertIs(sigmaker.UIServices.current(), services)
+
+    def test_default_services_follow_idaq_host(self):
+        ida_services = sigmaker.UIServices(
+            cancel_requested=MagicMock(return_value=False)
+        )
+        with patch.object(
+            sigmaker,
+            "_IDA_IS_IDAQ",
+            return_value=True,
+        ), patch.object(
+            sigmaker,
+            "_ida_ui_services",
+            return_value=ida_services,
+        ):
+            self.assertIs(sigmaker._select_default_ui_services(), ida_services)
+
+        for is_idaq in (
+            None,
+            MagicMock(return_value=False),
+            MagicMock(return_value=1),
+        ):
+            with self.subTest(is_idaq=is_idaq), patch.object(
+                sigmaker,
+                "_IDA_IS_IDAQ",
+                is_idaq,
+            ):
+                self.assertIs(
+                    sigmaker._select_default_ui_services(),
+                    sigmaker._HEADLESS_UI,
+                )
+
+        with patch.object(
+            sigmaker,
+            "_IDA_IS_IDAQ",
+            side_effect=RuntimeError("no host UI"),
+        ):
+            self.assertIs(
+                sigmaker._select_default_ui_services(),
+                sigmaker._HEADLESS_UI,
+            )
+
+    def test_default_is_headless_noop(self):
+        with patch.object(
+            sigmaker,
+            "idaapi_user_canceled",
+            side_effect=AssertionError("headless service polled IDA UI"),
+        ):
+            ui = sigmaker.UIServices.current()
+            with ui.progress("copying"):
+                pass
+            self.assertFalse(ui.cancel_requested())
+
+    def test_use_scopes_and_resets(self):
+        outer = sigmaker.UIServices.current()
+        cancel_requested = MagicMock(return_value=True)
+        services = sigmaker.UIServices(cancel_requested=cancel_requested)
+
+        with self.assertRaisesRegex(RuntimeError, "leave context"):
+            with sigmaker.UIServices.use(services) as active:
+                self.assertIs(active, services)
+                self.assertIs(sigmaker.UIServices.current(), services)
+                self.assertTrue(sigmaker.UIServices.current().cancel_requested())
+                raise RuntimeError("leave context")
+
+        self.assertIs(sigmaker.UIServices.current(), outer)
+        cancel_requested.assert_called_once_with()
+
+    def test_load_search_buffer_uses_injected_progress(self):
+        events = []
+        loaded = MagicMock()
+        services = sigmaker.UIServices(progress=self._recording_progress(events))
+        with sigmaker.UIServices.use(services), patch.object(
+            sigmaker.InMemoryBuffer,
+            "load",
+            return_value=loaded,
+        ) as load:
+            result = sigmaker._load_search_buffer((0x2000, 0x2100))
+
+        self.assertIs(result, loaded)
+        self.assertEqual(
+            events,
+            [
+                ("init", "Please stand by, copying the segment...", False),
+                ("enter",),
+                ("exit",),
+            ],
+        )
+        load.assert_called_once_with(
+            mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS,
+            scope_ea=0x2000,
+        )
+
+    def test_signature_search_uses_injected_progress(self):
+        events = []
+        services = sigmaker.UIServices(progress=self._recording_progress(events))
+        with sigmaker.UIServices.use(services), patch.object(
+            sigmaker,
+            "ProgressDialog",
+            side_effect=AssertionError("library search opened IDA UI"),
+        ), patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ), patch.object(
+            sigmaker.SearchResults,
+            "current_imagebase",
+            return_value=0x1000,
+        ):
+            result = sigmaker.SignatureSearcher.from_signature("90").search()
+
+        self.assertEqual(result.status, "no_matches")
+        self.assertEqual(events[0][0], "init")
+        self.assertIn("Search for a signature", events[0][1])
+        self.assertEqual(events[1:], [("enter",), ("exit",)])
+
+    def test_ida_ui_services_use_real_progress_and_safe_cancel_wrapper(self):
+        with patch.object(sigmaker, "ProgressDialog") as progress, patch.object(
+            sigmaker,
+            "idaapi_user_canceled",
+        ) as cancel_requested:
+            services = sigmaker._ida_ui_services()
+
+        self.assertIs(services.progress, progress)
+        self.assertIs(services.cancel_requested, cancel_requested)
+
+
+class TestNibbleWildcardFallback(CoveredUnitTest):
+    def setUp(self):
+        self._simd_available = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        self._user_canceled = sigmaker.idaapi_user_canceled
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+
+    def tearDown(self):
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = self._simd_available
+        sigmaker.idaapi_user_canceled = self._user_canceled
+
+    @staticmethod
+    def _buffer(
+        data: bytes,
+        *,
+        segments: list[tuple[int, int, int]] | None = None,
+    ) -> sigmaker.InMemoryBuffer:
+        buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
+        buf._buffer.extend(data)
+        buf._segments.extend(segments or [(0, 0x1000, len(data))])
+        return buf
+
+    def test_find_all_matches_nibble_wildcards_without_simd(self):
+        buf = self._buffer(
+            b"\x48\x4A\x1F\x90\xCC\x48\x5B\x2F\x90"
+        )
+
+        with patch.object(sigmaker.idaapi, "parse_binpat_str") as parse_binpat_str:
+            matches = sigmaker.SignatureSearcher.find_all(
+                "48 4? ?F 90",
+                buf=buf,
+                imagebase=0x1000,
+            )
+
+        self.assertEqual(matches, [sigmaker.Match(0x1000, rva=0)])
+        parse_binpat_str.assert_not_called()
+
+    def test_find_all_returns_no_matches_for_common_anchor(self):
+        buf = self._buffer(b"\x00" * 4096)
+
+        matches = sigmaker.SignatureSearcher.find_all(
+            "00 4? ?F",
+            buf=buf,
+        )
+
+        self.assertEqual(matches, [])
+
+    def test_middle_exact_run_matches_at_both_buffer_edges(self):
+        buf = self._buffer(
+            b"\x4A\x11\x22\x99\x3F\xCC\x4B\x11\x22\x00\x4F"
+        )
+
+        matches = sigmaker.SignatureSearcher.find_all(
+            "4? 11 22 ?? ?F",
+            buf=buf,
+        )
+
+        self.assertEqual(
+            matches,
+            [sigmaker.Match(0x1000), sigmaker.Match(0x1006)],
+        )
+
+    def test_skip_more_than_one_stops_after_second_nibble_match(self):
+        occurrence = b"\x00\x4A\x1F"
+        buf = self._buffer(occurrence * 256)
+
+        matches = sigmaker.SignatureSearcher.find_all(
+            "00 4? ?F",
+            buf=buf,
+            skip_more_than_one=True,
+        )
+
+        self.assertEqual(
+            matches,
+            [sigmaker.Match(0x1000), sigmaker.Match(0x1003)],
+        )
+
+    def test_nibble_fallback_cancellation_returns_partial_results(self):
+        buf = self._buffer(b"\x48\x4A\x1F\x90" * 3)
+        cancel_requested = MagicMock(side_effect=[False, True])
+
+        with patch.object(
+            sigmaker,
+            "_CANCEL_POLL_STRIDE",
+            1,
+        ), sigmaker.UIServices.use(
+            sigmaker.UIServices(cancel_requested=cancel_requested)
+        ):
+            matches = sigmaker.SignatureSearcher.find_all("48 4? ?F 90", buf=buf)
+
+        self.assertEqual(matches, [sigmaker.Match(0x1000)])
+        self.assertEqual(cancel_requested.call_count, 2)
+
+    def test_nibble_fallback_cancellation_can_raise(self):
+        buf = self._buffer(b"\x48\x4A\x1F\x90")
+
+        with sigmaker.UIServices.use(
+            sigmaker.UIServices(cancel_requested=lambda: True)
+        ):
+            with self.assertRaises(sigmaker.UserCanceledError):
+                sigmaker.SignatureSearcher.find_all(
+                    "48 4? ?F 90",
+                    buf=buf,
+                    raise_on_cancel=True,
+                )
+
+    def test_nibble_fallback_headless_default_does_not_poll_ida_ui(self):
+        buf = self._buffer(b"\x48\x4A\x1F\x90" * 3)
+
+        with patch.object(
+            sigmaker,
+            "_CANCEL_POLL_STRIDE",
+            1,
+        ), patch.object(
+            sigmaker,
+            "idaapi_user_canceled",
+            side_effect=AssertionError("headless search polled IDA UI"),
+        ):
+            matches = sigmaker.SignatureSearcher.find_all(
+                "48 4? ?F 90",
+                buf=buf,
+            )
+
+        self.assertEqual(
+            matches,
+            [
+                sigmaker.Match(0x1000),
+                sigmaker.Match(0x1004),
+                sigmaker.Match(0x1008),
+            ],
+        )
+
+    def test_nibble_fallback_loads_the_requested_scope(self):
+        buf = self._buffer(b"\x48\x4A\x1F\x90", segments=[(0, 0x2000, 4)])
+
+        with patch.object(
+            sigmaker.InMemoryBuffer,
+            "load",
+            return_value=buf,
+        ) as load, patch.object(
+            sigmaker,
+            "idaapi_user_canceled",
+            return_value=False,
+        ):
+            matches = sigmaker.SignatureSearcher.find_all(
+                "48 4? ?F 90",
+                scope=(0x2000, 0x2010),
+            )
+
+        load.assert_called_once_with(
+            mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS,
+            scope_ea=0x2000,
+        )
+        self.assertEqual(matches, [sigmaker.Match(0x2000)])
+
+    def test_nibble_fallback_intersects_supplied_buffer_with_scope(self):
+        buf = self._buffer(
+            b"\x90\x90\x90\x90\x48\x4A\x1F\x90",
+            segments=[(0, 0x1000, 4), (4, 0x2000, 4)],
+        )
+
+        matches = sigmaker.SignatureSearcher.find_all(
+            "48 4? ?F 90",
+            buf=buf,
+            scope=(0x1000, 0x1004),
+        )
+
+        self.assertEqual(matches, [])
+
+    def test_nibble_fallback_maps_noncontiguous_segments(self):
+        buf = self._buffer(
+            b"\x90\x90\x90\x90\x48\x4A\x1F\x90",
+            segments=[(0, 0x1000, 4), (4, 0x2000, 4)],
+        )
+
+        matches = sigmaker.SignatureSearcher.find_all(
+            "48 4? ?F 90",
+            buf=buf,
+        )
+
+        self.assertEqual(matches, [sigmaker.Match(0x2000)])
+
+    def test_nibble_fallback_does_not_match_across_segment_boundaries(self):
+        buf = self._buffer(
+            b"\x48\x4A\x1F\x90",
+            segments=[(0, 0x1000, 2), (2, 0x2000, 2)],
+        )
+
+        matches = sigmaker.SignatureSearcher.find_all(
+            "48 4? ?F 90",
+            buf=buf,
+        )
+
+        self.assertEqual(matches, [])
+
+    def test_nibble_fallback_requires_an_exact_byte(self):
+        buf = self._buffer(b"\x4A\x1F")
+
+        with self.assertRaisesRegex(ValueError, "at least one exact byte"):
+            sigmaker.SignatureSearcher.find_all("4? ?F", buf=buf)
+
+    def test_nibble_fallback_matches_bruteforce_oracle(self):
+        rng = random.Random(0x59)
+        for case in range(100):
+            data = rng.randbytes(128)
+            cells: list[tuple[str, int, int]] = []
+            for _ in range(rng.randrange(2, 9)):
+                value = rng.randrange(256)
+                kind = rng.randrange(4)
+                if kind == 0:
+                    cells.append((f"{value:02X}", value, 0xFF))
+                elif kind == 1:
+                    cells.append((f"?{value & 0xF:X}", value, 0x0F))
+                elif kind == 2:
+                    cells.append((f"{value >> 4:X}?", value, 0xF0))
+                else:
+                    cells.append(("??", 0, 0))
+            cells[0] = (f"{data[0]:02X}", data[0], 0xFF)
+            cells[1] = (f"?{data[1] & 0xF:X}", data[1], 0x0F)
+
+            size = len(cells)
+            expected = [
+                sigmaker.Match(0x1000 + start)
+                for start in range(len(data) - size + 1)
+                if all(
+                    (data[start + index] & mask) == (value & mask)
+                    for index, (_token, value, mask) in enumerate(cells)
+                )
+            ]
+            actual = sigmaker.SignatureSearcher.find_all(
+                " ".join(token for token, _value, _mask in cells),
+                buf=self._buffer(data),
+            )
+            self.assertEqual(actual, expected, f"random case {case}")
 
 
 class TestSigMakerConfigDefaults(CoveredUnitTest):
@@ -4555,7 +4992,6 @@ class TestSignatureSearcherBufferCache(CoveredUnitTest):
     """The SignatureSearcher scan API accepts an optional cached buffer."""
 
     def setUp(self):
-        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
         sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
 

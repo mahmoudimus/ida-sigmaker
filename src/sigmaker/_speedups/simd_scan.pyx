@@ -786,6 +786,46 @@ def refine_offsets(const unsigned char[:] data_view,
     return w
 
 
+def filter_offsets_by_segment_ends(unsigned int[:] cands,
+                                   Py_ssize_t count,
+                                   Py_ssize_t pattern_size,
+                                   const unsigned long long[:] segment_ends):
+    """Keep sorted candidate starts whose pattern fits in one segment.
+
+    Compacts cands[0:count] in place and returns the new count. Segment ends
+    are exclusive buffer offsets in ascending order. The scan is allocation
+    free and runs under nogil after validating its direct-call contract.
+    """
+    cdef Py_ssize_t seg_count = segment_ends.shape[0]
+    cdef Py_ssize_t i
+    if count < 0 or count > cands.shape[0]:
+        raise ValueError("count must be within the candidate array")
+    if pattern_size <= 0:
+        raise ValueError("pattern_size must be positive")
+    if seg_count == 0:
+        raise ValueError("segment_ends must not be empty")
+    for i in range(1, seg_count):
+        if segment_ends[i] <= segment_ends[i - 1]:
+            raise ValueError("segment_ends must be strictly increasing")
+
+    cdef Py_ssize_t r = 0
+    cdef Py_ssize_t w = 0
+    cdef Py_ssize_t seg = 0
+    cdef Py_ssize_t start
+    with nogil:
+        while r < count:
+            start = <Py_ssize_t>cands[r]
+            while seg < seg_count and start >= segment_ends[seg]:
+                seg += 1
+            if seg == seg_count:
+                break
+            if start + pattern_size <= segment_ends[seg]:
+                cands[w] = cands[r]
+                w += 1
+            r += 1
+    return w
+
+
 def seed_offsets(const unsigned int[:] bucket,
                  Py_ssize_t s,
                  Py_ssize_t m,

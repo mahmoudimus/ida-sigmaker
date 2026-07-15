@@ -2,6 +2,12 @@
 
 All notable user-visible changes to this plugin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Signature search and uniqueness checks no longer bridge segment boundaries.** IDA segments are copied into one tightly packed scan buffer for speed, but adjacent buffer bytes may belong to unrelated, non-contiguous segments. Direct searches, seed/refinement generation, and byte-index-backed minimal-function generation now reject candidates whose full pattern crosses a segment boundary while preserving the contiguous-buffer SIMD and index speedups.
+
 ## [1.11.0] - 2026-07-05
 
 ### Added

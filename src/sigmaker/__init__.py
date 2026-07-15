@@ -491,6 +491,23 @@ class InMemoryBuffer:
                 buf.extend(data)
             seg = idaapi.get_next_seg(seg.start_ea)
 
+    def _segment_buffer_ends(self) -> "array.array":
+        """Return each loaded segment's exclusive end in buffer coordinates.
+
+        FILE-mode buffers have no segment map, so their entire buffer is one
+        searchable span. Ends are uint64 so direct scanning does not gain the
+        byte index's existing uint32 candidate-offset limit.
+        """
+        if self._segments:
+            return array.array(
+                "Q",
+                (
+                    buffer_offset + size
+                    for buffer_offset, _segment_ea, size in self._segments
+                ),
+            )
+        return array.array("Q", [len(self._buffer)])
+
     def offset_mapper(self) -> typing.Callable[[int], int]:
         """Return a callable that maps ASCENDING buffer offsets to real IDA
         addresses. Segments are concatenated tightly even when their addresses
@@ -617,6 +634,36 @@ class InMemoryBuffer:
                 "ida_addr_to_segment_offset is only valid in 'segments' mode."
             )
         return ida_addr - self.imagebase
+
+
+def _buffer_segment_ends(
+    buf: "InMemoryBuffer", buffer_size: int
+) -> "array.array":
+    """Return searchable span ends for a buffer or buffer-like test double."""
+    if isinstance(buf, InMemoryBuffer):
+        return buf._segment_buffer_ends()
+    return array.array("Q", [buffer_size])
+
+
+def _span_fits_checker(
+    segment_ends: typing.Sequence[int],
+) -> typing.Callable[[int, int], bool]:
+    """Return a validator for ascending candidate starts."""
+    segment_index = 0
+
+    def fits(start: int, size: int) -> bool:
+        nonlocal segment_index
+        while (
+            segment_index < len(segment_ends)
+            and start >= segment_ends[segment_index]
+        ):
+            segment_index += 1
+        return (
+            segment_index < len(segment_ends)
+            and start + size <= segment_ends[segment_index]
+        )
+
+    return fits
 
 
 @dataclasses.dataclass
@@ -1579,6 +1626,7 @@ class UniqueSignatureGenerator:
         # first scan; buf holds the segment buffer the offsets index into.
         offsets: typing.Optional[list[int]] = None
         buf: typing.Optional["InMemoryBuffer"] = None
+        segment_ends: typing.Optional[typing.Sequence[int]] = None
         if cfg.scope_to_segment:
             # Issue #64: scope uniqueness to the anchor's segment. Pre-load it so
             # the seed scan and every refinement stay within the segment.
@@ -1651,11 +1699,23 @@ class UniqueSignatureGenerator:
                     count = SignatureSearcher.count_matches(f"{sig:ida}", buf=buf)
                 elif offsets is None:
                     # Seed once: scan the whole database, keep every match
-                    # offset. The candidate count is the exact match count.
+                    # offset. Seed from the eventual output form so candidates
+                    # that only a trailing wildcard would push across a segment
+                    # boundary remain available when uniqueness is checked
+                    # after trimming.
+                    seed_signature = Signature(sig)
+                    seed_signature.trim_signature()
+                    if not seed_signature:
+                        seed_signature = sig
                     offsets, buf = SignatureSearcher.find_all_offsets(
-                        f"{sig:ida}", buf=buf
+                        f"{seed_signature:ida}", buf=buf
                     )
-                    count = len(offsets)
+                    data_mv = buf.data()
+                    segment_ends = _buffer_segment_ends(buf, len(data_mv))
+                    valid_offsets = _filter_offsets_by_segment_ends(
+                        offsets, len(sig), segment_ends
+                    )
+                    count = len(valid_offsets)
                 else:
                     # Refine the surviving candidates in memory for each byte
                     # appended this iteration; no rescan of the database.
@@ -1664,7 +1724,12 @@ class UniqueSignatureGenerator:
                         sb = sig[j]
                         mask = 0x00 if sb.is_wildcard else 0xFF
                         offsets = _refine_offsets(data_mv, offsets, j, sb.value, mask)
-                    count = len(offsets)
+                    if segment_ends is None:
+                        segment_ends = _buffer_segment_ends(buf, len(data_mv))
+                    valid_offsets = _filter_offsets_by_segment_ends(
+                        offsets, len(sig), segment_ends
+                    )
+                    count = len(valid_offsets)
                 # find_all_offsets polls idaapi_user_canceled inside its scan
                 # loop and bails when set, returning whatever partial offsets
                 # it had so far (often 0). When the call was interrupted, keep
@@ -1675,12 +1740,42 @@ class UniqueSignatureGenerator:
                 if not idaapi_user_canceled():
                     progress.last_match_count = count
                     if count == 1:
+                        trimmed_signature = Signature(sig)
+                        trimmed_signature.trim_signature()
+                        if not trimmed_signature:
+                            continue
+                        if len(trimmed_signature) < len(sig):
+                            if offsets is None or segment_ends is None:
+                                if not SignatureSearcher.is_unique(
+                                    f"{trimmed_signature:ida}", buf=buf
+                                ):
+                                    continue
+                            else:
+                                trimmed_count = len(
+                                    _filter_offsets_by_segment_ends(
+                                        offsets,
+                                        len(trimmed_signature),
+                                        segment_ends,
+                                    )
+                                )
+                                if trimmed_count != 1:
+                                    continue
                         sig.trim_signature()
                         return GeneratedSignature(sig, Match(ea))
 
         if cancel.partial is not None:
             return cancel.partial
         raise Unexpected("Signature not unique (reached end of analysis)")
+
+
+def _filter_offsets_by_segment_ends(
+    offsets: list[int],
+    pattern_size: int,
+    segment_ends: typing.Sequence[int],
+) -> list[int]:
+    """Keep sorted candidate starts whose full pattern fits in one segment."""
+    span_fits = _span_fits_checker(segment_ends)
+    return [start for start in offsets if span_fits(start, pattern_size)]
 
 
 def _refine_offsets(
@@ -1726,6 +1821,35 @@ def _refine_offsets_into(
             cands[w] = cands[r]
             w += 1
     return w
+
+
+def _filter_offsets_into_by_segment_ends(
+    cands: "array.array",
+    count: int,
+    pattern_size: int,
+    segment_ends: typing.Sequence[int],
+) -> int:
+    """Compact segment-valid sorted candidates in place."""
+    if SIMD_SPEEDUP_AVAILABLE:
+        return simd_scan.filter_offsets_by_segment_ends(
+            cands, count, pattern_size, segment_ends
+        )
+
+    segment_index = 0
+    write_index = 0
+    for read_index in range(count):
+        start = cands[read_index]
+        while (
+            segment_index < len(segment_ends)
+            and start >= segment_ends[segment_index]
+        ):
+            segment_index += 1
+        if segment_index == len(segment_ends):
+            break
+        if start + pattern_size <= segment_ends[segment_index]:
+            cands[write_index] = start
+            write_index += 1
+    return write_index
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1801,6 +1925,7 @@ def _seed_via_index(
     sig: "Signature",
     index: typing.Optional["_ByteIndex"],
     buf: "InMemoryBuffer",
+    segment_ends: typing.Optional[typing.Sequence[int]] = None,
 ) -> typing.Optional[tuple["array.array", int]]:
     """Seed the candidate set from the byte index instead of scanning.
 
@@ -1819,6 +1944,8 @@ def _seed_via_index(
     data_mv = buf.data()
     n = len(data_mv)
     m = len(sig)
+    if segment_ends is None:
+        segment_ends = _buffer_segment_ends(buf, n)
     raw = index.candidates(key) if width == 2 else index.candidates1(key)
     # Map each hit at offset p back to a pattern start p - s, keeping only
     # candidates whose full pattern fits in the buffer. The Cython kernel does
@@ -1853,6 +1980,12 @@ def _seed_via_index(
         if sb.is_wildcard:
             continue
         count = _refine_offsets_into(data_mv, cands, count, j, sb.value, 0xFF)
+    count = _filter_offsets_into_by_segment_ends(
+        cands,
+        count,
+        m,
+        segment_ends,
+    )
     return cands, count
 
 
@@ -1963,6 +2096,7 @@ class MinimalFunctionSignatureGenerator:
         # 84% of generate() wall time when called per-is_unique.
         buf: typing.Optional["InMemoryBuffer"] = None
         index: typing.Optional["_ByteIndex"] = None
+        segment_ends: typing.Optional[typing.Sequence[int]] = None
         if SIMD_SPEEDUP_AVAILABLE:
             with ProgressDialog("Please stand by, copying segments..."):
                 buf = InMemoryBuffer.load(
@@ -1971,7 +2105,9 @@ class MinimalFunctionSignatureGenerator:
                 )
             # Build the 2-byte position index once for the whole search so each
             # anchor seeds with an O(1) lookup instead of a full-buffer scan.
-            index = _ByteIndex.build(buf.data())
+            data_mv = buf.data()
+            index = _ByteIndex.build(data_mv)
+            segment_ends = _buffer_segment_ends(buf, len(data_mv))
 
         # Iterate the pre-decoded anchors inside a ProgressBox so the wait
         # box shows live progress (issue #27). enumerate() keeps the index
@@ -2006,6 +2142,7 @@ class MinimalFunctionSignatureGenerator:
             sig = self._grow_unique_from_decoded(
                 decoded, anchor_idx, progress.best_size, cfg,
                 buf=buf, progress=progress, index=index,
+                segment_ends=segment_ends,
             )
             if sig is None:
                 continue
@@ -2035,6 +2172,7 @@ class MinimalFunctionSignatureGenerator:
         buf: typing.Optional["InMemoryBuffer"] = None,
         progress: typing.Optional["_FunctionSigProgress"] = None,
         index: typing.Optional["_ByteIndex"] = None,
+        segment_ends: typing.Optional[typing.Sequence[int]] = None,
     ) -> typing.Optional[Signature]:
         """Grow a signature from ``decoded[anchor_idx]`` forward until unique.
 
@@ -2056,6 +2194,9 @@ class MinimalFunctionSignatureGenerator:
         offsets: typing.Optional["array.array"] = None
         ocount = 0
         seed_buf = buf
+        if segment_ends is None and seed_buf is not None:
+            seed_data = seed_buf.data()
+            segment_ends = _buffer_segment_ends(seed_buf, len(seed_data))
         min_useful = self.MIN_USEFUL_SIG_BYTES
         for i in range(anchor_idx, len(decoded)):
             if (
@@ -2097,7 +2238,9 @@ class MinimalFunctionSignatureGenerator:
                 count = SignatureSearcher.count_matches(f"{sig:ida}", buf=buf)
             elif offsets is None:
                 # Seed once. Prefer the byte index (Dynamic Seed Selection).
-                seeded = _seed_via_index(sig, index, seed_buf)
+                seeded = _seed_via_index(
+                    sig, index, seed_buf, segment_ends=segment_ends
+                )
                 if seeded is not None:
                     offsets, ocount = seeded
                     count = ocount
@@ -2130,12 +2273,39 @@ class MinimalFunctionSignatureGenerator:
                     ocount = _refine_offsets_into(
                         data_mv, offsets, ocount, j, sb.value, mask
                     )
+                if segment_ends is None:
+                    segment_ends = _buffer_segment_ends(seed_buf, len(data_mv))
+                ocount = _filter_offsets_into_by_segment_ends(
+                    offsets,
+                    ocount,
+                    len(sig),
+                    segment_ends,
+                )
                 count = ocount
 
             if progress is not None:
                 progress.inner_length = len(sig)
                 progress.inner_matches = count
             if count == 1:
+                trimmed_signature = Signature(sig)
+                trimmed_signature.trim_signature()
+                if not trimmed_signature:
+                    continue
+                if len(trimmed_signature) < len(sig):
+                    trimmed_seed = _seed_via_index(
+                        trimmed_signature,
+                        index,
+                        seed_buf,
+                        segment_ends=segment_ends,
+                    )
+                    if trimmed_seed is not None:
+                        _trimmed_offsets, trimmed_count = trimmed_seed
+                        if trimmed_count != 1:
+                            continue
+                    elif not SignatureSearcher.is_unique(
+                        f"{trimmed_signature:ida}", buf=seed_buf
+                    ):
+                        continue
                 sig.trim_signature()
                 return sig
 
@@ -2602,7 +2772,6 @@ class SignatureSearcher:
             return [Match(base)]
 
         n = len(data_mv)
-        off = 0
         # Matches arrive in ascending offset order, so map each offset to its
         # real address with a forward cursor (amortized O(1) per match); see
         # InMemoryBuffer.offset_mapper.
@@ -2611,21 +2780,26 @@ class SignatureSearcher:
         # find_all_offsets) so per-match user_cancelled() overhead does not
         # dominate a scan over a short, common pattern.
         since_poll = 0
-        while off <= n - k:
-            since_poll += 1
-            if since_poll >= _CANCEL_POLL_STRIDE:
-                since_poll = 0
-                if idaapi_user_canceled():
-                    LOGGER.info("Search canceled by user")
-                    break
+        segment_start = 0
+        for segment_end in _buffer_segment_ends(buf, n):
+            off = segment_start
+            while off <= segment_end - k:
+                since_poll += 1
+                if since_poll >= _CANCEL_POLL_STRIDE:
+                    since_poll = 0
+                    if idaapi_user_canceled():
+                        LOGGER.info("Search canceled by user")
+                        return results
 
-            idx = _simd_scan_bytes(data_mv[off:], sig)
-            if idx < 0:
-                break
-            results.append(Match(to_addr(off + idx)))
-            if skip_more_than_one and len(results) > 1:
-                break
-            off += idx + 1
+                idx = _simd_scan_bytes(data_mv[off:segment_end], sig)
+                if idx < 0:
+                    break
+                start = off + idx
+                results.append(Match(to_addr(start)))
+                if skip_more_than_one and len(results) > 1:
+                    return results
+                off = start + 1
+            segment_start = segment_end
         return results
 
     @staticmethod
@@ -2649,23 +2823,27 @@ class SignatureSearcher:
         if k == 0:
             return [0], buf
         n = len(data_mv)
-        off = 0
         # Poll cancellation every _CANCEL_POLL_STRIDE matches rather than on
         # every match: idaapi.user_cancelled() costs ~0.5us per call and a
         # short, common seed can produce millions of matches, so per-match
         # polling alone can dominate the scan (observed: 44s of a 76s seed).
         since_poll = 0
-        while off <= n - k:
-            since_poll += 1
-            if since_poll >= _CANCEL_POLL_STRIDE:
-                since_poll = 0
-                if idaapi_user_canceled():
+        segment_start = 0
+        for segment_end in _buffer_segment_ends(buf, n):
+            off = segment_start
+            while off <= segment_end - k:
+                since_poll += 1
+                if since_poll >= _CANCEL_POLL_STRIDE:
+                    since_poll = 0
+                    if idaapi_user_canceled():
+                        return offsets, buf
+                idx = _simd_scan_bytes(data_mv[off:segment_end], sig)
+                if idx < 0:
                     break
-            idx = _simd_scan_bytes(data_mv[off:], sig)
-            if idx < 0:
-                break
-            offsets.append(off + idx)
-            off += idx + 1
+                start = off + idx
+                offsets.append(start)
+                off = start + 1
+            segment_start = segment_end
         return offsets, buf
 
     @staticmethod

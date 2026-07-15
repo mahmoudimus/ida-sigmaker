@@ -486,13 +486,21 @@ class InMemoryBuffer:
         back to its real address (segments need not be contiguous, #68)."""
         buf = self._buffer
         seg = idaapi.get_first_seg()
+        previous_start: typing.Optional[int] = None
         while seg:
-            size = seg.end_ea - seg.start_ea
-            data = idaapi.get_bytes(seg.start_ea, size)
+            start_ea = int(seg.start_ea)
+            if previous_start is not None and start_ea <= previous_start:
+                raise RuntimeError(
+                    "IDA segment iteration did not advance: "
+                    f"0x{start_ea:X} after 0x{previous_start:X}"
+                )
+            previous_start = start_ea
+            size = int(seg.end_ea) - start_ea
+            data = idaapi.get_bytes(start_ea, size)
             if data:
-                self._segments.append((len(buf), int(seg.start_ea), len(data)))
+                self._segments.append((len(buf), start_ea, len(data)))
                 buf.extend(data)
-            seg = idaapi.get_next_seg(seg.start_ea)
+            seg = idaapi.get_next_seg(start_ea)
 
     def offset_mapper(self) -> typing.Callable[[int], int]:
         """Return a callable that maps ASCENDING buffer offsets to real IDA

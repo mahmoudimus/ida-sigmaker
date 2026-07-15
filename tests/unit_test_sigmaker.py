@@ -5931,6 +5931,20 @@ class TestSearchAddressMapping(unittest.TestCase):
             mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS
         )
 
+    def test_load_segments_rejects_non_advancing_iterator(self):
+        seg = MagicMock(start_ea=0x1000, end_ea=0x1004)
+        sigmaker.idaapi.get_first_seg = MagicMock(return_value=seg)
+        sigmaker.idaapi.get_next_seg = MagicMock(side_effect=[seg, None])
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=b"\x90" * 4)
+
+        with self.assertRaisesRegex(RuntimeError, "did not advance"):
+            sigmaker.InMemoryBuffer.load(
+                mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS
+            )
+
+        sigmaker.idaapi.get_bytes.assert_called_once_with(0x1000, 4)
+        sigmaker.idaapi.get_next_seg.assert_called_once_with(0x1000)
+
     def test_offset_mapper_across_noncontiguous_segments(self):
         buf = self._two_segment_buffer()
         m = buf.offset_mapper()

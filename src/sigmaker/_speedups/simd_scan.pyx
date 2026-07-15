@@ -9,6 +9,12 @@ import array as py_stdlib_arr_mod        # run-time: the Python array module (co
 
 from sigmaker._speedups.simd_scan cimport Signature, SimdLevel, simd_support_best_level
 
+
+ctypedef fused candidate_offset_t:
+    unsigned int
+    unsigned long long
+
+
 cdef extern from "simd_support.hpp":
     unsigned _tzcnt32_inline(unsigned x) noexcept nogil
     unsigned _scan32_anchors_inline(const unsigned char* base,
@@ -762,7 +768,7 @@ def build_byte_index(const unsigned char[:] data_view):
 
 
 def refine_offsets(const unsigned char[:] data_view,
-                   unsigned int[:] cands,
+                   candidate_offset_t[:] cands,
                    Py_ssize_t count,
                    Py_ssize_t j,
                    unsigned int value,
@@ -775,15 +781,62 @@ def refine_offsets(const unsigned char[:] data_view,
     cdef unsigned int target = value & mask
     cdef Py_ssize_t r = 0
     cdef Py_ssize_t w = 0
-    cdef Py_ssize_t c
+    cdef unsigned long long c
+    cdef unsigned long long data_size = <unsigned long long>n
+    cdef unsigned long long relative_offset
+    if j < 0:
+        raise ValueError("relative offset must be non-negative")
+    relative_offset = <unsigned long long>j
     with nogil:
         while r < count:
-            c = <Py_ssize_t>cands[r]
-            if c + j < n and (data_view[c + j] & mask) == target:
+            c = <unsigned long long>cands[r]
+            if (c < data_size and relative_offset < data_size - c and
+                    (data_view[<Py_ssize_t>(c + relative_offset)] & mask) == target):
                 cands[w] = cands[r]
                 w += 1
             r += 1
     return w
+
+
+def filter_offsets_by_search_ranges(candidate_offset_t[:] cands,
+                                    Py_ssize_t count,
+                                    Py_ssize_t pattern_size,
+                                    const unsigned long long[:] range_starts,
+                                    const unsigned long long[:] range_ends):
+    """Compact sorted candidates whose full pattern fits one search range."""
+    cdef Py_ssize_t range_count = range_starts.shape[0]
+    cdef Py_ssize_t i
+    if count < 0 or count > cands.shape[0]:
+        raise ValueError("count is outside the candidate array")
+    if pattern_size <= 0:
+        raise ValueError("pattern_size must be positive")
+    if range_count == 0 or range_count != range_ends.shape[0]:
+        raise ValueError("search ranges must be non-empty pairs")
+    for i in range(range_count):
+        if range_starts[i] > range_ends[i]:
+            raise ValueError("search ranges must be ordered and non-overlapping")
+        if i > 0 and range_starts[i] < range_ends[i - 1]:
+            raise ValueError("search ranges must be ordered and non-overlapping")
+
+    cdef Py_ssize_t read_index = 0
+    cdef Py_ssize_t write_index = 0
+    cdef Py_ssize_t range_index = 0
+    cdef unsigned long long start
+    cdef unsigned long long end
+    with nogil:
+        while read_index < count:
+            start = <unsigned long long>cands[read_index]
+            while range_index < range_count and start >= range_ends[range_index]:
+                range_index += 1
+            if range_index == range_count:
+                break
+            end = range_ends[range_index]
+            if (start >= range_starts[range_index] and
+                    <unsigned long long>pattern_size <= end - start):
+                cands[write_index] = cands[read_index]
+                write_index += 1
+            read_index += 1
+    return write_index
 
 
 def seed_offsets(const unsigned int[:] bucket,

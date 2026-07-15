@@ -1920,6 +1920,24 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         self.assertEqual(results[0].search_pattern, "48 8B ? 90 90")
         self.assertEqual(results[0].normalized_signature, "48 8B ?? 90 90")
 
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_search_rejects_match_across_address_gap(self):
+        buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
+        buf._buffer.extend(b"\xAA\xDD\xF1\xBB")
+        buf._segments.extend(
+            [(0, 0x1000, 2), (2, 0x2000, 2)]
+        )
+
+        with patch.object(
+            sigmaker.idaapi, "get_imagebase", return_value=0x1000
+        ):
+            results = sigmaker.BatchSignatureSearcher.from_text(
+                "cross := DD F1"
+            ).search(buf=buf)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].matches, [])
+
     def test_search_rejects_buffer_and_scope_together(self):
         with self.assertRaisesRegex(ValueError, "buf.*scope_ea"):
             sigmaker.BatchSignatureSearcher.from_text("90").search(
@@ -3856,7 +3874,7 @@ class TestNibbleWildcardFallback(CoveredUnitTest):
 
         self.assertEqual(matches, [sigmaker.Match(0x2000)])
 
-    def test_nibble_fallback_does_not_match_across_segment_boundaries(self):
+    def test_nibble_fallback_does_not_match_across_address_gap(self):
         buf = self._buffer(
             b"\x48\x4A\x1F\x90",
             segments=[(0, 0x1000, 2), (2, 0x2000, 2)],
@@ -4303,6 +4321,88 @@ class TestUniqueSignatureGeneratorSeedThenRefine(CoveredUnitTest):
         # Two 0x90 bytes survive to uniqueness (offset 0: 0x90 0x90).
         self.assertEqual(len(result.signature), 2)
 
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_wildcard_growth_drops_candidate_across_address_gap(self):
+        append_count = 0
+        processor = MagicMock()
+
+        def append_byte(sig, *_args):
+            nonlocal append_count
+            sig.append(
+                sigmaker.SignatureByte(0x90, is_wildcard=append_count == 1)
+            )
+            append_count += 1
+
+        processor.append_instruction_to_sig.side_effect = append_byte
+        generator = sigmaker.UniqueSignatureGenerator(processor)
+        seed_buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
+        seed_buf._buffer.extend(b"\x90\x00\x90\x00\x90\x00")
+        seed_buf._segments.extend(
+            [(0, 0x1000, 3), (3, 0x2000, 3)]
+        )
+
+        with patch.object(
+            sigmaker,
+            "InstructionWalker",
+            return_value=[
+                (0x1000, MagicMock(), 1),
+                (0x1001, MagicMock(), 1),
+                (0x1002, MagicMock(), 1),
+            ],
+        ), patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all_offsets",
+            return_value=([0, 2], seed_buf),
+        ):
+            result = generator.generate(
+                0x1000,
+                self._make_cfg(),
+                policy=sigmaker.GenerationPolicy.strict(),
+            )
+
+        self.assertEqual(result.status, sigmaker.GenerationStatus.UNIQUE)
+        self.assertEqual(append_count, 3)
+        self.assertEqual(len(result.signature), 3)
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_trailing_wildcard_gap_only_uniqueness_is_rejected(self):
+        append_count = 0
+        processor = MagicMock()
+
+        def append_byte(sig, *_args):
+            nonlocal append_count
+            sig.append(
+                sigmaker.SignatureByte(0x90, is_wildcard=append_count == 1)
+            )
+            append_count += 1
+
+        processor.append_instruction_to_sig.side_effect = append_byte
+        generator = sigmaker.UniqueSignatureGenerator(processor)
+        seed_buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
+        seed_buf._buffer.extend(b"\x90\x00\x90")
+        seed_buf._segments.extend(
+            [(0, 0x1000, 2), (2, 0x2000, 1)]
+        )
+
+        with patch.object(
+            sigmaker,
+            "InstructionWalker",
+            return_value=[
+                (0x1000, MagicMock(), 1),
+                (0x1001, MagicMock(), 1),
+            ],
+        ), patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all_offsets",
+            return_value=([0, 2], seed_buf),
+        ):
+            with self.assertRaises(sigmaker.Unexpected):
+                generator.generate(
+                    0x1000,
+                    self._make_cfg(),
+                    policy=sigmaker.GenerationPolicy.strict(),
+                )
+
 
 class TestGeneratedSignatureDisplay(CoveredUnitTest):
     """display() branches on status and respects the no-clipboard rule for partials."""
@@ -4535,8 +4635,22 @@ class TestSignatureSearcherCountMatches(CoveredUnitTest):
         self.assertFalse(kwargs.get("skip_more_than_one", False))
 
 
-class TestRefineOffsets(CoveredUnitTest):
-    """In-memory candidate refinement: keep offsets whose byte at c+j matches."""
+def _refine_offsets_with_python_fallback(data, offsets, index, value, mask):
+    candidates = array.array("Q", offsets)
+    with patch.object(sigmaker, "SIMD_SPEEDUP_AVAILABLE", False):
+        count = sigmaker._refine_offsets_into(
+            data,
+            candidates,
+            len(candidates),
+            index,
+            value,
+            mask,
+        )
+    return list(candidates[:count])
+
+
+class TestRefineOffsetsInto(CoveredUnitTest):
+    """Python fallback keeps matching offsets and compacts them in place."""
 
     def _mv(self, b: bytes):
         return memoryview(bytearray(b))
@@ -4544,29 +4658,42 @@ class TestRefineOffsets(CoveredUnitTest):
     def test_exact_byte_keeps_matching(self):
         data = self._mv(b"\x90\x48\x90\x48\x90")
         # offsets 0..4; appended byte index j=1 must equal 0x48 (mask 0xFF)
-        out = sigmaker._refine_offsets(data, [0, 1, 2, 3], 1, 0x48, 0xFF)
+        out = _refine_offsets_with_python_fallback(
+            data, [0, 1, 2, 3], 1, 0x48, 0xFF
+        )
         # c=0 -> data[1]=0x48 keep; c=1 -> data[2]=0x90 drop; c=2 -> data[3]=0x48 keep; c=3 -> data[4]=0x90 drop
         self.assertEqual(out, [0, 2])
 
     def test_full_wildcard_keeps_all(self):
         data = self._mv(b"\x01\x02\x03\x04")
-        out = sigmaker._refine_offsets(data, [0, 1, 2], 1, 0x00, 0x00)
+        out = _refine_offsets_with_python_fallback(
+            data, [0, 1, 2], 1, 0x00, 0x00
+        )
         self.assertEqual(out, [0, 1, 2])
 
     def test_nibble_mask(self):
         data = self._mv(b"\x4A\x4B\x9C")
         # mask 0xF0 keeps where high nibble == 0x40
-        out = sigmaker._refine_offsets(data, [0, 1, 2], 0, 0x40, 0xF0)
+        out = _refine_offsets_with_python_fallback(
+            data, [0, 1, 2], 0, 0x40, 0xF0
+        )
         self.assertEqual(out, [0, 1])
 
     def test_out_of_bounds_dropped(self):
         data = self._mv(b"\x90\x90")
         # c=1, j=2 -> c+j=3 is past the buffer; must be dropped, not raise
-        out = sigmaker._refine_offsets(data, [0, 1], 2, 0x90, 0xFF)
+        out = _refine_offsets_with_python_fallback(
+            data, [0, 1], 2, 0x90, 0xFF
+        )
         self.assertEqual(out, [])
 
     def test_empty_input(self):
-        self.assertEqual(sigmaker._refine_offsets(self._mv(b"\x90"), [], 0, 0x90, 0xFF), [])
+        self.assertEqual(
+            _refine_offsets_with_python_fallback(
+                self._mv(b"\x90"), [], 0, 0x90, 0xFF
+            ),
+            [],
+        )
 
 
 class TestFindAllOffsets(CoveredUnitTest):
@@ -4633,7 +4760,9 @@ class TestRefinementEquivalence(CoveredUnitTest):
             if offsets is None:
                 offsets = self._full_matches(data, pattern)  # seed at length 1
             else:
-                offsets = sigmaker._refine_offsets(mv, offsets, j, v, msk)
+                offsets = _refine_offsets_with_python_fallback(
+                    mv, offsets, j, v, msk
+                )
             expected = self._full_matches(data, pattern)
             self.assertEqual(
                 sorted(offsets), sorted(expected),
@@ -5037,6 +5166,107 @@ class TestMinimalFunctionSignatureGeneratorSeedThenRefine(CoveredUnitTest):
             f"seed must be deferred to >= {min_useful} bytes; got {seed_sig_byte_lens}",
         )
         self.assertEqual(len(result.signature), 5)
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_wildcard_growth_drops_candidate_across_address_gap(self):
+        pattern = b"\x10\x20\x30\x40\x50"
+        seed_buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
+        seed_buf._buffer.extend(
+            pattern + b"\x00\x60" + pattern + b"\x00\x60"
+        )
+        seed_buf._segments.extend(
+            [(0, 0x1000, 7), (7, 0x2000, 5), (12, 0x3000, 2)]
+        )
+        index = sigmaker._ByteIndex.build(seed_buf.data())
+        decoded = [
+            sigmaker._DecodedInstruction(
+                ea=0x1000,
+                size=5,
+                raw_bytes=pattern,
+                operand_offb=0,
+                operand_length=0,
+            ),
+            sigmaker._DecodedInstruction(
+                ea=0x1005,
+                size=1,
+                raw_bytes=b"\x00",
+                operand_offb=0,
+                operand_length=1,
+            ),
+            sigmaker._DecodedInstruction(
+                ea=0x1006,
+                size=1,
+                raw_bytes=b"\x60",
+                operand_offb=0,
+                operand_length=0,
+            ),
+        ]
+        generator = sigmaker.MinimalFunctionSignatureGenerator(
+            sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        )
+
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", return_value=False
+        ):
+            signature = generator._grow_unique_from_decoded(
+                decoded,
+                0,
+                50,
+                self._make_cfg(),
+                buf=seed_buf,
+                index=index,
+            )
+
+        self.assertIsNotNone(signature)
+        self.assertEqual(len(signature), 7)
+        self.assertTrue(signature[5].is_wildcard)
+        self.assertFalse(signature[6].is_wildcard)
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_short_trimmed_nonunique_pattern_keeps_growing(self):
+        seed_buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
+        seed_buf._buffer.extend(b"\x10\x20\x30\x40\x50\x60")
+        seed_buf._segments.append((0, 0x1000, 6))
+        decoded = [
+            sigmaker._DecodedInstruction(
+                ea=0x1000,
+                size=4,
+                raw_bytes=b"\x10\x20\x30\x40",
+                operand_offb=3,
+                operand_length=1,
+            ),
+            sigmaker._DecodedInstruction(
+                ea=0x1004,
+                size=2,
+                raw_bytes=b"\x50\x60",
+                operand_offb=0,
+                operand_length=0,
+            ),
+        ]
+        generator = sigmaker.MinimalFunctionSignatureGenerator(
+            sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        )
+
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "is_unique",
+            side_effect=[True, False],
+        ), patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all_offsets",
+            return_value=([0], seed_buf),
+        ):
+            signature = generator._grow_unique_from_decoded(
+                decoded,
+                0,
+                50,
+                self._make_cfg(),
+                buf=seed_buf,
+                index=None,
+            )
+
+        self.assertIsNotNone(signature)
+        self.assertEqual(len(signature), 6)
 
 
 class TestSignatureSearcherBufferCache(CoveredUnitTest):
@@ -5624,6 +5854,17 @@ class TestSeedViaIndex(CoveredUnitTest):
             sig.append(sigmaker.SignatureByte(v, w))
         return sig
 
+    def _segmented_buffer(self, *payloads):
+        buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
+        offset = 0
+        for segment_index, payload in enumerate(payloads):
+            buf._segments.append(
+                (offset, 0x1000 + segment_index * 0x1000, len(payload))
+            )
+            buf._buffer.extend(payload)
+            offset += len(payload)
+        return buf
+
     def test_index_seed_matches_buffer(self):
         buf = MagicMock()
         buf.data.return_value = memoryview(
@@ -5749,6 +5990,22 @@ class TestSeedViaIndex(CoveredUnitTest):
         sig = self._sig([(0x90, False), (0x91, False)])
         self.assertIsNone(sigmaker._seed_via_index(sig, None, buf))
 
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_rejects_seed_that_exists_only_across_address_gap(self):
+        buf = self._segmented_buffer(b"\x00\xAA", b"\xBB\x00")
+        index = sigmaker._ByteIndex.build(buf.data())
+        sig = self._sig([(0xAA, False), (0xBB, False)])
+        candidates, count = sigmaker._seed_via_index(sig, index, buf)
+        self.assertEqual(list(candidates[:count]), [])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_keeps_valid_seeds_around_gap_candidate(self):
+        buf = self._segmented_buffer(b"\xAA\xBB\xAA", b"\xBB\xAA\xBB")
+        index = sigmaker._ByteIndex.build(buf.data())
+        sig = self._sig([(0xAA, False), (0xBB, False)])
+        candidates, count = sigmaker._seed_via_index(sig, index, buf)
+        self.assertEqual(list(candidates[:count]), [0, 4])
+
 
 class TestSelectSeedRun(CoveredUnitTest):
     """Dynamic Seed Selection across 1-byte and 2-byte runs."""
@@ -5813,6 +6070,60 @@ class TestSelectSeedRun(CoveredUnitTest):
     def test_returns_none_when_no_exact_byte(self):
         sig = self._sig([(0, True), (0, True)])
         self.assertIsNone(sigmaker._select_seed_run(sig, self._index({})))
+
+
+class TestValidatedTrimmedSignature(CoveredUnitTest):
+    @staticmethod
+    def _signature(*wildcards):
+        return sigmaker.Signature(
+            [sigmaker.SignatureByte(0x90, False)]
+            + [sigmaker.SignatureByte(0, wildcard) for wildcard in wildcards]
+        )
+
+    def test_reuses_signature_when_no_trimming_is_needed(self):
+        signature = self._signature(False)
+        with patch.object(sigmaker.SignatureSearcher, "is_unique") as is_unique:
+            result = sigmaker._validated_trimmed_signature(signature, None)
+        self.assertIs(result, signature)
+        is_unique.assert_not_called()
+
+    def test_returns_trimmed_copy_after_uniqueness_validation(self):
+        signature = self._signature(True, True)
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", return_value=True
+        ) as is_unique:
+            result = sigmaker._validated_trimmed_signature(signature, None)
+        self.assertIsNot(result, signature)
+        self.assertEqual(len(signature), 3)
+        self.assertEqual(result, signature[:1])
+        is_unique.assert_called_once()
+
+    def test_rejects_nonunique_trimmed_copy(self):
+        signature = self._signature(True)
+        with patch.object(
+            sigmaker.SignatureSearcher, "is_unique", return_value=False
+        ):
+            result = sigmaker._validated_trimmed_signature(signature, None)
+        self.assertIsNone(result)
+
+    def test_uses_index_when_validating_trimmed_copy(self):
+        signature = self._signature(True)
+        buf = MagicMock()
+        index = MagicMock()
+        seeded = (array.array("I", [0]), 1)
+        with patch.object(
+            sigmaker, "_seed_via_index", return_value=seeded
+        ) as seed_via_index, patch.object(
+            sigmaker.SignatureSearcher, "is_unique"
+        ) as is_unique:
+            result = sigmaker._validated_trimmed_signature(
+                signature,
+                buf,
+                index=index,
+            )
+        self.assertEqual(result, signature[:1])
+        seed_via_index.assert_called_once()
+        is_unique.assert_not_called()
 
 
 class TestByteIndexOneByte(CoveredUnitTest):
@@ -6003,10 +6314,171 @@ class TestRefineOffsetsCython(CoveredUnitTest):
             j = rng.randrange(8)
             value = rng.randrange(256)
             mask = rng.choice([0x00, 0x0F, 0xF0, 0xFF])
-            py = sigmaker._refine_offsets(mv, list(cand_list), j, value, mask)
+            target = value & mask
+            py = [
+                candidate
+                for candidate in cand_list
+                if candidate + j < len(mv)
+                and (mv[candidate + j] & mask) == target
+            ]
             arr = array.array("I", cand_list)
             n = sigmaker.simd_scan.refine_offsets(mv, arr, len(cand_list), j, value, mask)
             self.assertEqual(sorted(arr[:n]), sorted(py))
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_supports_uint64_candidate_array(self):
+        data = memoryview(bytearray(b"\x90\x48\x90\x48\x90"))
+        candidates = array.array("Q", [0, 1, 2, 3])
+        count = sigmaker.simd_scan.refine_offsets(
+            data, candidates, 4, 1, 0x48, 0xFF
+        )
+        self.assertEqual(count, 2)
+        self.assertEqual(list(candidates[:count]), [0, 2])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_uint64_candidate_past_py_ssize_is_dropped(self):
+        data = memoryview(bytearray(b"\x90"))
+        candidates = array.array("Q", [(1 << 64) - 1])
+        count = sigmaker.simd_scan.refine_offsets(
+            data, candidates, 1, 0, 0x90, 0xFF
+        )
+        self.assertEqual(count, 0)
+
+
+class TestSearchRangeCandidateFilter(CoveredUnitTest):
+    def _filter(self, candidates, pattern_size, starts, ends):
+        cands = array.array("I", candidates)
+        count = sigmaker._filter_offsets_into_search_ranges(
+            cands,
+            len(cands),
+            pattern_size,
+            array.array("Q", starts),
+            array.array("Q", ends),
+        )
+        return list(cands[:count])
+
+    def test_compacts_multiple_ranges_without_reordering(self):
+        self.assertEqual(
+            self._filter([0, 2, 3, 4, 6, 7], 2, [0, 4], [4, 8]),
+            [0, 2, 4, 6],
+        )
+
+    def test_rejects_candidate_before_clipped_range_start(self):
+        self.assertEqual(
+            self._filter([0, 2, 4, 6], 2, [2, 6], [4, 8]),
+            [2, 6],
+        )
+
+    def test_shared_refinement_removes_cross_range_candidate_in_place(self):
+        data = memoryview(bytearray(b"\x90\x00\x90\x00"))
+        candidates = array.array("Q", [1, 2])
+        signature = sigmaker.Signature(
+            [
+                sigmaker.SignatureByte(0x90, False),
+                sigmaker.SignatureByte(0, True),
+            ]
+        )
+        count = sigmaker._refine_candidate_offsets(
+            data,
+            candidates,
+            len(candidates),
+            signature,
+            1,
+            (array.array("Q", [0, 2]), array.array("Q", [2, 4])),
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(list(candidates[:count]), [2])
+
+    def test_keeps_candidate_ending_exactly_at_range_end(self):
+        self.assertEqual(self._filter([2], 2, [0], [4]), [2])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_supports_offsets_past_four_gibibytes(self):
+        start = 0x1_0000_0000
+        candidates = array.array("Q", [start])
+        count = sigmaker._filter_offsets_into_search_ranges(
+            candidates,
+            1,
+            2,
+            array.array("Q", [start]),
+            array.array("Q", [start + 2]),
+        )
+        self.assertEqual(count, 1)
+        self.assertEqual(candidates[0], start)
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_rejects_candidate_whose_end_would_overflow_uint64(self):
+        maximum = (1 << 64) - 1
+        candidates = array.array("Q", [maximum - 1])
+        count = sigmaker._filter_offsets_into_search_ranges(
+            candidates,
+            1,
+            2,
+            array.array("Q", [maximum - 1]),
+            array.array("Q", [maximum]),
+        )
+        self.assertEqual(count, 0)
+
+    def test_python_fallback_matches_expected_ranges(self):
+        with patch.object(sigmaker, "SIMD_SPEEDUP_AVAILABLE", False):
+            self.assertEqual(
+                self._filter([0, 2, 3, 4, 6, 7], 2, [0, 4], [4, 8]),
+                [0, 2, 4, 6],
+            )
+
+    def test_rejects_invalid_arguments(self):
+        cands = array.array("I", [0])
+        starts = array.array("Q", [0])
+        ends = array.array("Q", [4])
+        invalid = (
+            (2, 1, starts, ends),
+            (1, 0, starts, ends),
+            (1, 1, array.array("Q"), array.array("Q")),
+            (1, 1, array.array("Q", [0, 4]), ends),
+            (
+                1,
+                1,
+                array.array("Q", [0, 3]),
+                array.array("Q", [4, 8]),
+            ),
+        )
+        for count, pattern_size, range_starts, range_ends in invalid:
+            with self.subTest(
+                count=count,
+                pattern_size=pattern_size,
+                starts=list(range_starts),
+                ends=list(range_ends),
+            ):
+                with self.assertRaises(ValueError):
+                    sigmaker._filter_offsets_into_search_ranges(
+                        cands,
+                        count,
+                        pattern_size,
+                        range_starts,
+                        range_ends,
+                    )
+
+    def test_randomized_python_and_cython_results_match(self):
+        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
+            self.skipTest("SIMD speedup not available")
+        rng = random.Random(8675309)
+        for _ in range(200):
+            lengths = [rng.randint(1, 128) for _ in range(rng.randint(1, 12))]
+            ends = list(itertools.accumulate(lengths))
+            starts = [0, *ends[:-1]]
+            total = ends[-1]
+            candidates = sorted(
+                rng.sample(range(total), rng.randint(0, min(total, 200)))
+            )
+            pattern_size = rng.randint(1, 24)
+            with patch.object(sigmaker, "SIMD_SPEEDUP_AVAILABLE", False):
+                expected = self._filter(
+                    candidates, pattern_size, starts, ends
+                )
+            self.assertEqual(
+                self._filter(candidates, pattern_size, starts, ends),
+                expected,
+            )
 
 
 class TestBuildByteIndex(CoveredUnitTest):
@@ -6418,6 +6890,18 @@ class TestSearchAddressMapping(unittest.TestCase):
             mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS
         )
 
+    @staticmethod
+    def _adjacent_segment_buffer():
+        buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
+        buf._buffer.extend(b"\xAA\xBB\xCC\xDD")
+        buf._segments.extend(
+            (
+                (0, 0x1000, 2),
+                (2, 0x1002, 2),
+            )
+        )
+        return buf
+
     def test_load_segments_rejects_non_advancing_iterator(self):
         seg = MagicMock(start_ea=0x1000, end_ea=0x1004)
         sigmaker.idaapi.get_first_seg = MagicMock(return_value=seg)
@@ -6447,11 +6931,52 @@ class TestSearchAddressMapping(unittest.TestCase):
         buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
         self.assertEqual(buf.offset_mapper()(0x40), 0x1000 + 0x40)
 
+    def test_search_ranges_merge_address_contiguous_segments(self):
+        buf = self._adjacent_segment_buffer()
+        self.assertEqual(list(buf._search_ranges()), [(0, 4)])
+
+    def test_scoped_search_ranges_merge_address_contiguous_segments(self):
+        buf = self._adjacent_segment_buffer()
+        self.assertEqual(
+            list(buf._search_ranges((0x1001, 0x1003))),
+            [(1, 3)],
+        )
+
     @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
     def test_find_all_simd_reports_real_address_in_second_segment(self):
         buf = self._two_segment_buffer()
         matches = sigmaker.SignatureSearcher._find_all_simd("F1 B5 04 00", buf=buf)
         self.assertEqual([int(m.address) for m in matches], [0x1F78000])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_find_all_simd_accepts_match_across_contiguous_segments(self):
+        buf = self._adjacent_segment_buffer()
+        matches = sigmaker.SignatureSearcher._find_all_simd("BB CC", buf=buf)
+        self.assertEqual([int(match.address) for match in matches], [0x1001])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_find_all_simd_rejects_match_across_address_gap(self):
+        buf = self._two_segment_buffer()
+        matches = sigmaker.SignatureSearcher._find_all_simd("DD F1", buf=buf)
+        self.assertEqual(matches, [])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_find_all_offsets_rejects_match_across_address_gap(self):
+        buf = self._two_segment_buffer()
+        offsets, returned = sigmaker.SignatureSearcher.find_all_offsets(
+            "DD F1", buf=buf
+        )
+        self.assertIs(returned, buf)
+        self.assertEqual(offsets, [])
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_find_all_offsets_accepts_match_across_contiguous_segments(self):
+        buf = self._adjacent_segment_buffer()
+        offsets, returned = sigmaker.SignatureSearcher.find_all_offsets(
+            "BB CC", buf=buf
+        )
+        self.assertIs(returned, buf)
+        self.assertEqual(offsets, [1])
 
 
 class TestSegmentScope(unittest.TestCase):

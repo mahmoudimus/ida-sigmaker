@@ -3378,6 +3378,57 @@ class TestSearchCancellation(CoveredUnitTest):
             # Restore SIMD setting
             sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
 
+    def test_find_all_rejects_nonadvancing_native_search(self):
+        bin_search = MagicMock(
+            side_effect=[
+                (0x1000, None),
+                (0x1000, None),
+                AssertionError("search loop requested a third identical hit"),
+            ]
+        )
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            False,
+        ), patch.object(
+            sigmaker.idaapi,
+            "BADADDR",
+            0xFFFFFFFFFFFFFFFF,
+        ), patch.object(
+            sigmaker.idaapi,
+            "inf_get_min_ea",
+            return_value=0x1000,
+        ), patch.object(
+            sigmaker.idaapi,
+            "inf_get_max_ea",
+            return_value=0xFFFF,
+        ), patch.object(
+            sigmaker.idaapi,
+            "compiled_binpat_vec_t",
+            MagicMock,
+        ), patch.object(
+            sigmaker.idaapi,
+            "parse_binpat_str",
+        ), patch.object(
+            sigmaker.idaapi,
+            "BIN_SEARCH_NOCASE",
+            0,
+        ), patch.object(
+            sigmaker.idaapi,
+            "BIN_SEARCH_FORWARD",
+            0,
+        ), patch.object(
+            sigmaker.idaapi,
+            "bin_search",
+            bin_search,
+        ), sigmaker.UIServices.use(
+            sigmaker.UIServices()
+        ):
+            with self.assertRaisesRegex(RuntimeError, "did not advance"):
+                sigmaker.SignatureSearcher.find_all("48 8B C4")
+
+        self.assertEqual(bin_search.call_count, 2)
+
     def test_cancellation_returns_partial_results(self):
         """Test that cancellation returns partial results found so far."""
         # Mock user_canceled to cancel after finding 2 matches

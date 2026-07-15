@@ -3562,6 +3562,7 @@ class SignatureSearcher:
         )
         flags = idaapi.BIN_SEARCH_NOCASE | idaapi.BIN_SEARCH_FORWARD
         cancel_requested = UIServices.current().cancel_requested
+        previous_hit: typing.Optional[int] = None
         while True:
             # Check for user cancellation
             if cancel_requested():
@@ -3573,6 +3574,9 @@ class SignatureSearcher:
             hit, _ = _bin_search(ea, max_ea, binary, flags)
             if hit == idaapi.BADADDR:
                 break
+            if previous_hit is not None and hit <= previous_hit:
+                raise RuntimeError("IDA bin_search did not advance")
+            previous_hit = hit
             out.append(
                 Match(
                     hit,

@@ -39,6 +39,47 @@ PLUGIN_AUTHOR: str = __author__
 WILDCARD_POLICY_CTX: contextvars.ContextVar["WildcardPolicy"] = contextvars.ContextVar(
     "wildcard_policy"
 )
+_UI_SERVICES_CTX: contextvars.ContextVar["UIServices"] = contextvars.ContextVar(
+    "ui_services"
+)
+
+
+@contextlib.contextmanager
+def _null_progress(*args, **kwargs) -> typing.Iterator[None]:
+    """Provide a headless progress context."""
+    yield
+
+
+def _never_cancel() -> bool:
+    return False
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class UIServices:
+    """Context-local UI hooks selected for the current IDA host."""
+
+    #: Factory for the progress context used while loading and searching.
+    progress: typing.Callable[..., typing.ContextManager[object]] = _null_progress
+    #: Cheap predicate polled periodically by long-running search loops.
+    cancel_requested: typing.Callable[[], bool] = _never_cancel
+    _ctx = _UI_SERVICES_CTX
+
+    @classmethod
+    def current(cls) -> "UIServices":
+        return cls._ctx.get(_DEFAULT_UI_SERVICES)
+
+    @classmethod
+    @contextlib.contextmanager
+    def use(cls, services: "UIServices") -> typing.Iterator["UIServices"]:
+        token = cls._ctx.set(services)
+        try:
+            yield services
+        finally:
+            cls._ctx.reset(token)
+
+
+_HEADLESS_UI = UIServices()
+_DEFAULT_UI_SERVICES = _HEADLESS_UI
 
 
 SIMD_SPEEDUP_AVAILABLE = False
@@ -145,9 +186,18 @@ LOGGER = configure_logging()
 # Set to True to enable verbose debug logging for progress reporter initialization
 DEBUGGING_MODE = False
 
-# Wrapper for IDA's British English spelling
-# IDA uses 'cancelled' but we use American English 'canceled' throughout our code
-idaapi_user_canceled = idaapi.user_cancelled
+_IDA_USER_CANCELLED = getattr(idaapi, "user_cancelled", None)
+_IDA_IS_IDAQ = getattr(idaapi, "is_idaq", None)
+
+
+def idaapi_user_canceled() -> bool:
+    """Poll IDA cancellation when its UI API is available."""
+    if not callable(_IDA_USER_CANCELLED):
+        return False
+    try:
+        return bool(_IDA_USER_CANCELLED())
+    except Exception:
+        return False
 
 
 def _load_qmessage_box_cls():
@@ -526,6 +576,23 @@ class InMemoryBuffer:
             return seg_ea + (offset - buf_off)
 
         return _map
+
+    def _search_ranges(
+        self,
+        scope: typing.Optional[tuple[int, int]] = None,
+    ) -> typing.Iterator[tuple[int, int]]:
+        """Yield contiguous buffer ranges, optionally clipped to an EA scope."""
+        segments = self._segments or (
+            (0, self.imagebase, len(self._buffer)),
+        )
+        for offset, segment_ea, size in segments:
+            if scope is None:
+                yield offset, offset + size
+                continue
+            start_ea = max(segment_ea, scope[0])
+            end_ea = min(segment_ea + size, scope[1])
+            if start_ea < end_ea:
+                yield offset + start_ea - segment_ea, offset + end_ea - segment_ea
 
     def _load_single_segment(self, ea: int):
         """Load only the segment containing ``ea`` (issue #64), recording it in
@@ -3039,6 +3106,56 @@ class SignatureParser:
         return " ".join(tokens)
 
 
+def _masked_signature_bytes(ida_signature: str) -> tuple[bytes, bytes]:
+    """Return normalized pattern values and per-nibble comparison masks."""
+    normalized, _ = SigText.normalize(ida_signature)
+    values = bytearray()
+    masks = bytearray()
+    for token in normalized.split():
+        values.append(int(token.replace("?", "0"), 16))
+        masks.append(
+            (0xF0 if token[0] != "?" else 0)
+            | (0x0F if token[1] != "?" else 0)
+        )
+    return bytes(values), bytes(masks)
+
+
+def _longest_exact_run(masks: bytes) -> tuple[int, int]:
+    """Return ``(start, length)`` for the longest 0xFF mask run."""
+    best_start = 0
+    best_length = 0
+    run_start = 0
+    for index, mask in enumerate(masks):
+        if mask == 0xFF:
+            continue
+        if index - run_start > best_length:
+            best_start = run_start
+            best_length = index - run_start
+        run_start = index + 1
+    if len(masks) - run_start > best_length:
+        best_start = run_start
+        best_length = len(masks) - run_start
+    if best_length == 0:
+        raise ValueError("Nibble wildcard search requires at least one exact byte")
+    return best_start, best_length
+
+
+def _load_search_buffer(
+    scope: typing.Optional[tuple[int, int]] = None,
+) -> InMemoryBuffer:
+    message = (
+        "Please stand by, copying the segment..."
+        if scope is not None
+        else "Please stand by, copying segments..."
+    )
+    scope_kwargs = {"scope_ea": scope[0]} if scope is not None else {}
+    with UIServices.current().progress(message):
+        return InMemoryBuffer.load(
+            mode=InMemoryBuffer.LoadMode.SEGMENTS,
+            **scope_kwargs,
+        )
+
+
 @dataclasses.dataclass(slots=True)
 class SignatureSearcher:
     """Parses a signature string and searches the DB for matches."""
@@ -3162,11 +3279,6 @@ class SignatureSearcher:
             not is_wildcard for _, is_wildcard in pattern
         ):
             raise ValueError("Unrecognized signature format")
-        if (
-            not SIMD_SPEEDUP_AVAILABLE
-            and SignatureSearcher._has_nibble_wildcards(normalized)
-        ):
-            raise ValueError("Nibble wildcard search requires SIMD speedups")
         return sig_str, normalized
 
     def search(self, scope_ea: typing.Optional[int] = None) -> SearchResults:
@@ -3196,8 +3308,7 @@ class SignatureSearcher:
 
         where = "the current segment" if scope else "the whole database"
         imagebase = SearchResults.current_imagebase()
-        # Wrap the search in a ProgressDialog to allow cancellation
-        with ProgressDialog(
+        with UIServices.current().progress(
             "Search for a signature\n\n"
             f"Scanning {where} for your pattern.\n\n"
             "Press Cancel to stop"
@@ -3218,6 +3329,83 @@ class SignatureSearcher:
         )
 
     @staticmethod
+    def _find_all_nibble_fallback(
+        ida_signature: str,
+        skip_more_than_one: bool = False,
+        buf: typing.Optional["InMemoryBuffer"] = None,
+        scope: typing.Optional[tuple[int, int]] = None,
+        *,
+        imagebase: typing.Optional[int] = None,
+        raise_on_cancel: bool = False,
+    ) -> list[Match]:
+        values, masks = _masked_signature_bytes(ida_signature)
+        anchor_start, anchor_size = _longest_exact_run(masks)
+        pattern_size = len(values)
+        anchor = values[anchor_start : anchor_start + anchor_size]
+
+        if buf is None:
+            buf = _load_search_buffer(scope)
+
+        data_mv = buf.data()
+        # Search the owned bytearray directly so bytearray.find stays in C and
+        # the fallback does not duplicate the full segment buffer.
+        haystack = buf._buffer
+        checks = tuple(
+            (index, mask, values[index] & mask)
+            for index, mask in enumerate(masks)
+            if mask != 0
+            and not anchor_start <= index < anchor_start + anchor_size
+        )
+        to_addr = buf.offset_mapper()
+        results: list[Match] = []
+        since_poll = 0
+        cancel_requested = UIServices.current().cancel_requested
+
+        def stop_requested() -> bool:
+            if not cancel_requested():
+                return False
+            LOGGER.info("Search canceled by user")
+            if raise_on_cancel:
+                raise UserCanceledError("Search canceled by user")
+            return True
+
+        if stop_requested():
+            return results
+
+        for range_start, range_end in buf._search_ranges(scope):
+            if range_end - range_start < pattern_size:
+                continue
+            search_from = range_start + anchor_start
+            search_end = range_end - pattern_size + anchor_start + anchor_size
+            while search_from < search_end:
+                anchor_hit = haystack.find(anchor, search_from, search_end)
+                if anchor_hit < 0:
+                    break
+                candidate = anchor_hit - anchor_start
+                matched = True
+                for index, mask, target in checks:
+                    if (data_mv[candidate + index] & mask) != target:
+                        matched = False
+                        break
+                if matched:
+                    address = to_addr(candidate)
+                    results.append(
+                        Match(
+                            address,
+                            rva=None if imagebase is None else address - imagebase,
+                        )
+                    )
+                    if skip_more_than_one and len(results) > 1:
+                        return results
+                search_from = anchor_hit + 1
+                since_poll += 1
+                if since_poll >= _CANCEL_POLL_STRIDE:
+                    since_poll = 0
+                    if stop_requested():
+                        return results
+        return results
+
+    @staticmethod
     def _find_all_simd(
         ida_signature: str,
         skip_more_than_one: bool = False,
@@ -3228,8 +3416,7 @@ class SignatureSearcher:
     ) -> list[Match]:
         simd_signature, _ = SigText.normalize(ida_signature)
         if buf is None:
-            with ProgressDialog("Please stand by, copying segments..."):
-                buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
+            buf = _load_search_buffer()
         data_mv = buf.data()
         LOGGER.debug(
             "searching for",
@@ -3263,11 +3450,12 @@ class SignatureSearcher:
         # find_all_offsets) so per-match user_cancelled() overhead does not
         # dominate a scan over a short, common pattern.
         since_poll = 0
+        cancel_requested = UIServices.current().cancel_requested
         while off <= n - k:
             since_poll += 1
             if since_poll >= _CANCEL_POLL_STRIDE:
                 since_poll = 0
-                if idaapi_user_canceled():
+                if cancel_requested():
                     LOGGER.info("Search canceled by user")
                     if raise_on_cancel:
                         raise UserCanceledError("Search canceled by user")
@@ -3300,8 +3488,7 @@ class SignatureSearcher:
         """
         simd_signature, _ = SigText.normalize(ida_signature)
         if buf is None:
-            with ProgressDialog("Please stand by, copying segments..."):
-                buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
+            buf = _load_search_buffer()
         data_mv = buf.data()
         sig = _SimdSignature(simd_signature)
         offsets: list[int] = []
@@ -3315,11 +3502,12 @@ class SignatureSearcher:
         # short, common seed can produce millions of matches, so per-match
         # polling alone can dominate the scan (observed: 44s of a 76s seed).
         since_poll = 0
+        cancel_requested = UIServices.current().cancel_requested
         while off <= n - k:
             since_poll += 1
             if since_poll >= _CANCEL_POLL_STRIDE:
                 since_poll = 0
-                if idaapi_user_canceled():
+                if cancel_requested():
                     break
             idx = _simd_scan_bytes(data_mv[off:], sig)
             if idx < 0:
@@ -3344,10 +3532,7 @@ class SignatureSearcher:
                 # Scope the SIMD scan to one segment by loading only its bytes;
                 # offset_mapper resolves the match offsets back to real
                 # addresses (issue #64 search-scope, on top of #68).
-                with ProgressDialog("Please stand by, copying the segment..."):
-                    buf = InMemoryBuffer.load(
-                        mode=InMemoryBuffer.LoadMode.SEGMENTS, scope_ea=scope[0]
-                    )
+                buf = _load_search_buffer(scope)
             return SignatureSearcher._find_all_simd(
                 ida_signature,
                 skip_more_than_one=skip_more_than_one,
@@ -3356,7 +3541,14 @@ class SignatureSearcher:
                 raise_on_cancel=raise_on_cancel,
             )
         if SignatureSearcher._has_nibble_wildcards(ida_signature):
-            raise ValueError("Nibble wildcard search requires SIMD speedups")
+            return SignatureSearcher._find_all_nibble_fallback(
+                ida_signature,
+                skip_more_than_one=skip_more_than_one,
+                buf=buf,
+                scope=scope,
+                imagebase=imagebase,
+                raise_on_cancel=raise_on_cancel,
+            )
         binary = idaapi.compiled_binpat_vec_t()
         idaapi.parse_binpat_str(binary, idaapi.inf_get_min_ea(), ida_signature, 16)
         out: list[Match] = []
@@ -3369,9 +3561,10 @@ class SignatureSearcher:
             idaapi, "bin_search3"
         )
         flags = idaapi.BIN_SEARCH_NOCASE | idaapi.BIN_SEARCH_FORWARD
+        cancel_requested = UIServices.current().cancel_requested
         while True:
             # Check for user cancellation
-            if idaapi_user_canceled():
+            if cancel_requested():
                 LOGGER.info("Search canceled by user")
                 if raise_on_cancel:
                     raise UserCanceledError("Search canceled by user")
@@ -3463,25 +3656,17 @@ class BatchSignatureSearcher:
 
                 matches = match_cache.get(normalized)
                 if matches is None:
-                    if SIMD_SPEEDUP_AVAILABLE and active_buf is None:
-                        message = (
-                            "Please stand by, copying the segment..."
-                            if scope is not None
-                            else "Please stand by, copying segments..."
-                        )
-                        load_kwargs: dict[str, typing.Any] = {
-                            "mode": InMemoryBuffer.LoadMode.SEGMENTS,
-                        }
-                        if scope is not None:
-                            load_kwargs["scope_ea"] = scope[0]
-                        with ProgressDialog(message):
-                            active_buf = InMemoryBuffer.load(**load_kwargs)
+                    uses_buffer = SIMD_SPEEDUP_AVAILABLE or (
+                        SignatureSearcher._has_nibble_wildcards(normalized)
+                    )
+                    if uses_buffer and active_buf is None:
+                        active_buf = _load_search_buffer(scope)
                         imagebase = SearchResults.current_imagebase(active_buf)
 
                     matches = SignatureSearcher.find_all(
                         normalized,
                         buf=active_buf,
-                        scope=None if SIMD_SPEEDUP_AVAILABLE else scope,
+                        scope=None if uses_buffer else scope,
                         imagebase=imagebase,
                         raise_on_cancel=True,
                     )
@@ -3696,6 +3881,28 @@ class ProgressDialog:
 
     # Provide alias with alternative spelling for backwards compatibility.
     user_cancelled = user_canceled
+
+
+def _ida_ui_services() -> UIServices:
+    """Build the UI services installed by the interactive IDA plugin."""
+    return UIServices(
+        progress=ProgressDialog,
+        cancel_requested=idaapi_user_canceled,
+    )
+
+
+def _select_default_ui_services() -> UIServices:
+    """Use IDA UI services only when IDAPython is hosted by the GUI."""
+    if callable(_IDA_IS_IDAQ):
+        try:
+            if _IDA_IS_IDAQ() is True:
+                return _ida_ui_services()
+        except Exception:
+            pass
+    return _HEADLESS_UI
+
+
+_DEFAULT_UI_SERVICES = _select_default_ui_services()
 
 
 @dataclasses.dataclass(slots=True)
@@ -4302,6 +4509,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             scope_to_segment=scope_to_segment,
         )
 
+        ui_token = _UI_SERVICES_CTX.set(_ida_ui_services())
         try:
             if action == Action.CREATE_UNIQUE:
                 ea = idaapi.get_screen_ea()
@@ -4364,6 +4572,8 @@ class SigMakerPlugin(idaapi.plugin_t):
         except Exception as e:
             LOGGER.error("Exception occurred: %s%s%s", e, os.linesep, traceback.format_exc())
             return
+        finally:
+            _UI_SERVICES_CTX.reset(ui_token)
 
     def _run_find_function_sig(self, config: SigMakerConfig) -> None:
         """Action.FIND_FUNCTION_SIG: shortest unique sig within the function,

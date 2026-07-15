@@ -10,7 +10,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 - **Batch result formatting** supports text, CSV, and JSON. Results include normalized signatures, status, match counts, absolute EAs, RVAs relative to the imagebase, lazily resolved file offsets, and per-entry errors.
 - **Batch search formatters are extensible.** Power users can register custom renderers with `@BatchSearchFormatter.register("name", suffixes=(...))`, then use `results.format("name")` or export to a registered suffix. Duplicate names and suffixes are rejected atomically unless the registration explicitly passes `override=True`.
 - **Search results now expose structured metadata.** `SearchResults` keeps the existing `matches` and `signature_str` fields while adding raw pattern, name/source-line context, status/error helpers, and lazy file-offset lookup. `Match` supports f-string fields like `ea`, `rva`, and `fileoffset`. Batch search uses the same result type per pattern.
-- **Batch search loads and reuses one copied segment buffer** when SIMD speedups are available, so a batch does not reload the database for every pattern.
+- **Batch search loads and reuses one copied segment buffer** when SIMD speedups are available or a no-SIMD batch contains nibble wildcard patterns, so a batch does not reload the database for every in-memory pattern.
+- **Nibble wildcard search works without SIMD speedups.** The fallback uses the longest exact-byte run as a C-speed anchor and verifies the remaining nibble masks in Python while preserving scope, address mapping, cancellation, and uniqueness early exit. Patterns still require at least one exact byte; common anchors remain slower than the optional SIMD scanner. ([#59](https://github.com/mahmoudimus/ida-sigmaker/issues/59))
 
 ### Changed
 
@@ -20,6 +21,7 @@ All notable user-visible changes to this plugin are documented here. The format 
 ### Fixed
 
 - **Batch search now honors segment scope and cancellation.** A scoped batch uses the same containing-segment policy as ordinary search. Canceling an IDA or SIMD batch scan raises `UserCanceledError` instead of returning partial hits as a successful result; existing direct `find_all()` callers retain their partial-result behavior.
+- **Embedded search no longer depends on IDA's GUI event loop.** `SignatureSearcher` and batch search automatically retain IDA wait-box progress and cancellation when `idaapi.is_idaq()` reports the graphical host, while idalib and hosts without that API use headless services. The interactive plugin installs IDA services explicitly while handling an action, and embedders can inject their own context-local services with `UIServices.use(...)`.
 
 ### Documentation
 

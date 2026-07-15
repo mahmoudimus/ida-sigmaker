@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 import warnings
+from unittest.mock import patch
 
 sys.path.insert(0, pathlib.Path(__file__).parent.as_posix())
 
@@ -145,6 +146,10 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
         self.assertEqual(sigmaker.IDAVersionInfo.ida_version().sdk_version, idaapi.IDA_SDK_VERSION)
         self.assertEqual(sigmaker.IDAVersionInfo.ida_version().major, major)
         self.assertEqual(sigmaker.IDAVersionInfo.ida_version().minor, minor)
+
+    def test_idalib_defaults_to_headless_search_services(self):
+        self.assertFalse(idaapi.is_idaq())
+        self.assertIs(sigmaker.UIServices.current(), sigmaker._HEADLESS_UI)
 
     def test_load_binary_with_ida(self):
         """Test loading the binary with IDA and basic analysis"""
@@ -298,6 +303,20 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
         self.assertEqual(payload["entry_count"], 3)
         self.assertEqual(payload["entries"][0]["match_count"], 4)
         self.assertIn("match_file_offsets", f"{results:csv}")
+
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    def test_no_simd_nibble_fallback_matches_simd_results(self):
+        pattern = "E? 8? 0A 00 00 48 89 C7"
+        buf = sigmaker.InMemoryBuffer.load(
+            mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS
+        )
+        expected = sigmaker.SignatureSearcher.find_all(pattern, buf=buf)
+        self.assertGreater(len(expected), 0)
+
+        with patch.object(sigmaker, "SIMD_SPEEDUP_AVAILABLE", False):
+            actual = sigmaker.SignatureSearcher.find_all(pattern, buf=buf)
+
+        self.assertEqual(actual, expected)
 
     def test_signature_occurrence_finding(self):
         test_signatures = [

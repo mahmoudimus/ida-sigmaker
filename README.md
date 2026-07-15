@@ -29,6 +29,8 @@ Background reading on [mahmoudimus.com](https://mahmoudimus.com):
   - [Benchmarks](#benchmarks)
   - [How it works](#how-it-works)
 - [Using SigMaker as a library](#using-sigmaker-as-a-library)
+  - [Batch search API](#batch-search-api)
+  - [Custom batch search formatters](#custom-batch-search-formatters)
   - [Stability contract](#stability-contract)
   - [Used by](#used-by)
 - [Acknowledgements](#acknowledgements)
@@ -233,14 +235,124 @@ for gen in xrefs.signatures:
     print(str(gen.address), f"{gen.signature:ida}")
 ```
 
+### Batch search API
+
+The batch search feature is also available to scripts:
+
+```python
+import sigmaker
+
+text = """
+print = "48 8B ?? ??"
+update := E8 ? ? ? ? 48 89 C7
+tick = 90;90;CC
+draw = "48 89 C7"
+48 8B ?? ?? 89
+"""
+
+results = sigmaker.BatchSignatureSearcher.from_text(text).search()
+print(results)            # text
+print(f"{results:text}")  # registered text formatter
+print(f"{results:csv}")   # registered CSV formatter
+print(f"{results:json}")  # registered JSON formatter
+
+for result in results:
+    print(result.display_name, result.status, result.match_count)
+    print(result.raw_pattern, result.search_pattern, result.normalized_signature)
+    for hit in result.matches:
+        file_offset = result.file_offset_for_match(hit)
+        file_offset_text = (
+            "unavailable" if file_offset is None else f"0x{file_offset:X}"
+        )
+        print(f"{hit:ea}", f"{hit:rva}", file_offset_text)
+```
+
+Batch search accepts one named or unnamed pattern per non-empty line. Names are optional and must use `name := pattern` or `name = pattern`. Quoted patterns are supported only as the right-hand side of a named pattern. Newlines are the only batch entry boundary; a semicolon remains a byte separator, so `tick := 90;90;CC` is one signature. SigMaker does not parse C declarations or join patterns across multiple lines. If a pattern has no name, SigMaker labels it by source line in the result list. `SignatureSearcher.from_many(text)` returns the parsed per-pattern searchers if you want to inspect names and source lines before searching; `BatchSignatureSearcher.from_text(text)` uses it internally. `#` and `//` comments are ignored outside quoted strings, and Markdown fence lines are skipped so you can paste snippets from issues or notes.
+
+Each line is parsed through the same strict parser used by regular signature search. Supported forms include:
+
+```text
+48 8B ? ?? 4? ?F
+488B??9090
+488B4??F90
+48,8B;?;90
+\x48\x8B\x00\x48\x89 xx?xx
+0x48, 0x8B, 0x00, 0x48, 0x89 0b11011
+(48 8B ? 90)
+```
+
+Compact input may omit separators when the complete pattern consists of fixed two-character cells: `HH`, `??`, `H?`, or `?H`. For example, `488B??9090` parses as `48 8B ? 90 90`. Single nibbles such as `E 8 4`, odd-length compact input such as `488B?9090`, hybrid glued input such as `488B ?? 90`, long integer notation such as `0x488B9090`, colon/pipe/hyphen separators, declaration text, and random prose are rejected rather than guessed. Invalid batch patterns are reported per entry instead of aborting the whole batch. Patterns must contain at least one exact byte; an all-wildcard pattern such as `?? ?? ??` is rejected because it matches almost everywhere and is not a useful search key.
+
+`BatchSearchResults` is iterable, so `list(results)` gives the per-pattern `SearchResults` objects. `SearchResults.raw_pattern` is the extracted user input, `SearchResults.search_pattern` is the parsed SigMaker search pattern, and `SearchResults.normalized_signature` is the canonical matcher/cache pattern. Nibble wildcard patterns such as `4? ?F ??` keep their nibble masks in both parsed and normalized forms; full-byte wildcards display as `?` in `search_pattern` and normalize to `??` in `normalized_signature`. `SearchResults.signature_str` remains available as a compatibility alias for the search pattern. `SearchResults.matches` remains the main match list, and each `Match` still acts like an int while carrying its optional RVA metadata.
+
+`Match` supports f-string fields such as `f"{hit:ea}"`, `f"{hit:rva}"`, and `f"{hit:fileoffset}"`. Search populates `hit.rva` directly. File offsets are intentionally lazy because IDA must resolve them one address at a time: call `result.file_offset_for_match(hit)`, or let a built-in exporter call it for the hits it emits. The result caches both resolved and unavailable offsets. Batch search itself performs no file-offset lookups; text resolves only previewed hits, while CSV and JSON resolve every exported hit. `:rva` and `:fileoffset` do not fall back to `:ea`, because that would label an absolute address as a derived offset. If metadata is unavailable on the `Match` itself, its formatter returns `repr(hit)`, so output still shows the hit EA.
+
+When SIMD speedups are available, a batch lazily copies the requested segment (or all segments) once and reuses that buffer for every unique normalized pattern. `results = batch.search(scope_ea=ea)` uses the same containing-segment fallback policy as ordinary signature search. Supplying both `buf` and `scope_ea` is rejected because SigMaker cannot prove that the caller-provided buffer represents that segment. Canceling a batch raises `UserCanceledError`; partial hits are not cached or exported as a complete entry.
+
+`BatchSearchResults.display()` writes the text format to `idaapi.msg` by default, or writes the selected formatter to any text file-like object or callable sink:
+
+```python
+import io
+
+buf = io.StringIO()
+results.display(output=buf, formatter="json")
+payload = buf.getvalue()
+```
+
+The built-in batch formats are `text`, `csv`, and `json`. Export suffixes such as `.txt`, `.csv`, and `.json` select the matching built-in formatter. Loadable formatter examples live in [`examples/`](./examples/).
+
+### Custom batch search formatters
+
+Power users can add project-specific output formats without changing SigMaker core:
+
+```python
+import sigmaker
+
+
+@sigmaker.BatchSearchFormatter.register("labels", suffixes=(".labels",))
+class LabelFormatter:
+    def format(self, results: sigmaker.BatchSearchResults) -> str:
+        lines = []
+        for result in results:
+            if len(result.matches) != 1:
+                continue
+            name = result.name or result.display_name
+            hit = result.matches[0]
+            address = f"{hit:rva}" if hit.rva is not None else f"{hit:ea}"
+            lines.append(f"{name}: {address}")
+        return "\n".join(lines) + "\n"
+```
+
+After registration, `results.format("labels")` and `f"{results:labels}"` use the formatter by name, and exporting to `something.labels` uses it by suffix. Formatter classes are instantiated once at registration time; formatter objects can be registered the same way.
+
+Formatter names and export suffixes must be unique. Registering a name or suffix that is already in use raises `ValueError` without changing either registry. When replacing an existing registration is intentional, opt in explicitly:
+
+```python
+@sigmaker.BatchSearchFormatter.register(
+    "labels",
+    suffixes=(".labels",),
+    override=True,
+)
+class ReplacementLabelFormatter:
+    ...
+```
+
+One `override=True` allows both replacing the formatter registered under that name and rebinding the listed suffixes. Existing suffixes that already point to the replaced name remain valid.
+
+To install a formatter permanently, paste the same formatter registration code into `$IDAUSR/idapythonrc.py`. IDA sources that file during startup, so the formatter is available in each new IDA session.
+
+If `sigmaker` is not already importable from your IDA Python environment, add the SigMaker plugin directory to `sys.path` before the formatter code.
+
+See [`examples/batch_search_c_formatter.py`](./examples/batch_search_c_formatter.py) for a complete C-style formatter template that emits absolute EAs, RVAs, and file offsets while keeping C output out of the built-in format list.
+
 ### Stability contract
 
 If you embed `sigmaker`, you can rely on the following. These are treated as a contract and are checked before any change to the public surface:
 
 1. **Append-only config.** `SigMakerConfig` fields are never reordered or removed. New behavior arrives as new fields with safe defaults, so existing constructions keep working.
-2. **Stable public names.** These names and their documented attributes are not renamed or removed: `SignatureMaker`, `SigMakerConfig`, `SignatureType` (`IDA`, `x64Dbg`, `Mask`, `BitMask`), `XrefFinder`, `GeneratedSignature` (`signature`, `address`, `status`, `match_count`), `XrefGeneratedSignature` (`signatures`), `Match` (`__str__` returns the hex address), `Signature` (`__len__`, `__format__`), `GenerationPolicy`, `GenerationStatus`.
-3. **Stable method signatures.** `SignatureMaker.make_signature(ea, cfg, end=None, *, progress_reporter=None, policy=GenerationPolicy.strict())`, `XrefFinder.find_xrefs(ea, cfg)`, `XrefFinder.count_code_xrefs_to(ea)`, and `XrefFinder.iter_code_xrefs_to(ea)`.
-4. **Stable format specs.** `f"{sig:ida}"`, `f"{sig:x64dbg}"`, `f"{sig:mask}"`, and `f"{sig:bitmask}"` keep producing their current output exactly.
+2. **Stable public names.** These names and their documented attributes are not renamed or removed: `SignatureMaker`, `SigMakerConfig`, `SignatureType` (`IDA`, `x64Dbg`, `Mask`, `BitMask`), `XrefFinder`, `GeneratedSignature` (`signature`, `address`, `status`, `match_count`), `XrefGeneratedSignature` (`signatures`), `Match` (`address`, `rva`, `file_offset`; `__str__` returns the hex address; `__format__` supports `ea`, `rva`, and `fileoffset`), `Signature` (`__len__`, `__format__`), `SignatureSearcher` (`input_signature`, `name`, `source_line`), `SearchResults` (`matches`, `signature_str`, `raw_pattern`, `search_pattern`, `normalized_signature`, `file_offset_for_match`), `GenerationPolicy`, `GenerationStatus`, `BatchSignatureSearcher` (`input_text`, `searchers`), `BatchSearchResults` (`__str__`, `__format__`), `BatchSearchFormatter`.
+3. **Stable method signatures.** `SignatureMaker.make_signature(ea, cfg, end=None, *, progress_reporter=None, policy=GenerationPolicy.strict())`, `XrefFinder.find_xrefs(ea, cfg)`, `XrefFinder.count_code_xrefs_to(ea)`, `XrefFinder.iter_code_xrefs_to(ea)`, `SignatureSearcher.from_signature(input_signature, *, name=None, source_line=0)`, `SignatureSearcher.from_many(text)`, and `BatchSignatureSearcher.search(*, buf=None, scope_ea=None)`.
+4. **Stable format specs.** `f"{sig:ida}"`, `f"{sig:x64dbg}"`, `f"{sig:mask}"`, and `f"{sig:bitmask}"` keep producing their current output exactly. Batch search keeps the registered built-in formatter names `text`, `csv`, and `json`.
 5. **Byte-identical defaults.** Production defaults are unchanged across optimizations: a script that does not opt into a new flag gets byte-identical signatures to previous versions.
 
 ### Used by

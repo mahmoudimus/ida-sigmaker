@@ -2,6 +2,31 @@
 
 All notable user-visible changes to this plugin are documented here. The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+
+- **Batch signature search API** supports several named or unnamed signatures at once, using one `foo = "48 8B ?? ??"`, `foo := 48 8B ?? ??`, or plain signature per non-empty line. The batch parser does not infer C declarations or join entries across multiple lines. Each pattern is normalized and searched independently; invalid patterns are reported per entry instead of aborting the whole batch.
+- **Batch result formatting** supports text, CSV, and JSON. Results include normalized signatures, status, match counts, absolute EAs, RVAs relative to the imagebase, lazily resolved file offsets, and per-entry errors.
+- **Batch search formatters are extensible.** Power users can register custom renderers with `@BatchSearchFormatter.register("name", suffixes=(...))`, then use `results.format("name")` or export to a registered suffix. Duplicate names and suffixes are rejected atomically unless the registration explicitly passes `override=True`.
+- **Search results now expose structured metadata.** `SearchResults` keeps the existing `matches` and `signature_str` fields while adding raw pattern, name/source-line context, status/error helpers, and lazy file-offset lookup. `Match` supports f-string fields like `ea`, `rva`, and `fileoffset`. Batch search uses the same result type per pattern.
+- **Batch search loads and reuses one copied segment buffer** when SIMD speedups are available, so a batch does not reload the database for every pattern.
+
+### Changed
+
+- **Signature search input parsing is explicit.** Spaced byte tokens, full-byte and nibble wildcards, escaped bytes, repeated `0xHH` bytes, and existing mask forms remain supported. Compact fixed-pair patterns such as `488B??9090` are split into `HH`, `??`, `H?`, or `?H` cells. Single nibbles, odd-length or hybrid glued input, unsupported separators, declaration text, and other malformed input are rejected instead of being guessed or converted to wildcards.
+- **File offsets are resolved only when output requests them.** Batch search performs no `get_fileregion_offset` calls. Text output resolves previewed hits, while CSV, JSON, and custom formatters resolve and cache the hits they emit.
+
+### Fixed
+
+- **Batch search now honors segment scope and cancellation.** A scoped batch uses the same containing-segment policy as ordinary search. Canceling an IDA or SIMD batch scan raises `UserCanceledError` instead of returning partial hits as a successful result; existing direct `find_all()` callers retain their partial-result behavior.
+
+### Documentation
+
+- README now documents the batch search workflow, accepted input forms, export formats, batch search API, and custom formatter registration. A C-style formatter example lives in `examples/batch_search_c_formatter.py`.
+
+[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.11.0...HEAD
+
 ## [1.11.0] - 2026-07-05
 
 ### Added

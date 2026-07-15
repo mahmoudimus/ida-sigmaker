@@ -6,15 +6,18 @@ to ensure reliable testing across different platforms and architectures.
 """
 
 import array
+import csv
 import dataclasses
 import gc
 import itertools
+import io
 import json
 import logging
 import pathlib
 import platform
 import random
 import re
+import runpy
 import sys
 import tempfile
 import time
@@ -1485,6 +1488,1271 @@ class TestSigTextAndSignatureParsing(CoveredUnitTest):
             self.assertIsNone(sig.mask_ptr())
 
 
+class TestSignatureSearcherInput(CoveredUnitTest):
+    """Normal signature search owns single-pattern parse/validation policy."""
+
+    def test_parser_accepts_only_explicit_signature_tokens(self):
+        cases = {
+            "48 8B 00": "48 8B 00",
+            "48,8B;00": "48 8B 00",
+            "488B9090": "48 8B 90 90",
+            "488b??9090": "48 8B ? 90 90",
+            "488B4??F90": "48 8B 4? ?F 90",
+            "[488B??9090]": "48 8B ? 90 90",
+            "0b1010": "0B 10 10",
+            "(48 8B ? ?? 4? ?F)": "48 8B ? ? 4? ?F",
+            "[48 8B ?]": "48 8B ?",
+            r"\x48\x8B\x00": "48 8B 00",
+            "0x48 0x8B 0x00": "48 8B 00",
+            "48 8B ? ?? 4? ?F ??": "48 8B ? ? 4? ?F ?",
+            r"\x48\x8B\x00\x48\x89 xx?xx": "48 8B ? 48 89",
+            "0x48, 0x8B, 0x00, 0x48, 0x89 0b11011": "48 8B ? 48 89",
+        }
+
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(sigmaker.SignatureParser.parse(raw), expected)
+
+    def test_parser_rejects_ambiguous_or_random_input(self):
+        invalid = (
+            "E 8 4 ? C",
+            "488B?9090",
+            "488B9",
+            "488B ?? 90",
+            "488BGG9090",
+            "0x488B9090",
+            "48:8B:90",
+            "48|8B|90",
+            "48-8B-90",
+            "48 GG 90",
+            "hello world",
+            "(48 8B 90",
+            r"prefix \x48\x8B xx",
+            "prefix 0x48 0x8B xx",
+        )
+
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                self.assertEqual(sigmaker.SignatureParser.parse(raw), "")
+
+    def test_parser_handles_large_compact_pattern(self):
+        raw = "48??4??F" * 1024
+        expected = " ".join(["48", "?", "4?", "?F"] * 1024)
+
+        self.assertEqual(sigmaker.SignatureParser.parse(raw), expected)
+
+    def test_searcher_does_not_expose_parser_api(self):
+        self.assertFalse(
+            hasattr(sigmaker.SignatureSearcher, "parse_search_signature")
+        )
+
+    def test_search_results_keeps_plain_match_list_without_metadata(self):
+        matches = [sigmaker.Match(0x1000)]
+
+        result = sigmaker.SearchResults(matches, "90")
+
+        self.assertIs(result.matches, matches)
+        self.assertIs(result.matches[0], matches[0])
+        self.assertEqual(result.matches[0], sigmaker.Match(0x1000))
+        self.assertEqual(str(result.matches[0]), "0x1000")
+        self.assertEqual(repr(result.matches[0]), "Match(address=0x1000)")
+        self.assertEqual(hash(result.matches[0]), hash(sigmaker.Match(0x1000)))
+
+    def test_result_models_omit_redundant_batch_helpers(self):
+        batch_result_names = {
+            field.name for field in dataclasses.fields(sigmaker.BatchSearchResults)
+        }
+
+        self.assertNotIn("rva_for_match", dir(sigmaker.SearchResults))
+        self.assertNotIn("match_record", dir(sigmaker.SearchResults))
+        self.assertIn("_match_record", dir(sigmaker.SearchResults))
+        self.assertNotIn("source_text", batch_result_names)
+
+    def test_file_offset_lookup_does_not_replace_matches(self):
+        result = sigmaker.SearchResults([sigmaker.Match(0x1000)], "90")
+        original = result.matches[0]
+
+        with patch.object(
+            sigmaker.SearchResults,
+            "_file_offset_for_ea",
+            return_value=0x400,
+        ) as lookup:
+            self.assertEqual(result.file_offset_for_match(original), 0x400)
+            self.assertEqual(result.file_offset_for_match(original), 0x400)
+
+        self.assertIs(result.matches[0], original)
+        self.assertIsNone(result.matches[0].rva)
+        self.assertIsNone(result.matches[0].file_offset)
+        self.assertFalse(hasattr(result, "imagebase"))
+        self.assertFalse(hasattr(result, "file_offsets"))
+        lookup.assert_called_once_with(0x1000)
+
+    def test_file_offset_lookup_caches_unavailable_results(self):
+        result = sigmaker.SearchResults([sigmaker.Match(0x1000)], "90")
+
+        with patch.object(
+            sigmaker.SearchResults,
+            "_file_offset_for_ea",
+            return_value=None,
+        ) as lookup:
+            self.assertIsNone(result.file_offset_for_match(result.matches[0]))
+            self.assertIsNone(result.file_offset_for_match(result.matches[0]))
+
+        lookup.assert_called_once_with(0x1000)
+
+    def test_match_metadata_keeps_address_equality_and_hash(self):
+        plain = sigmaker.Match(0x1000)
+        enriched = sigmaker.Match(0x1000, rva=0x100, file_offset=0x400)
+
+        self.assertTrue(dataclasses.is_dataclass(sigmaker.Match))
+        self.assertIs(type(enriched), sigmaker.Match)
+        self.assertEqual(enriched, plain)
+        self.assertEqual(hash(enriched), hash(plain))
+        self.assertEqual(str(enriched), "0x1000")
+        self.assertEqual(repr(enriched), "Match(address=0x1000)")
+        self.assertEqual(f"{enriched:rva}", "0x100")
+        self.assertEqual(f"{enriched:fileoffset}", "0x400")
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            enriched.rva = 0x200
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            enriched.address = 0x2000
+
+    def test_search_uses_canonical_signature(self):
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[sigmaker.Match(0x1000, rva=0)],
+        ) as find_all, patch.object(
+            sigmaker.idaapi,
+            "get_imagebase",
+            return_value=0x1000,
+        ):
+            result = sigmaker.SignatureSearcher.from_signature(
+                "E8 ? ? ? ? 48"
+            ).search()
+
+        find_all.assert_called_once_with(
+            "E8 ?? ?? ?? ?? 48",
+            scope=None,
+            imagebase=0x1000,
+        )
+        self.assertEqual(result.signature_str, "E8 ? ? ? ? 48")
+        self.assertEqual(result.search_pattern, "E8 ? ? ? ? 48")
+        self.assertEqual(result.normalized_signature, "E8 ?? ?? ?? ?? 48")
+        self.assertEqual(result.raw_pattern, "E8 ? ? ? ? 48")
+        self.assertEqual(result.status, "matched")
+        self.assertEqual(result.match_count, 1)
+        self.assertEqual(result.matches[0].rva, 0)
+        self.assertEqual(result.matches[0], sigmaker.Match(0x1000))
+        self.assertEqual(result.matches[0].rva, 0)
+        self.assertFalse(hasattr(result, "imagebase"))
+
+    def test_search_accepts_compact_signature(self):
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all, patch.object(
+            sigmaker.idaapi,
+            "get_imagebase",
+            return_value=None,
+        ):
+            result = sigmaker.SignatureSearcher.from_signature(
+                "488b??9090"
+            ).search()
+
+        find_all.assert_called_once_with(
+            "48 8B ?? 90 90",
+            scope=None,
+            imagebase=None,
+        )
+        self.assertEqual(result.signature_str, "48 8B ? 90 90")
+        self.assertEqual(result.search_pattern, "48 8B ? 90 90")
+        self.assertEqual(result.normalized_signature, "48 8B ?? 90 90")
+
+    def test_search_preserves_search_pattern_signature_string(self):
+        cases = (
+            "48 8B ? 48 89",
+            "\\x48\\x8B\\x00\\x48\\x89 xx?xx",
+            "0x48, 0x8B, 0x00, 0x48, 0x89 0b11011",
+        )
+
+        for raw in cases:
+            with self.subTest(raw=raw), patch.object(
+                sigmaker.SignatureSearcher,
+                "find_all",
+                return_value=[sigmaker.Match(0x1000)],
+            ) as find_all, patch.object(
+                sigmaker.idaapi,
+                "get_imagebase",
+                return_value=None,
+            ):
+                result = sigmaker.SignatureSearcher.from_signature(raw).search()
+
+            find_all.assert_called_once_with(
+                "48 8B ?? 48 89",
+                scope=None,
+                imagebase=None,
+            )
+            self.assertEqual(result.signature_str, "48 8B ? 48 89")
+            self.assertEqual(result.search_pattern, "48 8B ? 48 89")
+            self.assertEqual(result.normalized_signature, "48 8B ?? 48 89")
+
+    def test_search_preserves_nibble_wildcard_patterns(self):
+        cases = (
+            ("4? ?F ?? 7A", "4? ?F ? 7A", "4? ?F ?? 7A"),
+            ("48 8B 4? ?F ??", "48 8B 4? ?F ?", "48 8B 4? ?F ??"),
+        )
+
+        for raw, search_pattern, normalized in cases:
+            with self.subTest(raw=raw), patch.object(
+                sigmaker.SignatureSearcher,
+                "find_all",
+                return_value=[sigmaker.Match(0x1000)],
+            ) as find_all, patch.object(
+                sigmaker.idaapi,
+                "get_imagebase",
+                return_value=None,
+            ):
+                result = sigmaker.SignatureSearcher.from_signature(raw).search()
+
+            find_all.assert_called_once_with(
+                normalized,
+                scope=None,
+                imagebase=None,
+            )
+            self.assertEqual(result.raw_pattern, raw)
+            self.assertEqual(result.signature_str, search_pattern)
+            self.assertEqual(result.search_pattern, search_pattern)
+            self.assertEqual(result.normalized_signature, normalized)
+
+    def test_search_rejects_all_wildcard_pattern(self):
+        with patch.object(sigmaker.idaapi, "msg") as msg, patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+        ) as find_all:
+            result = sigmaker.SignatureSearcher.from_signature("?? ?? ??").search()
+
+        find_all.assert_not_called()
+        self.assertEqual(result.matches, [])
+        self.assertEqual(result.signature_str, "")
+        self.assertEqual(result.status, "error")
+        self.assertIn("Unrecognized", result.error)
+        msg.assert_called_once_with("Unrecognized signature type\n")
+
+    def test_search_reports_nibble_wildcard_error_without_simd(self):
+        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        try:
+            sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+            with patch.object(sigmaker.idaapi, "msg") as msg, patch.object(
+                sigmaker.SignatureSearcher,
+                "find_all",
+            ) as find_all:
+                result = sigmaker.SignatureSearcher.from_signature("48 4? ?F").search()
+
+            find_all.assert_not_called()
+            self.assertEqual(result.status, "error")
+            self.assertEqual(
+                result.error,
+                "Nibble wildcard search requires SIMD speedups",
+            )
+            msg.assert_called_once_with("Unrecognized signature type\n")
+        finally:
+            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+
+    def test_searcher_metadata_flows_to_results(self):
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[sigmaker.Match(0x1000)],
+        ):
+            result = sigmaker.SignatureSearcher.from_signature(
+                "90",
+                name="tick",
+                source_line=7,
+            ).search()
+
+        self.assertEqual(result.raw_pattern, "90")
+        self.assertEqual(result.name, "tick")
+        self.assertEqual(result.source_line, 7)
+
+
+class TestSignatureSearcherFromMany(CoveredUnitTest):
+    """Batch construction accepts named and unnamed pasted signature lines."""
+
+    def test_parse_named_quoted_and_plain_patterns(self):
+        text = """
+        print = "48 8B ?? ??"
+        update := E8 ? ? ? ? 48 89 C7
+        90 90 CC
+        """
+
+        searchers = sigmaker.SignatureSearcher.from_many(text)
+
+        self.assertEqual(len(searchers), 3)
+        self.assertEqual(searchers[0].name, "print")
+        self.assertEqual(searchers[0].input_signature, "48 8B ?? ??")
+        self.assertEqual(searchers[0].source_line, 2)
+        self.assertEqual(searchers[1].name, "update")
+        self.assertEqual(searchers[1].input_signature, "E8 ? ? ? ? 48 89 C7")
+        self.assertEqual(searchers[1].source_line, 3)
+        self.assertIsNone(searchers[2].name)
+        self.assertEqual(searchers[2].input_signature, "90 90 CC")
+        self.assertEqual(searchers[2].source_line, 4)
+
+    def test_semicolon_separates_bytes_not_batch_entries(self):
+        searchers = sigmaker.SignatureSearcher.from_many(
+            "first := 48;8B;90\nsecond = CC"
+        )
+
+        self.assertEqual(
+            [
+                (searcher.name, searcher.input_signature, searcher.source_line)
+                for searcher in searchers
+            ],
+            [
+                ("first", "48;8B;90", 1),
+                ("second", "CC", 2),
+            ],
+        )
+
+    def test_parse_does_not_accept_bare_colon_names(self):
+        searchers = sigmaker.SignatureSearcher.from_many("update: E8 ? ? ? ?")
+
+        self.assertEqual(len(searchers), 1)
+        self.assertIsNone(searchers[0].name)
+        self.assertEqual(searchers[0].input_signature, "update: E8 ? ? ? ?")
+
+    def test_parse_does_not_infer_c_declarations_or_join_lines(self):
+        text = """
+        constexpr const char* print = "48 8B ?? ??";
+        split =
+          "90 90 CC";
+        """
+
+        searchers = sigmaker.SignatureSearcher.from_many(text)
+
+        self.assertEqual(
+            [
+                (searcher.name, searcher.input_signature, searcher.source_line)
+                for searcher in searchers
+            ],
+            [
+                (None, 'constexpr const char* print = "48 8B ?? ??";', 2),
+                (None, "split =", 3),
+                (None, '"90 90 CC";', 4),
+            ],
+        )
+
+    def test_parse_ignores_blank_comment_and_fence_lines(self):
+        text = """
+        // generated signatures
+        ```
+        foo = "AA BB CC" // inline comment
+
+        # another comment
+        bar := 11 22 33
+        ```
+        """
+
+        searchers = sigmaker.SignatureSearcher.from_many(text)
+
+        self.assertEqual(
+            [(searcher.name, searcher.input_signature) for searcher in searchers],
+            [("foo", "AA BB CC"), ("bar", "11 22 33")],
+        )
+
+    def test_empty_input_returns_no_searchers(self):
+        self.assertEqual(sigmaker.SignatureSearcher.from_many("  \n\t"), [])
+
+
+class TestBatchSignatureSearcher(CoveredUnitTest):
+    """Batch search normalizes patterns and keeps per-entry errors."""
+
+    def test_from_text_stores_parsed_signature_searchers(self):
+        batch = sigmaker.BatchSignatureSearcher.from_text(
+            'print = "48 8B C4"\n90 90 CC'
+        )
+
+        self.assertEqual(batch.input_text, 'print = "48 8B C4"\n90 90 CC')
+        self.assertEqual(len(batch.searchers), 2)
+        self.assertTrue(
+            all(
+                isinstance(searcher, sigmaker.SignatureSearcher)
+                for searcher in batch.searchers
+            )
+        )
+        self.assertEqual(batch.searchers[0].input_signature, "48 8B C4")
+        self.assertEqual(batch.searchers[0].name, "print")
+        self.assertEqual(batch.searchers[1].input_signature, "90 90 CC")
+        self.assertIsNone(batch.searchers[1].name)
+
+    def test_search_accepts_named_compact_signature(self):
+        buf = MagicMock()
+        buf.imagebase = 0x140000000
+
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all:
+            results = sigmaker.BatchSignatureSearcher.from_text(
+                "handler := 488b??9090"
+            ).search(buf=buf)
+
+        find_all.assert_called_once_with(
+            "48 8B ?? 90 90",
+            buf=buf,
+            scope=None,
+            imagebase=0x140000000,
+            raise_on_cancel=True,
+        )
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].name, "handler")
+        self.assertEqual(results[0].source_line, 1)
+        self.assertEqual(results[0].signature_str, "48 8B ? 90 90")
+        self.assertEqual(results[0].search_pattern, "48 8B ? 90 90")
+        self.assertEqual(results[0].normalized_signature, "48 8B ?? 90 90")
+
+    def test_search_rejects_buffer_and_scope_together(self):
+        with self.assertRaisesRegex(ValueError, "buf.*scope_ea"):
+            sigmaker.BatchSignatureSearcher.from_text("90").search(
+                buf=MagicMock(),
+                scope_ea=0x1010,
+            )
+
+    def test_search_reuses_one_automatic_simd_buffer(self):
+        loaded = MagicMock()
+        loaded.imagebase = 0x140000000
+
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            True,
+        ), patch.object(
+            sigmaker,
+            "ProgressDialog",
+            MagicMock(),
+        ), patch.object(
+            sigmaker.InMemoryBuffer,
+            "load",
+            return_value=loaded,
+        ) as load, patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all:
+            results = sigmaker.BatchSignatureSearcher.from_text(
+                "first = 90\nsecond = CC"
+            ).search()
+
+        load.assert_called_once_with(
+            mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS,
+        )
+        self.assertEqual(find_all.call_count, 2)
+        for call in find_all.call_args_list:
+            self.assertIs(call.kwargs["buf"], loaded)
+            self.assertIsNone(call.kwargs["scope"])
+            self.assertEqual(call.kwargs["imagebase"], 0x140000000)
+            self.assertIs(call.kwargs["raise_on_cancel"], True)
+        self.assertEqual(results.imagebase, 0x140000000)
+
+    def test_search_does_not_load_simd_buffer_for_invalid_or_empty_batch(self):
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            True,
+        ), patch.object(
+            sigmaker.InMemoryBuffer,
+            "load",
+        ) as load:
+            invalid = sigmaker.BatchSignatureSearcher.from_text(
+                "bad = random prose"
+            ).search()
+            empty = sigmaker.BatchSignatureSearcher.from_text("").search()
+
+        load.assert_not_called()
+        self.assertEqual(invalid[0].status, "error")
+        self.assertEqual(len(empty), 0)
+
+    def test_search_passes_resolved_scope_to_non_simd_scan(self):
+        seg = MagicMock(start_ea=0x3000, end_ea=0x3400)
+
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            False,
+        ), patch.object(
+            sigmaker.idaapi,
+            "getseg",
+            return_value=seg,
+        ) as getseg, patch.object(
+            sigmaker.idaapi,
+            "get_imagebase",
+            return_value=0x1000,
+        ), patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all:
+            sigmaker.BatchSignatureSearcher.from_text("90").search(
+                scope_ea=0x3200
+            )
+
+        getseg.assert_called_once_with(0x3200)
+        find_all.assert_called_once_with(
+            "90",
+            buf=None,
+            scope=(0x3000, 0x3400),
+            imagebase=0x1000,
+            raise_on_cancel=True,
+        )
+
+    def test_search_scope_without_segment_falls_back_to_whole_database(self):
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            False,
+        ), patch.object(
+            sigmaker.idaapi,
+            "getseg",
+            return_value=None,
+        ), patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all:
+            sigmaker.BatchSignatureSearcher.from_text("90").search(
+                scope_ea=0x9999
+            )
+
+        self.assertIsNone(find_all.call_args.kwargs["scope"])
+
+    def test_search_loads_scoped_simd_buffer_once(self):
+        seg = MagicMock(start_ea=0x3000, end_ea=0x3400)
+        loaded = MagicMock()
+        loaded.imagebase = 0x1000
+
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            True,
+        ), patch.object(
+            sigmaker,
+            "ProgressDialog",
+            MagicMock(),
+        ), patch.object(
+            sigmaker.idaapi,
+            "getseg",
+            return_value=seg,
+        ), patch.object(
+            sigmaker.InMemoryBuffer,
+            "load",
+            return_value=loaded,
+        ) as load, patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[],
+        ) as find_all:
+            sigmaker.BatchSignatureSearcher.from_text(
+                "first = 90\nsecond = CC"
+            ).search(scope_ea=0x3200)
+
+        load.assert_called_once_with(
+            mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS,
+            scope_ea=0x3000,
+        )
+        self.assertEqual(find_all.call_count, 2)
+        for call in find_all.call_args_list:
+            self.assertIs(call.kwargs["buf"], loaded)
+            self.assertIsNone(call.kwargs["scope"])
+            self.assertIs(call.kwargs["raise_on_cancel"], True)
+
+    def test_search_reuses_normalized_match_results(self):
+        calls: list[str] = []
+        shared_buf = MagicMock()
+        shared_buf.imagebase = 0x140000000
+
+        def fake_find_all(
+            ida_signature,
+            buf=None,
+            scope=None,
+            *,
+            imagebase=None,
+            raise_on_cancel=False,
+        ):
+            calls.append(ida_signature)
+            self.assertIs(buf, shared_buf)
+            self.assertIsNone(scope)
+            self.assertEqual(imagebase, 0x140000000)
+            self.assertIs(raise_on_cancel, True)
+            return [sigmaker.Match(0x140001000, rva=0x1000)]
+
+        text = """
+        first = "48 8B C4"
+        second := 48 8B C4
+        third = "E8 ? ? ? ? 48"
+        """
+
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            side_effect=fake_find_all,
+        ), patch.object(
+            sigmaker.idaapi,
+            "get_fileregion_offset",
+            return_value=0x401000,
+        ) as get_fileregion_offset:
+            results = sigmaker.BatchSignatureSearcher.from_text(text).search(
+                buf=shared_buf
+            )
+            get_fileregion_offset.assert_not_called()
+            first_file_offset = results[0].file_offset_for_match(
+                results[0].matches[0]
+            )
+            second_file_offset = results[0].file_offset_for_match(
+                results[0].matches[0]
+            )
+            match_record = results[0]._match_record(results[0].matches[0])
+            get_fileregion_offset.assert_called_once_with(0x140001000)
+
+        self.assertEqual(calls, ["48 8B C4", "E8 ?? ?? ?? ?? 48"])
+        self.assertEqual(len(results), 3)
+        result_list = list(results)
+        self.assertEqual(len(result_list), 3)
+        self.assertIs(results[0], result_list[0])
+        self.assertEqual(results[:2], result_list[:2])
+        self.assertTrue(all(entry.matches for entry in results))
+        self.assertTrue(
+            all(isinstance(entry, sigmaker.SearchResults) for entry in results)
+        )
+        self.assertEqual(results.imagebase, 0x140000000)
+        self.assertFalse(hasattr(results[0], "imagebase"))
+        self.assertFalse(hasattr(results[0], "file_offsets"))
+        self.assertEqual(results[0].normalized_signature, "48 8B C4")
+        self.assertEqual(results[2].signature_str, "E8 ? ? ? ? 48")
+        self.assertEqual(results[2].search_pattern, "E8 ? ? ? ? 48")
+        self.assertEqual(results[2].normalized_signature, "E8 ?? ?? ?? ?? 48")
+        self.assertEqual(
+            results[0].matches[0].rva,
+            0x1000,
+        )
+        self.assertEqual(first_file_offset, 0x401000)
+        self.assertEqual(second_file_offset, 0x401000)
+        self.assertEqual(
+            match_record,
+            {"ea": 0x140001000, "rva": 0x1000, "file_offset": 0x401000},
+        )
+        self.assertEqual(results[0].matches[0], sigmaker.Match(0x140001000))
+        self.assertIs(results[0].matches[0], results[1].matches[0])
+        hit = results[0].matches[0]
+        self.assertEqual(hit.rva, 0x1000)
+        self.assertIsNone(hit.file_offset)
+        self.assertEqual(f"{hit}", "0x140001000")
+        self.assertEqual(f"{hit:ea}", "0x140001000")
+        self.assertEqual(f"{hit:address}", "0x140001000")
+        self.assertEqual(f"{hit:rva}", "0x1000")
+        self.assertEqual(f"{hit:rva:x}", "1000")
+        self.assertEqual(f"{hit:fileoffset}", repr(hit))
+        self.assertEqual(f"{hit:file_offset}", repr(hit))
+        self.assertEqual(f"{hit:file:X}", repr(hit))
+        self.assertEqual(f"{hit:#x}", "0x140001000")
+        sparse_hit = sigmaker.Match(0x140001000)
+        self.assertEqual(
+            repr(sparse_hit),
+            "Match(address=0x140001000)",
+        )
+        self.assertEqual(f"{sparse_hit:rva}", repr(sparse_hit))
+        self.assertEqual(f"{sparse_hit:fileoffset}", repr(sparse_hit))
+
+    def test_search_preserves_batch_nibble_wildcard_patterns(self):
+        shared_buf = MagicMock()
+        shared_buf.imagebase = 0x1000
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            return_value=[sigmaker.Match(0x1000)],
+        ) as find_all:
+            results = sigmaker.BatchSignatureSearcher.from_text(
+                'nibble = "4? ?F ?? 7A"'
+            ).search(buf=shared_buf)
+
+        find_all.assert_called_once_with(
+            "4? ?F ?? 7A",
+            buf=shared_buf,
+            scope=None,
+            imagebase=0x1000,
+            raise_on_cancel=True,
+        )
+        self.assertEqual(results[0].raw_pattern, "4? ?F ?? 7A")
+        self.assertEqual(results[0].signature_str, "4? ?F ? 7A")
+        self.assertEqual(results[0].search_pattern, "4? ?F ? 7A")
+        self.assertEqual(results[0].normalized_signature, "4? ?F ?? 7A")
+
+    def test_search_records_parse_errors_per_entry(self):
+        text = """
+        good = "48 8B C4"
+        bad = "not-a-signature"
+        """
+        shared_buf = MagicMock()
+        shared_buf.imagebase = 0x1000
+
+        with patch.object(
+            sigmaker.SignatureSearcher, "find_all", return_value=[sigmaker.Match(0x1000)]
+        ):
+            results = sigmaker.BatchSignatureSearcher.from_text(text).search(
+                buf=shared_buf
+            )
+
+        self.assertEqual(results[0].status, "matched")
+        self.assertEqual(results[1].status, "error")
+        self.assertIn("Unrecognized", results[1].error)
+
+    def test_search_rejects_all_wildcard_patterns(self):
+        text = 'wild = "?? ?? ??"'
+
+        with patch.object(sigmaker.SignatureSearcher, "find_all") as find_all:
+            results = sigmaker.BatchSignatureSearcher.from_text(text).search()
+
+        find_all.assert_not_called()
+        self.assertEqual(results[0].status, "error")
+        self.assertIn("Unrecognized", results[0].error)
+
+    def test_search_propagates_real_ida_scan_cancellation(self):
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            False,
+        ), patch.object(
+            sigmaker,
+            "idaapi_user_canceled",
+            side_effect=[False, True],
+        ), patch.object(
+            sigmaker.idaapi,
+            "BADADDR",
+            0xFFFFFFFFFFFFFFFF,
+        ), patch.object(
+            sigmaker.idaapi,
+            "inf_get_min_ea",
+            return_value=0x1000,
+        ), patch.object(
+            sigmaker.idaapi,
+            "inf_get_max_ea",
+            return_value=0xFFFF,
+        ), patch.object(
+            sigmaker.idaapi,
+            "compiled_binpat_vec_t",
+            MagicMock,
+        ), patch.object(
+            sigmaker.idaapi,
+            "parse_binpat_str",
+        ), patch.object(
+            sigmaker.idaapi,
+            "BIN_SEARCH_NOCASE",
+            0,
+        ), patch.object(
+            sigmaker.idaapi,
+            "BIN_SEARCH_FORWARD",
+            0,
+        ), patch.object(
+            sigmaker.idaapi,
+            "bin_search",
+            return_value=(0x1000, None),
+        ):
+            with self.assertRaises(sigmaker.UserCanceledError):
+                sigmaker.BatchSignatureSearcher.from_text("48 8B C4").search()
+
+    def test_search_propagates_real_simd_scan_cancellation(self):
+        shared_buf = MagicMock()
+        shared_buf.imagebase = 0x1000
+        shared_buf.file_size = 2
+        shared_buf.data.return_value = memoryview(b"\x90\x90")
+        shared_buf.offset_mapper.return_value = lambda offset: 0x1000 + offset
+
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            True,
+        ), patch.object(
+            sigmaker,
+            "_CANCEL_POLL_STRIDE",
+            1,
+        ), patch.object(
+            sigmaker,
+            "idaapi_user_canceled",
+            side_effect=[False, True],
+        ), patch.object(
+            sigmaker,
+            "_simd_scan_bytes",
+            return_value=0,
+        ), patch.object(
+            sigmaker.idaapi,
+            "inf_get_min_ea",
+            return_value=0x1000,
+        ):
+            with self.assertRaises(sigmaker.UserCanceledError):
+                sigmaker.BatchSignatureSearcher.from_text("90").search(
+                    buf=shared_buf
+                )
+
+    def test_search_propagates_unexpected_search_errors(self):
+        shared_buf = MagicMock()
+        shared_buf.imagebase = 0x1000
+        with patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all",
+            side_effect=RuntimeError("database unavailable"),
+        ):
+            with self.assertRaises(RuntimeError):
+                sigmaker.BatchSignatureSearcher.from_text("48 8B C4").search(
+                    buf=shared_buf
+                )
+
+
+class TestBatchSearchFormatters(CoveredUnitTest):
+    """Batch result renderers produce useful text/csv/json outputs."""
+
+    def _results(self):
+        matched = sigmaker.SearchResults(
+            matches=[
+                sigmaker.Match(
+                    0x140001000,
+                    rva=0x1000,
+                    file_offset=0x401000,
+                )
+            ],
+            signature_str="48 8B ? 48 89",
+            raw_pattern="\\x48\\x8B\\x00\\x48\\x89 xx?xx",
+            name="print",
+            source_line=1,
+            canonical_pattern="48 8B ?? 48 89",
+        )
+        multi = sigmaker.SearchResults(
+            matches=[
+                sigmaker.Match(
+                    0x140002000,
+                    rva=0x2000,
+                    file_offset=0x402000,
+                ),
+                sigmaker.Match(
+                    0x140003000,
+                    rva=0x3000,
+                    file_offset=0x403000,
+                ),
+            ],
+            signature_str="90",
+            raw_pattern="90",
+            name="tick",
+            source_line=2,
+        )
+        error = sigmaker.SearchResults(
+            matches=[],
+            signature_str="",
+            raw_pattern="bad",
+            name="bad",
+            source_line=3,
+            error="Unrecognized signature format",
+        )
+        return sigmaker.BatchSearchResults(
+            [matched, multi, error],
+            imagebase=0x140000000,
+        )
+
+    def _lazy_results(self):
+        entry = sigmaker.SearchResults(
+            matches=[
+                sigmaker.Match(0x140001000, rva=0x1000),
+                sigmaker.Match(0x140002000, rva=0x2000),
+            ],
+            signature_str="90",
+            raw_pattern="90",
+            name="tick",
+            source_line=1,
+        )
+        return sigmaker.BatchSearchResults(
+            [entry],
+            imagebase=0x140000000,
+        )
+
+    def test_text_formatter_resolves_only_previewed_file_offsets(self):
+        results = self._lazy_results()
+
+        with patch.object(
+            sigmaker.SearchResults,
+            "_file_offset_for_ea",
+            side_effect=lambda ea: ea - 0x140000000 + 0x400000,
+        ) as lookup:
+            output = results.format(
+                sigmaker.BatchSearchTextFormatter(max_preview_matches=1)
+            )
+
+        lookup.assert_called_once_with(0x140001000)
+        self.assertIn("file 0x401000", output)
+        self.assertIn("(+1 more)", output)
+
+    def test_csv_and_json_reuse_lazy_file_offset_cache(self):
+        results = self._lazy_results()
+
+        with patch.object(
+            sigmaker.SearchResults,
+            "_file_offset_for_ea",
+            side_effect=lambda ea: ea - 0x140000000 + 0x400000,
+        ) as lookup:
+            csv_output = results.format("csv")
+            json_output = results.format("json")
+
+        self.assertEqual(lookup.call_count, 2)
+        self.assertIn("0x401000 | 0x402000", csv_output)
+        matches = json.loads(json_output)["entries"][0]["matches"]
+        self.assertEqual(
+            [match["file_offset"] for match in matches],
+            [0x401000, 0x402000],
+        )
+
+    def test_formatter_reuses_unavailable_file_offset_cache(self):
+        results = self._lazy_results()
+
+        with patch.object(
+            sigmaker.SearchResults,
+            "_file_offset_for_ea",
+            return_value=None,
+        ) as lookup:
+            results.format(sigmaker.BatchSearchTextFormatter(max_preview_matches=1))
+            results.format(sigmaker.BatchSearchTextFormatter(max_preview_matches=1))
+
+        lookup.assert_called_once_with(0x140001000)
+
+    def test_c_example_resolves_file_offset_lazily(self):
+        old_formatter = sigmaker._BATCH_SEARCH_FORMATTERS.get("c")
+        old_suffixes = {
+            suffix: sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES.get(suffix)
+            for suffix in (".c", ".h", ".hpp", ".cpp")
+        }
+        try:
+            with patch.dict("sys.modules", {"sigmaker": sigmaker}):
+                namespace = runpy.run_path(
+                    str(TEST_DIR.parent / "examples" / "batch_search_c_formatter.py"),
+                    run_name="batch_search_c_formatter_test",
+                )
+            CBatchSearchFormatter = namespace["CBatchSearchFormatter"]
+
+            results = sigmaker.BatchSearchResults(
+                [
+                    sigmaker.SearchResults(
+                        [sigmaker.Match(0x140001000, rva=0x1000)],
+                        "90",
+                        name="tick",
+                    )
+                ],
+                imagebase=0x140000000,
+            )
+            with patch.object(
+                sigmaker.SearchResults,
+                "_file_offset_for_ea",
+                return_value=0x401000,
+            ) as lookup:
+                output = CBatchSearchFormatter().format(results)
+
+            lookup.assert_called_once_with(0x140001000)
+            self.assertIn(
+                "static const uint64_t tick_file_offset = 0x401000ULL;",
+                output,
+            )
+        finally:
+            if old_formatter is None:
+                sigmaker._BATCH_SEARCH_FORMATTERS.pop("c", None)
+            else:
+                sigmaker._BATCH_SEARCH_FORMATTERS["c"] = old_formatter
+            for suffix, old_name in old_suffixes.items():
+                if old_name is None:
+                    sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES.pop(suffix, None)
+                else:
+                    sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES[suffix] = old_name
+
+    def test_render_text_includes_names_and_statuses(self):
+        out = self._results().format(sigmaker.BatchSearchTextFormatter())
+        self.assertIn("[print]", out)
+        self.assertIn("matched", out)
+        self.assertIn("[bad]", out)
+        self.assertIn("Unrecognized signature format", out)
+
+    def test_results_format_defaults_to_text_formatter(self):
+        out = self._results().format()
+        self.assertIn("Batch search finished: 2/3 matched, 1 error(s)", out)
+        self.assertIn("Imagebase: 0x140000000", out)
+        self.assertIn("[print] 1 match(es) for 48 8B ? 48 89", out)
+
+    def test_results_str_defaults_to_text_formatter(self):
+        self.assertEqual(str(self._results()), self._results().format())
+
+    def test_results_format_spec_selects_registered_formatter(self):
+        self.assertEqual(
+            f"{self._results():text}",
+            self._results().format("text"),
+        )
+        self.assertEqual(
+            f"{self._results():csv}",
+            self._results().format("csv"),
+        )
+        self.assertEqual(
+            f"{self._results():json}",
+            self._results().format("json"),
+        )
+
+    def test_display_writes_formatted_text_to_text_io(self):
+        output = io.StringIO()
+        formatter = sigmaker.BatchSearchTextFormatter(max_preview_matches=1)
+
+        self._results().display(output=output, formatter=formatter)
+
+        self.assertEqual(output.getvalue(), self._results().format(formatter))
+
+    def test_display_writes_formatted_text_to_callable_sink(self):
+        chunks: list[str] = []
+        formatter = sigmaker.BatchSearchTextFormatter()
+
+        self._results().display(output=chunks.append, formatter=formatter)
+
+        self.assertEqual(chunks, [self._results().format(formatter)])
+
+    def test_display_defaults_to_ida_message_sink(self):
+        with patch.object(sigmaker.idaapi, "msg") as msg, patch.object(
+            sigmaker.idaapi,
+            "get_func_name",
+            return_value="print_fn",
+        ) as get_func_name:
+            self._results().display()
+
+        msg.assert_called_once()
+        get_func_name.assert_not_called()
+        self.assertIn(
+            "0x140001000 (rva 0x1000, file 0x401000)",
+            msg.call_args.args[0],
+        )
+        self.assertNotIn("print_fn", msg.call_args.args[0])
+
+    def test_render_csv_quotes_fields(self):
+        out = self._results().format(sigmaker.BatchSearchCsvFormatter())
+        rows = list(csv.DictReader(io.StringIO(out)))
+
+        self.assertEqual(rows[0]["name"], "print")
+        self.assertEqual(rows[0]["search_pattern"], "48 8B ? 48 89")
+        self.assertEqual(rows[0]["normalized_signature"], "48 8B ?? 48 89")
+        self.assertEqual(rows[0]["raw_pattern"], "\\x48\\x8B\\x00\\x48\\x89 xx?xx")
+        self.assertEqual(rows[0]["match_eas"], "0x140001000")
+        self.assertEqual(rows[0]["match_rvas"], "0x1000")
+        self.assertEqual(rows[0]["match_file_offsets"], "0x401000")
+
+    def test_render_json_is_parseable(self):
+        out = self._results().format(sigmaker.BatchSearchJsonFormatter())
+        payload = json.loads(out)
+        self.assertEqual(payload["imagebase"], 0x140000000)
+        self.assertEqual(payload["entry_count"], 3)
+        self.assertEqual(payload["entries"][0]["name"], "print")
+        self.assertEqual(payload["entries"][0]["search_pattern"], "48 8B ? 48 89")
+        self.assertEqual(
+            payload["entries"][0]["normalized_signature"],
+            "48 8B ?? 48 89",
+        )
+        self.assertEqual(
+            payload["entries"][0]["raw_pattern"],
+            "\\x48\\x8B\\x00\\x48\\x89 xx?xx",
+        )
+        self.assertEqual(payload["entries"][0]["matches"][0]["ea"], 0x140001000)
+        self.assertEqual(payload["entries"][0]["matches"][0]["rva"], 0x1000)
+        self.assertNotIn("imagebase", payload["entries"][0])
+        self.assertEqual(
+            payload["entries"][0]["matches"][0]["file_offset"],
+            0x401000,
+        )
+
+    def test_formatter_for_path_uses_suffix(self):
+        cases = {
+            "out.txt": sigmaker.BatchSearchTextFormatter,
+            "out.csv": sigmaker.BatchSearchCsvFormatter,
+            "out.json": sigmaker.BatchSearchJsonFormatter,
+            "out.c": sigmaker.BatchSearchTextFormatter,
+        }
+        for path, formatter_type in cases.items():
+            formatter = sigmaker._batch_search_formatter_for_path(pathlib.Path(path))
+            self.assertIsInstance(formatter, formatter_type)
+
+    def test_format_accepts_registered_format_name(self):
+        old_formatter = sigmaker._BATCH_SEARCH_FORMATTERS.get("test")
+        try:
+            @sigmaker.BatchSearchFormatter.register("test")
+            class TestFormatter:
+                def format(self, results):
+                    return f"entries={len(results)}\n"
+
+            self.assertEqual(self._results().format("test"), "entries=3\n")
+        finally:
+            if old_formatter is None:
+                sigmaker._BATCH_SEARCH_FORMATTERS.pop("test", None)
+            else:
+                sigmaker._BATCH_SEARCH_FORMATTERS["test"] = old_formatter
+
+    def test_formatter_register_decorator_can_bind_suffix(self):
+        old_formatter = sigmaker._BATCH_SEARCH_FORMATTERS.get("c")
+        old_suffix = sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES.get(".c")
+        try:
+            @sigmaker.BatchSearchFormatter.register("c", suffixes=(".c",))
+            class TestFormatter:
+                def format(self, results):
+                    return "custom\n"
+
+            formatter = sigmaker._batch_search_formatter_for_path(pathlib.Path("out.c"))
+            self.assertEqual(formatter.format(self._results()), "custom\n")
+        finally:
+            if old_formatter is None:
+                sigmaker._BATCH_SEARCH_FORMATTERS.pop("c", None)
+            else:
+                sigmaker._BATCH_SEARCH_FORMATTERS["c"] = old_formatter
+            if old_suffix is None:
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES.pop(".c", None)
+            else:
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES[".c"] = old_suffix
+
+    def test_formatter_registration_rejects_duplicate_name_atomically(self):
+        class ExistingFormatter:
+            def format(self, results):
+                return "existing\n"
+
+        class ReplacementFormatter:
+            def format(self, results):
+                return "replacement\n"
+
+        existing = ExistingFormatter()
+        with patch.dict(
+            sigmaker._BATCH_SEARCH_FORMATTERS,
+            {"taken": existing},
+            clear=True,
+        ), patch.dict(
+            sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+            {".old": "taken"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, r"override=True"):
+                sigmaker.BatchSearchFormatter.register(
+                    "taken",
+                    suffixes=(".new",),
+                )(ReplacementFormatter)
+
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMATTERS,
+                {"taken": existing},
+            )
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+                {".old": "taken"},
+            )
+
+    def test_formatter_registration_rejects_duplicate_suffix_atomically(self):
+        class ExistingFormatter:
+            def format(self, results):
+                return "existing\n"
+
+        class ReplacementFormatter:
+            def format(self, results):
+                return "replacement\n"
+
+        existing = ExistingFormatter()
+        with patch.dict(
+            sigmaker._BATCH_SEARCH_FORMATTERS,
+            {"existing": existing},
+            clear=True,
+        ), patch.dict(
+            sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+            {".taken": "existing"},
+            clear=True,
+        ):
+            with self.assertRaisesRegex(ValueError, r"override=True"):
+                sigmaker.BatchSearchFormatter.register(
+                    "replacement",
+                    suffixes=("new", ".taken"),
+                )(ReplacementFormatter)
+
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMATTERS,
+                {"existing": existing},
+            )
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+                {".taken": "existing"},
+            )
+
+    def test_formatter_registration_override_replaces_name(self):
+        class ExistingFormatter:
+            def format(self, results):
+                return "existing\n"
+
+        class ReplacementFormatter:
+            def format(self, results):
+                return "replacement\n"
+
+        with patch.dict(
+            sigmaker._BATCH_SEARCH_FORMATTERS,
+            {"taken": ExistingFormatter()},
+            clear=True,
+        ), patch.dict(
+            sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+            {".old": "taken"},
+            clear=True,
+        ):
+            decorated = sigmaker.BatchSearchFormatter.register(
+                "taken",
+                override=True,
+            )(ReplacementFormatter)
+
+            self.assertIs(decorated, ReplacementFormatter)
+            self.assertIsInstance(
+                sigmaker._BATCH_SEARCH_FORMATTERS["taken"],
+                ReplacementFormatter,
+            )
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+                {".old": "taken"},
+            )
+
+    def test_formatter_registration_override_rebinds_suffix(self):
+        class ExistingFormatter:
+            def format(self, results):
+                return "existing\n"
+
+        class ReplacementFormatter:
+            def format(self, results):
+                return "replacement\n"
+
+        existing = ExistingFormatter()
+        with patch.dict(
+            sigmaker._BATCH_SEARCH_FORMATTERS,
+            {"existing": existing},
+            clear=True,
+        ), patch.dict(
+            sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES,
+            {".taken": "existing"},
+            clear=True,
+        ):
+            sigmaker.BatchSearchFormatter.register(
+                "replacement",
+                suffixes=("taken",),
+                override=True,
+            )(ReplacementFormatter)
+
+            self.assertIs(
+                sigmaker._BATCH_SEARCH_FORMATTERS["existing"],
+                existing,
+            )
+            self.assertIsInstance(
+                sigmaker._BATCH_SEARCH_FORMATTERS["replacement"],
+                ReplacementFormatter,
+            )
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES[".taken"],
+                "replacement",
+            )
+
+
 class TestSIMDScannerEquivalence(CoveredUnitTest):
     def _assert_match_all_kinds(self, hay: bytes, pat: str, expect: int):
         # Portable
@@ -2062,6 +3330,21 @@ class TestSearchCancellation(CoveredUnitTest):
             # Restore SIMD setting
             sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
 
+    def test_find_all_rejects_nibble_wildcards_without_simd(self):
+        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+        sigmaker.idaapi.parse_binpat_str = MagicMock()
+
+        try:
+            with self.assertRaisesRegex(
+                ValueError,
+                "Nibble wildcard search requires SIMD speedups",
+            ):
+                sigmaker.SignatureSearcher.find_all("48 4? ?F")
+            sigmaker.idaapi.parse_binpat_str.assert_not_called()
+        finally:
+            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+
     def test_cancellation_returns_partial_results(self):
         """Test that cancellation returns partial results found so far."""
         # Mock user_canceled to cancel after finding 2 matches
@@ -2105,6 +3388,38 @@ class TestSearchCancellation(CoveredUnitTest):
         finally:
             # Restore SIMD setting
             sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+
+    def test_simd_cancellation_returns_partial_results_by_default(self):
+        shared_buf = MagicMock()
+        shared_buf.imagebase = 0x1000
+        shared_buf.file_size = 2
+        shared_buf.data.return_value = memoryview(b"\x90\x90")
+        shared_buf.offset_mapper.return_value = lambda offset: 0x1000 + offset
+
+        with patch.object(
+            sigmaker,
+            "SIMD_SPEEDUP_AVAILABLE",
+            True,
+        ), patch.object(
+            sigmaker,
+            "_CANCEL_POLL_STRIDE",
+            1,
+        ), patch.object(
+            sigmaker,
+            "idaapi_user_canceled",
+            side_effect=[False, True],
+        ), patch.object(
+            sigmaker,
+            "_simd_scan_bytes",
+            return_value=0,
+        ), patch.object(
+            sigmaker.idaapi,
+            "inf_get_min_ea",
+            return_value=0x1000,
+        ):
+            results = sigmaker.SignatureSearcher.find_all("90", buf=shared_buf)
+
+        self.assertEqual(results, [sigmaker.Match(0x1000)])
 
 
 class TestSigMakerConfigDefaults(CoveredUnitTest):
@@ -2162,11 +3477,13 @@ class TestActionEnum(CoveredUnitTest):
 
     def test_action_values_match_form_order(self):
         # Order is locked by SignatureMakerForm.rAction:
-        #   ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode", "rSearchSignature")
+        #   ("rCreateUniqueSig", "rFindXRefSig", "rCopyCode",
+        #    "rSearchSignature", "rFindFunctionSig")
         self.assertEqual(int(sigmaker.Action.CREATE_UNIQUE), 0)
         self.assertEqual(int(sigmaker.Action.FIND_XREF), 1)
         self.assertEqual(int(sigmaker.Action.COPY_RANGE), 2)
         self.assertEqual(int(sigmaker.Action.SEARCH), 3)
+        self.assertEqual(int(sigmaker.Action.FIND_FUNCTION_SIG), 4)
 
     def test_action_is_intenum(self):
         import enum as _enum
@@ -3272,19 +4589,6 @@ class TestSignatureSearcherBufferCache(CoveredUnitTest):
         mp_load.assert_called_once()
 
 
-class TestActionEnumAddsFunctionSig(CoveredUnitTest):
-    """The Action IntEnum gains FIND_FUNCTION_SIG=4 for issue #17."""
-
-    def test_find_function_sig_value(self):
-        self.assertEqual(int(sigmaker.Action.FIND_FUNCTION_SIG), 4)
-
-    def test_existing_action_values_unchanged(self):
-        self.assertEqual(int(sigmaker.Action.CREATE_UNIQUE), 0)
-        self.assertEqual(int(sigmaker.Action.FIND_XREF), 1)
-        self.assertEqual(int(sigmaker.Action.COPY_RANGE), 2)
-        self.assertEqual(int(sigmaker.Action.SEARCH), 3)
-
-
 class TestGeneratedSignatureOrdering(CoveredUnitTest):
     """GeneratedSignature.__lt__ ranks by (size, wildcards) ascending."""
 
@@ -3859,6 +5163,70 @@ class TestSeedViaIndex(CoveredUnitTest):
         # offset 0 keeps (90 90 90 follow); offset 6 drops (00 00 follow)
         self.assertEqual(list(arr[:cnt]), [0])
 
+    def test_wildcard_heavy_signature_anchors_on_exact_island(self):
+        pattern = bytes(
+            [
+                0xE8,
+                0xAA,
+                0xBB,
+                0xCC,
+                0xDD,
+                0x48,
+                0x8B,
+                0xD8,
+                0x48,
+                0x85,
+                0xC0,
+                0x11,
+                0x22,
+                0x48,
+                0x8B,
+                0xCB,
+            ]
+        )
+        data = bytearray(b"\x90" * 100)
+        data[20:20 + len(pattern)] = pattern
+        data[69:71] = b"\x85\xc0"  # Decoy seed hit; full pattern should reject it.
+
+        buf = MagicMock()
+        buf.data.return_value = memoryview(data)
+        sig = self._sig(
+            [
+                (0xE8, False),
+                (0x00, True),
+                (0x00, True),
+                (0x00, True),
+                (0x00, True),
+                (0x48, False),
+                (0x8B, False),
+                (0xD8, False),
+                (0x48, False),
+                (0x85, False),
+                (0xC0, False),
+                (0x00, True),
+                (0x00, True),
+                (0x48, False),
+                (0x8B, False),
+                (0xCB, False),
+            ]
+        )
+        seed_key = (0x85 << 8) | 0xC0
+        idx = MagicMock()
+        idx.bucket_size.side_effect = lambda key: {seed_key: 2}.get(key, 10**9)
+        idx.bucket_size1.side_effect = lambda b: 10**9
+        idx.candidates.side_effect = (
+            lambda key: array.array("I", [29, 69])
+            if key == seed_key
+            else array.array("I", [])
+        )
+        idx.candidates1.side_effect = lambda b: array.array("I", [])
+
+        arr, cnt = sigmaker._seed_via_index(sig, idx, buf)
+
+        idx.candidates.assert_called_once_with(seed_key)
+        idx.candidates1.assert_not_called()
+        self.assertEqual(list(arr[:cnt]), [20])
+
     def test_one_byte_seed_path(self):
         # buffer: F3 at offsets 0 and 8; no 2-byte run is selectable, so the
         # single byte F3 is the seed. offset 0 fits a 5-byte pattern; offset 8
@@ -3928,6 +5296,32 @@ class TestSelectSeedRun(CoveredUnitTest):
         one = {0x00: 3_000_000, 0xF3: 800}
         run = sigmaker._select_seed_run(sig, self._index(two, one))
         self.assertEqual(run, (3, 1, 0xF3))
+
+    def test_selectivity_beats_longest_exact_run(self):
+        # 00 00 00 00 is the longest exact run, but it is common. The shorter
+        # 4C 8B island has the smaller bucket, so it is the better anchor.
+        sig = self._sig(
+            [
+                (0x00, False),
+                (0x00, False),
+                (0x00, False),
+                (0x00, False),
+                (0x00, True),
+                (0x4C, False),
+                (0x8B, False),
+                (0xDC, False),
+            ]
+        )
+        two = {
+            (0x00 << 8) | 0x00: 5_000_000,
+            (0x4C << 8) | 0x8B: 12,
+            (0x8B << 8) | 0xDC: 20,
+        }
+        one = {0x00: 8_000_000, 0x4C: 400, 0x8B: 800, 0xDC: 900}
+
+        run = sigmaker._select_seed_run(sig, self._index(two, one))
+
+        self.assertEqual(run, (5, 2, (0x4C << 8) | 0x8B))
 
     def test_returns_none_when_no_exact_byte(self):
         sig = self._sig([(0, True), (0, True)])
@@ -4536,6 +5930,20 @@ class TestSearchAddressMapping(unittest.TestCase):
         return sigmaker.InMemoryBuffer.load(
             mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS
         )
+
+    def test_load_segments_rejects_non_advancing_iterator(self):
+        seg = MagicMock(start_ea=0x1000, end_ea=0x1004)
+        sigmaker.idaapi.get_first_seg = MagicMock(return_value=seg)
+        sigmaker.idaapi.get_next_seg = MagicMock(side_effect=[seg, None])
+        sigmaker.idaapi.get_bytes = MagicMock(return_value=b"\x90" * 4)
+
+        with self.assertRaisesRegex(RuntimeError, "did not advance"):
+            sigmaker.InMemoryBuffer.load(
+                mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS
+            )
+
+        sigmaker.idaapi.get_bytes.assert_called_once_with(0x1000, 4)
+        sigmaker.idaapi.get_next_seg.assert_called_once_with(0x1000)
 
     def test_offset_mapper_across_noncontiguous_segments(self):
         buf = self._two_segment_buffer()

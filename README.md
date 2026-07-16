@@ -74,7 +74,11 @@ hcli plugin search sigmaker
 hcli plugin install SigMaker
 ```
 
-`hcli` downloads the plugin and places it in `$IDAUSR/plugins` (`~/.idapro/plugins` on macOS/Linux), where IDA loads it on the next launch. Requires IDA 9.0+. For `SIMD` speedups, also run `pip install sigmaker` as above.
+`hcli` installs the plugin under `$IDAUSR/plugins/SigMaker` and installs the
+matching `sigmaker` wheel into IDA's Python environment. That wheel includes
+the SIMD speedups for supported Python and platform combinations, so an HCLI
+install does not require a separate `pip install`. IDA loads the plugin on its
+next launch. Requires IDA 9.0+.
 
 ### Need to find your plugin directory?
 
@@ -89,12 +93,18 @@ import idaapi, os; print(os.path.join(idaapi.get_user_idadir(), "plugins"))
 The user directory is a location where IDA stores some of the global settings and which can be used for some additional customization.
 Default location:
 
-- On Windows: `%APPDATA%/Hex-Rays/IDA Pro`
-- On Linux and Mac: `$HOME/.idapro`
+- On Windows: `%APPDATA%\Hex-Rays\IDA Pro`
+- On macOS: `~/Library/Application Support/IDA Pro`
+- On Linux: `~/.idapro`
 
 ## SIMD Speedups
 
-If you just followed the installation above and ran `pip install sigmaker`, then based on your system and architecture (i.e. Windows (x64), Linux (x64), Mac (x64), Mac (ARM/Silicon)), the plugin will install the appropriate wheel and will automatically use them if they're available. You do not have to do anything else. The plugin is designed to display the status of whether or not SIMD speedups are installed. They are shown in the top right menu bar of the plugin:
+An HCLI install pulls in the matching `sigmaker` wheel automatically. For a
+manual or standalone `sigmaker.py` install, run `pip install sigmaker` in
+IDA's Python environment. On supported Windows, Linux, and macOS systems, pip
+selects the wheel for the active CPython version and architecture. SigMaker
+uses the extension automatically when it is available and shows its status in
+the top-right menu bar:
 
 ### SIMD Enabled
 
@@ -675,7 +685,11 @@ The version lives in one place, `__version__` in `src/sigmaker/__init__.py`. To 
 git config core.hooksPath .githooks
 ```
 
-The pre-commit hook (`.githooks/pre-commit`) runs `tools/sync_plugin_version.py`, which copies `__version__` into `ida-plugin.json` and stages it, so the manifest the IDA Plugin Repository reads can never drift behind a version bump. CI runs the same check (`TestPluginManifestVersion`) as a backstop for commits that skip the hook.
+The pre-commit hook (`.githooks/pre-commit`) runs
+`tools/sync_plugin_version.py`, which copies `__version__` into both the HCLI
+manifest version and its exact `sigmaker==VERSION` dependency, then stages the
+manifest. CI checks the same contract as a backstop for commits that skip the
+hook.
 
 ## Contact
 

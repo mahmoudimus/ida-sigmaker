@@ -4,6 +4,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-07-16
+
 ### Added
 
 - **Batch signature search API** supports several named or unnamed signatures at once, using one `foo = "48 8B ?? ??"`, `foo := 48 8B ?? ??`, or plain signature per non-empty line. The batch parser does not infer C declarations or join entries across multiple lines. Each pattern is normalized and searched independently; invalid patterns are reported per entry instead of aborting the whole batch.
@@ -29,7 +31,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 - README now documents the batch search workflow, accepted input forms, export formats, batch search API, and custom formatter registration. A C-style formatter example lives in `examples/batch_search_c_formatter.py`.
 
-[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.11.0...HEAD
+[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.12.0...HEAD
+[1.12.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.11.0...v1.12.0
 
 ## [1.11.0] - 2026-07-05
 

@@ -1,3 +1,4 @@
+import importlib.util
 import json
 import pathlib
 import re
@@ -97,7 +98,12 @@ class TestHCLIPackaging(unittest.TestCase):
         )
 
     def test_version_sync_updates_the_hcli_dependency(self):
-        from tools import sync_plugin_version
+        script = ROOT / "tools" / "sync_plugin_version.py"
+        spec = importlib.util.spec_from_file_location("sync_plugin_version", script)
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        sync_plugin_version = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(sync_plugin_version)
 
         manifest = json.dumps(
             {

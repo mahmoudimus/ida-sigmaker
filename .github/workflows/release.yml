@@ -16,6 +16,7 @@ concurrency:
 
 permissions:
     contents: write
+    id-token: write
 
 jobs:
     release:
@@ -119,3 +120,12 @@ jobs:
                   prerelease: ${{ contains(steps.version.outputs.version, '-') }}
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    publish-to-pypi:
+        needs: release
+        uses: ./.github/workflows/deploy.yml
+        with:
+            publish: true
+        permissions:
+            contents: read
+            id-token: write

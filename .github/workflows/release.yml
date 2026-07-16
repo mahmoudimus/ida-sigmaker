@@ -2,130 +2,87 @@ name: Release
 
 on:
     push:
-        # Sequence of patterns matched against refs/tags
         tags:
-            - "v*" # Push events to matching v*, i.e. v1.0, v20.15.10
+            - "v*"
     workflow_dispatch:
         inputs:
             tag:
-                description: "Release tag name (e.g. v1.2.3). If empty, will use latest."
-                required: false
-                default: ""
-    workflow_run:
-        workflows: [ida-sigmaker tests] # Reference the test workflow name
-        types:
-            - completed
+                description: "Release tag name (for example, v1.12.0)"
+                required: true
 
-# make concurrency tag-aware so one run doesn't cancel the other incorrectly
 concurrency:
-    group: ${{ github.workflow }}-${{ github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref || github.run_id }}
+    group: ${{ github.workflow }}-${{ inputs.tag || github.ref || github.run_id }}
     cancel-in-progress: true
 
 permissions:
     contents: write
 
 jobs:
-    debug-vars:
+    release:
         runs-on: ubuntu-latest
         steps:
-            - name: Look at environment variables
-              run: |
-                  echo -e "GITHUB_REF=${{ github.ref }}"
-                  echo -e "GITHUB_HEAD_REF=${{ github.head_ref }}"
-                  echo -e "GITHUB_BASE_REF=${{ github.base_ref }}"
-                  echo -e "GITHUB_ACTOR=${{ github.actor }}"
-                  echo -e "GITHUB_REPOSITORY=${{ github.repository }}"
-                  echo -e "GITHUB_SHA=${{ github.sha }}"
-                  echo -e "GITHUB_EVENT_NAME=${{ github.event_name }}"
-                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_CONCLUSION=${{ github.event.workflow_run.conclusion }}"
-                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_EVENT=${{ github.event.workflow_run.event }}"
-                  echo -e "GITHUB_EVENT_WORKFLOW_RUN_HEAD_BRANCH=${{ github.event.workflow_run.head_branch }}"
-                  echo -e "GITHUB_EVENT_INPUTS_TAG=${{ github.event.inputs.tag }}"
-            - name: Dump GitHub context
+            - name: Resolve release tag
+              id: version
               env:
-                  GITHUB_CONTEXT: ${{ toJson(github) }}
-              run: echo "$GITHUB_CONTEXT"
+                  REQUESTED_TAG: ${{ inputs.tag }}
+              run: |
+                  if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+                    TAG="$REQUESTED_TAG"
+                  else
+                    TAG="${GITHUB_REF#refs/tags/}"
+                  fi
+                  TAG="${TAG#refs/tags/}"
+                  if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-].*)?$ ]]; then
+                    echo "Release tag must use vMAJOR.MINOR.PATCH: $TAG" >&2
+                    exit 1
+                  fi
+                  {
+                    echo "ref=refs/tags/$TAG"
+                    echo "tag=$TAG"
+                    echo "version=${TAG#v}"
+                  } >> "$GITHUB_OUTPUT"
 
-    # releases only when a v tag points at the tested commit* (and tests succeeded).
-    release-from-workflow-run:
-        runs-on: ubuntu-latest
-        if: >
-            (
-              github.event_name == 'workflow_run' &&
-              github.event.workflow_run.conclusion == 'success'
-            )
-        steps:
-            - name: Checkout code
-              uses: actions/checkout@v4
+            - name: Check for an existing release
+              id: guard
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  TAG: ${{ steps.version.outputs.tag }}
+              run: |
+                  if gh release view "$TAG" >/dev/null 2>&1; then
+                    echo "already=true" >> "$GITHUB_OUTPUT"
+                  else
+                    echo "already=false" >> "$GITHUB_OUTPUT"
+                  fi
+
+            - name: Checkout release tag
+              if: ${{ steps.guard.outputs.already == 'false' }}
+              uses: actions/checkout@v5
               with:
-                  ref: ${{ github.event.workflow_run.head_sha }}
+                  ref: ${{ steps.version.outputs.ref }}
                   fetch-tags: true
 
-            - name: Extract version from tag
-              id: version
-              run: |
-                  # get tags pointing at this exact commit
-                  TAGS=$(git tag --points-at HEAD | tr -d '\r')
-                  echo "found tags:"
-                  printf '%s\n' "$TAGS"
-                  # pick the first v* tag (if any)
-                  TAG=$(printf '%s\n' "$TAGS" | grep -E '^v' | head -n1 || true)
-                  if [ -z "$TAG" ]; then
-                      echo "No v* tag points at $GITHUB_SHA; exiting."
-                      echo "should_release=false" >> $GITHUB_OUTPUT
-                      exit 0
-                  fi
-                  echo "ref=refs/tags/$TAG" >> $GITHUB_OUTPUT
-                  echo "tag=$TAG" >> $GITHUB_OUTPUT
-                  echo "version=${TAG#v}" >> $GITHUB_OUTPUT
-                  echo "should_release=true" >> $GITHUB_OUTPUT
+            - name: Create standalone sigmaker.py
+              if: ${{ steps.guard.outputs.already == 'false' }}
+              run: cp src/sigmaker/__init__.py sigmaker.py
 
-            - &skip-if-release-exists
-              name: Skip if release already exists
-              id: guard
-              if: ${{ steps.version.outputs.should_release == 'true' }}
-              run: |
-                  if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-                  echo "already=true" >> $GITHUB_OUTPUT
-                  else
-                  echo "already=false" >> $GITHUB_OUTPUT
-                  fi
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-            - &setup-python
-              name: Set up Python
-              if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
-              uses: actions/setup-python@v5
-              with:
-                  python-version: "3.10"
-            - &create-sigmaker-py
-              name: Create sigmaker.py from __init__.py
-              if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
-              run: |
-                  cp src/sigmaker/__init__.py sigmaker.py
-            - &read-changelog
-              name: 📖 Read CHANGELOG section for this version
+            - name: Read changelog section
               id: changelog
-              if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
-              # Pinned to v2.4.0 (mindsers/changelog-reader-action).
+              if: ${{ steps.guard.outputs.already == 'false' }}
               uses: mindsers/changelog-reader-action@1faaf50aa09d5793d9a100819973df801febfb31
               with:
                   version: ${{ steps.version.outputs.version }}
                   path: ./CHANGELOG.md
-            - &create-release-body
-              name: ✏️ Create release body
-              if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
-              # changes_file is a path to the parsed section body, so we cat it
-              # in (never interpolate changelog text into the shell, which would
-              # execute backticks/$() in the markdown).
+
+            - name: Create release body
+              if: ${{ steps.guard.outputs.already == 'false' }}
+              env:
+                  VERSION: ${{ steps.version.outputs.version }}
+                  CHANGES_FILE: ${{ steps.changelog.outputs.changes_file }}
               run: |
-                  VERSION="${{ steps.version.outputs.version }}"
-                  CHANGES_FILE="${{ steps.changelog.outputs.changes_file }}"
                   {
-                    echo "# sigmaker.py - IDA Python Standalone Python Release"
+                    echo "# sigmaker.py - IDAPython standalone release"
                     echo ""
-                    echo "## Release Information"
+                    echo "## Release information"
                     echo "- **Version**: ${VERSION}"
                     echo "- **Source**: https://github.com/mahmoudimus/ida-sigmaker"
                     echo "- **Author**: @mahmoudimus (Mahmoud Abdelkader)"
@@ -138,28 +95,23 @@ jobs:
                       echo "See [CHANGELOG.md](https://github.com/mahmoudimus/ida-sigmaker/blob/main/CHANGELOG.md) for details."
                     fi
                     echo ""
-                    echo "## Description"
-                    echo "This is a standalone release of the IDA Pro signature maker plugin. The file \`sigmaker.py\` contains the complete plugin code that can be directly imported into IDA Pro."
-                    echo ""
                     echo "## Installation"
-                    echo "1. Copy \`sigmaker.py\` to your IDA Pro plugins directory"
-                    echo "2. Restart IDA Pro"
-                    echo "3. Use Ctrl+Alt+S to access the Signature Maker menu"
+                    echo "1. Copy \`sigmaker.py\` to your IDA Pro plugins directory."
+                    echo "2. Restart IDA Pro."
+                    echo "3. Use Ctrl+Alt+S to access the Signature Maker menu."
+                    echo ""
+                    echo "The release source archive is also installable through Hex-Rays HCLI."
                     echo ""
                     echo "## License"
-                    echo "See the main repository for license information."
+                    echo "See the repository for license information."
                   } > release_body.md
 
-                  echo "----- release_body.md -----"
-                  cat release_body.md
-            - &generate-release
-              name: 📦 Generate Release
-              if: ${{ steps.version.outputs.should_release == 'true' && steps.guard.outputs.already == 'false' }}
+            - name: Publish GitHub release
+              if: ${{ steps.guard.outputs.already == 'false' }}
               uses: softprops/action-gh-release@v2
               with:
-                  files: |
-                      sigmaker.py
-                  tag_name: ${{ steps.version.outputs.tag }} # e.g. v1.3.0
+                  files: sigmaker.py
+                  tag_name: ${{ steps.version.outputs.tag }}
                   name: ${{ steps.version.outputs.tag }}
                   body_path: release_body.md
                   draft: false
@@ -167,53 +119,3 @@ jobs:
                   prerelease: ${{ contains(steps.version.outputs.version, '-') }}
               env:
                   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-    # releases only when tag push and manual dispatch.
-    release-from-other:
-        runs-on: ubuntu-latest
-        if: >
-            (             
-               github.event_name == 'push' &&
-               startsWith(github.ref, 'refs/tags/v')
-            ) || (
-               github.event_name == 'workflow_dispatch'
-            )
-        steps:
-            - name: Extract version from tag
-              id: version
-              run: |
-                  if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.tag }}" ]; then
-                    IN='${{ github.event.inputs.tag }}'
-                    if [[ "$IN" == refs/* ]]; then REF="$IN"; else REF="refs/tags/$IN"; fi
-                    TAG="${REF#refs/tags/}"
-                    echo "ref=$REF" >> $GITHUB_OUTPUT
-                    echo "tag=$TAG" >> $GITHUB_OUTPUT
-                    echo "version=${TAG#v}" >> $GITHUB_OUTPUT
-                  else
-                    echo "ref=refs/tags/${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-                    echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-                    echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-                  fi
-                  echo "should_release=true" >> $GITHUB_OUTPUT
-            - *skip-if-release-exists
-            - name: Checkout code
-              if: ${{ steps.guard.outputs.already == 'false' }}
-              uses: actions/checkout@v4
-              with:
-                  ref: ${{ steps.version.outputs.ref }}
-                  fetch-tags: true
-
-              #   if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-              #       REF=${{ github.event.inputs.tag_name }}"
-              #       echo "version=${REF#refs/tags/}" >> $GITHUB_OUTPUT
-              #       echo "version_clean=${REF#refs/tags/v}" >> $GITHUB_OUTPUT
-              #   else
-              #       echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
-              #       echo "version_clean=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-              #       # echo "::set-output name=tag::$(echo ${{ github.event.workflow_run.ref }} | sed 's|refs/tags/||')"
-              #   fi
-
-            - *setup-python
-            - *create-sigmaker-py
-            - *read-changelog
-            - *create-release-body
-            - *generate-release

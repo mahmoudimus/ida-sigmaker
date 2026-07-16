@@ -17,5 +17,5 @@ python3 tools/sync_plugin_version.py
 
 if ! git diff --quiet -- ida-plugin.json; then
     git add ida-plugin.json
-    echo "pre-commit: synced ida-plugin.json version and staged it"
+    echo "pre-commit: synced ida-plugin.json package references and staged it"
 fi

@@ -69,14 +69,29 @@ class TestHCLIPackaging(unittest.TestCase):
         project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
         self.assertEqual(project["dependencies"], [])
 
-    def test_automatic_deployments_require_a_published_release(self):
+    def test_release_calls_the_pypi_workflow_directly(self):
         release_workflow = (ROOT / ".github/workflows/release.yml").read_text()
         deploy_workflow = (ROOT / ".github/workflows/deploy.yml").read_text()
 
         self.assertNotIn("workflow_run:", release_workflow)
         self.assertNotIn("workflow_run:", deploy_workflow)
+        self.assertIn("workflow_call:", deploy_workflow)
         self.assertRegex(deploy_workflow, r"release:\s+types:\s+- published")
-        self.assertIn("workflow_dispatch:", deploy_workflow)
+        self.assertRegex(
+            release_workflow,
+            r"publish-to-pypi:\s+needs: release\s+uses: "
+            r"\./\.github/workflows/deploy\.yml\s+with:\s+publish: true",
+        )
+
+    def test_manual_pypi_publish_requires_explicit_confirmation(self):
+        deploy_workflow = (ROOT / ".github/workflows/deploy.yml").read_text()
+
+        self.assertRegex(
+            deploy_workflow,
+            r"workflow_dispatch:\s+inputs:\s+publish:\s+"
+            r"description:.*\s+required: true\s+type: boolean\s+default: false",
+        )
+        self.assertIn("inputs.publish == true", deploy_workflow)
 
     def test_ci_lints_the_plugin_with_pinned_hcli_inputs(self):
         workflow = (ROOT / ".github/workflows/python.yml").read_text()

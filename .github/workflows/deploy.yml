@@ -1,7 +1,18 @@
 name: Build and upload to PyPI
 
 on:
+    workflow_call:
+        inputs:
+            publish:
+                required: true
+                type: boolean
     workflow_dispatch:
+        inputs:
+            publish:
+                description: "Publish the built distributions to PyPI"
+                required: true
+                type: boolean
+                default: false
     release:
         types:
             - published
@@ -115,8 +126,9 @@ jobs:
             - uses: pypa/gh-action-pypi-publish@release/v1
               if: ${{
                   github.repository_owner == 'mahmoudimus' &&
-                  github.event_name == 'release' &&
-                  github.event.action == 'published'
+                  (inputs.publish == true ||
+                  (github.event_name == 'release' &&
+                  github.event.action == 'published'))
                   }}
               # See https://docs.pypi.org/trusted-publishers/using-a-publisher/
               with:

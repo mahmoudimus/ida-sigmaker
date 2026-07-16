@@ -1,3 +1,4 @@
+import json
 import pathlib
 import re
 import unittest
@@ -9,6 +10,18 @@ except ImportError:  # Python 3.10
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+HCLI_SCHEMA = "https://hcli.docs.hex-rays.com/schemas/ida-plugin.json"
+HCLI_VERSION = "0.18.5"
+REPOSITORY_URL = "https://github.com/mahmoudimus/ida-sigmaker"
+SUPPORTED_IDA_VERSIONS = [
+    "9.0",
+    "9.0sp1",
+    "9.1",
+    "9.2",
+    "9.3",
+    "9.4",
+    "10.0",
+]
 
 
 class TestWheelBuildConfiguration(unittest.TestCase):
@@ -25,3 +38,78 @@ class TestWheelBuildConfiguration(unittest.TestCase):
     def test_project_advertises_python_314(self):
         project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
         self.assertIn("Programming Language :: Python :: 3.14", project["classifiers"])
+
+
+class TestHCLIPackaging(unittest.TestCase):
+    def setUp(self):
+        self.manifest = json.loads((ROOT / "ida-plugin.json").read_text())
+        self.plugin = self.manifest["plugin"]
+
+    def test_manifest_has_hcli_metadata(self):
+        self.assertEqual(self.manifest["$schema"], HCLI_SCHEMA)
+        self.assertEqual(
+            self.plugin["entryPoint"], "src/sigmaker/__init__.py"
+        )
+        self.assertTrue((ROOT / self.plugin["entryPoint"]).is_file())
+        self.assertEqual(self.plugin["urls"]["repository"], REPOSITORY_URL)
+        self.assertTrue(self.plugin["authors"])
+        self.assertTrue(self.plugin["authors"][0]["email"])
+        self.assertEqual(self.plugin["license"], "MIT")
+        self.assertTrue(self.plugin["keywords"])
+        self.assertEqual(self.plugin["idaVersions"], SUPPORTED_IDA_VERSIONS)
+
+    def test_hcli_installs_the_matching_speedup_wheel(self):
+        self.assertEqual(
+            self.plugin["pythonDependencies"],
+            [f"sigmaker=={self.plugin['version']}"],
+        )
+
+    def test_direct_install_remains_dependency_free(self):
+        project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
+        self.assertEqual(project["dependencies"], [])
+
+    def test_automatic_deployments_require_a_published_release(self):
+        release_workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        deploy_workflow = (ROOT / ".github/workflows/deploy.yml").read_text()
+
+        self.assertNotIn("workflow_run:", release_workflow)
+        self.assertNotIn("workflow_run:", deploy_workflow)
+        self.assertRegex(deploy_workflow, r"release:\s+types:\s+- published")
+        self.assertIn("workflow_dispatch:", deploy_workflow)
+
+    def test_ci_lints_the_plugin_with_pinned_hcli_inputs(self):
+        workflow = (ROOT / ".github/workflows/python.yml").read_text()
+        self.assertIn(
+            f"HexRaysSA/ida-hcli/releases/download/v{HCLI_VERSION}/"
+            f"hcli-linux-x86_64-{HCLI_VERSION}",
+            workflow,
+        )
+        self.assertIn(
+            "b35eb351ce9e706709212604f937118643eee861bf4411bc4cac94217245b277",
+            workflow,
+        )
+        self.assertIn(
+            "3cee9691f72459c5ac75b028c827016e93e58923/plugin-repository.json",
+            workflow,
+        )
+        self.assertIn(
+            "plugin --repo /tmp/plugin-repository-v1.json lint .", workflow
+        )
+
+    def test_version_sync_updates_the_hcli_dependency(self):
+        from tools import sync_plugin_version
+
+        manifest = json.dumps(
+            {
+                "plugin": {
+                    "version": "1.0.0",
+                    "pythonDependencies": ["sigmaker==1.0.0"],
+                }
+            }
+        )
+        updated = json.loads(sync_plugin_version.sync_manifest(manifest, "2.0.0"))
+
+        self.assertEqual(updated["plugin"]["version"], "2.0.0")
+        self.assertEqual(
+            updated["plugin"]["pythonDependencies"], ["sigmaker==2.0.0"]
+        )

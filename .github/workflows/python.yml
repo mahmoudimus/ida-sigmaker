@@ -19,6 +19,27 @@ concurrency:
     cancel-in-progress: true
 
 jobs:
+    hcli-lint:
+        runs-on: ubuntu-24.04
+        steps:
+            - name: Checkout plugin source
+              uses: actions/checkout@v5
+              with:
+                  persist-credentials: false
+
+            - name: Validate HCLI plugin archive
+              run: |
+                  curl -LsSf --retry 3 \
+                    https://github.com/HexRaysSA/ida-hcli/releases/download/v0.18.5/hcli-linux-x86_64-0.18.5 \
+                    -o /tmp/hcli
+                  echo "b35eb351ce9e706709212604f937118643eee861bf4411bc4cac94217245b277  /tmp/hcli" \
+                    | sha256sum --check
+                  chmod 0755 /tmp/hcli
+                  curl -LsSf --retry 3 \
+                    https://raw.githubusercontent.com/HexRaysSA/plugin-repository/3cee9691f72459c5ac75b028c827016e93e58923/plugin-repository.json \
+                    -o /tmp/plugin-repository-v1.json
+                  /tmp/hcli plugin --repo /tmp/plugin-repository-v1.json lint .
+
     unit-tests:
         runs-on: ubuntu-24.04
         strategy:
@@ -98,6 +119,7 @@ jobs:
                     https://api.github.com/users/mahmoudimus/packages/container/idapro-linux/versions | \
                     jq -r ".[]|select(.metadata.container.tags[]==\"${TAG}\")|.name")
                   echo "SHA_NAME: ${SHA_NAME}"
+                  # shellcheck disable=SC2046,SC2086
                   docker save $(docker images --format '{{.Repository}}')@${SHA_NAME} -o /tmp/docker-cache/${{ matrix.service }}.tar || echo "Failed to save image."
                   # Only save the image if it was not restored from cache
                   # The cache will be updated for future runs

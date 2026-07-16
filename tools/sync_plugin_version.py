@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Keep ``ida-plugin.json``'s version in sync with ``sigmaker.__version__``.
+"""Keep HCLI's manifest version fields in sync with ``sigmaker.__version__``.
 
 The single source of truth for the version is ``__version__`` in
 ``src/sigmaker/__init__.py`` (``pyproject.toml`` already derives the package
-version from it). The IDA Plugin Repository and ``hcli`` read the version out
-of ``ida-plugin.json``, so the two must agree. This script copies the package
-version into the manifest.
+version from it). The IDA Plugin Repository and ``hcli`` read the version and
+the exact PyPI dependency out of ``ida-plugin.json``, so both must agree. This
+script updates them together.
 
 It reads ``__version__`` by parsing the source with ``ast`` rather than
 importing the module, because importing ``sigmaker`` pulls in ``idaapi``,
-which only exists inside IDA. The manifest is rewritten with a targeted
-substitution so the rest of its formatting is left untouched.
+which only exists inside IDA. The manifest is parsed and written as JSON so
+the two related fields cannot drift independently.
 
 Usage:
     python tools/sync_plugin_version.py            # write the manifest in place
@@ -23,7 +23,6 @@ import argparse
 import ast
 import json
 import pathlib
-import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -46,6 +45,15 @@ def manifest_version(text: str) -> str:
     return json.loads(text)["plugin"]["version"]
 
 
+def sync_manifest(text: str, version: str) -> str:
+    """Return manifest JSON with all package-version references updated."""
+    manifest = json.loads(text)
+    plugin = manifest["plugin"]
+    plugin["version"] = version
+    plugin["pythonDependencies"] = [f"sigmaker=={version}"]
+    return json.dumps(manifest, indent=4) + "\n"
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -57,27 +65,30 @@ def main(argv=None) -> int:
 
     version = package_version()
     text = MANIFEST.read_text(encoding="utf-8")
-    current = manifest_version(text)
+    manifest = json.loads(text)
+    current = manifest["plugin"]["version"]
+    dependencies = manifest["plugin"].get("pythonDependencies")
+    expected_dependencies = [f"sigmaker=={version}"]
 
-    if current == version:
+    if current == version and dependencies == expected_dependencies:
         return 0
 
     if args.check:
         print(
-            f"ida-plugin.json version {current!r} != sigmaker.__version__ "
-            f"{version!r}; run: python tools/sync_plugin_version.py",
+            "ida-plugin.json package references are out of sync: "
+            f"version={current!r}, pythonDependencies={dependencies!r}, "
+            f"expected version={version!r} and dependencies="
+            f"{expected_dependencies!r}; run: python "
+            "tools/sync_plugin_version.py",
             file=sys.stderr,
         )
         return 1
 
-    # Replace only the version string, so the manifest's formatting is preserved.
-    new_text, n = re.subn(
-        r'("version"\s*:\s*")[^"]*(")', r"\g<1>" + version + r"\g<2>", text, count=1
+    MANIFEST.write_text(sync_manifest(text, version), encoding="utf-8")
+    print(
+        "synced ida-plugin.json package references "
+        f"from version {current} to {version}"
     )
-    if n != 1:
-        raise SystemExit("could not locate the version field in ida-plugin.json")
-    MANIFEST.write_text(new_text, encoding="utf-8")
-    print(f"synced ida-plugin.json version {current} -> {version}")
     return 0
 
 

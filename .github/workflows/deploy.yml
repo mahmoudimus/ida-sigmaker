@@ -5,10 +5,6 @@ on:
     release:
         types:
             - published
-    workflow_run:
-        workflows: ["Release"]
-        types:
-            - completed
 
 # make concurrency tag-aware so one run doesn't cancel the other incorrectly
 concurrency:
@@ -61,14 +57,12 @@ jobs:
         steps:
             - uses: actions/checkout@v5
 
-            - &display-version
-              name: Display version
+            - name: Display version
               run: |
                   python --version
                   pip --version
 
-            - &install-build-twine
-              name: Install pypa/build pypa/twine
+            - name: Install pypa/build pypa/twine
               run: |
                   pip install --upgrade pip
                   pip install --upgrade setuptools==77.0.1
@@ -78,19 +72,16 @@ jobs:
                   echo "Installed versions:"
                   pip list | grep -E "(twine|packaging|setuptools|build)"
 
-            - &build-sdist
-              name: Build sdist
+            - name: Build sdist
               run: |
                   rm -rf dist/*
                   python -m build --sdist
 
-            - &display-content-dist-folder
-              name: Display content dist folder
+            - name: Display content dist folder
               run: |
                   ls -shR dist/
 
-            - &run-twine-check
-              name: Run twin check
+            - name: Run twin check
               run: |
                   twine check dist/*
 
@@ -123,9 +114,9 @@ jobs:
 
             - uses: pypa/gh-action-pypi-publish@release/v1
               if: ${{
-                  github.repository_owner == 'mahmoudimus' && (
-                  (github.event_name == 'release' && github.event.action == 'published') ||
-                  (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success'))
+                  github.repository_owner == 'mahmoudimus' &&
+                  github.event_name == 'release' &&
+                  github.event.action == 'published'
                   }}
               # See https://docs.pypi.org/trusted-publishers/using-a-publisher/
               with:

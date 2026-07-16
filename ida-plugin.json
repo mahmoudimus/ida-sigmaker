@@ -1,16 +1,45 @@
 {
+    "$schema": "https://hcli.docs.hex-rays.com/schemas/ida-plugin.json",
     "IDAMetadataDescriptorVersion": 1,
     "plugin": {
         "name": "SigMaker",
         "entryPoint": "src/sigmaker/__init__.py",
+        "version": "1.12.0",
+        "idaVersions": [
+            "9.0",
+            "9.0sp1",
+            "9.1",
+            "9.2",
+            "9.3",
+            "9.4",
+            "10.0"
+        ],
+        "description": "Create and search resilient byte signatures for functions and addresses in IDA Pro.",
         "categories": [
             "collaboration-and-productivity",
             "decompilation",
             "debugging-and-tracing"
         ],
+        "keywords": [
+            "binary-patterns",
+            "function-identification",
+            "signature-generation",
+            "signature-search"
+        ],
+        "license": "MIT",
         "logoPath": "assets/sigmaker-logo.png",
-        "idaVersions": ">=9.0",
-        "description": "SigMaker is a cross-platform signature maker plugin that works on MacOS/Linux/Windows. The primary goal of this plugin is to work with future versions of IDA without needing to compile against the IDA SDK as well as to allow for easier community contributions",
-        "version": "1.12.0"
+        "pythonDependencies": [
+            "sigmaker==1.12.0"
+        ],
+        "urls": {
+            "repository": "https://github.com/mahmoudimus/ida-sigmaker",
+            "homepage": "https://mahmoudimus.com"
+        },
+        "authors": [
+            {
+                "name": "Mahmoud Abdelkader",
+                "email": "m{_no-spam_}@mahmoudimus.com"
+            }
+        ]
     }
 }

@@ -23,6 +23,7 @@ All notable user-visible changes to this plugin are documented here. The format 
 - **Batch search now honors segment scope and cancellation.** A scoped batch uses the same containing-segment policy as ordinary search. Canceling an IDA or SIMD batch scan raises `UserCanceledError` instead of returning partial hits as a successful result; existing direct `find_all()` callers retain their partial-result behavior.
 - **Embedded search no longer depends on IDA's GUI event loop.** `SignatureSearcher` and batch search automatically retain IDA wait-box progress and cancellation when `idaapi.is_idaq()` reports the graphical host, while idalib and hosts without that API use headless services. The interactive plugin installs IDA services explicitly while handling an action, and embedders can inject their own context-local services with `UIServices.use(...)`.
 - **Native search rejects non-advancing backend results.** If IDA or a test double returns the same or an earlier address repeatedly, search now raises instead of appending matches without bound.
+- **SIMD search no longer matches across address gaps.** Direct and batch search, ordinary uniqueness checks, and shortest-function signature generation reject synthetic matches across non-contiguous IDA segments. Adjacent segments remain one searchable range when their buffer offsets and IDA addresses are both contiguous.
 
 ### Documentation
 

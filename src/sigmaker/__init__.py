@@ -581,18 +581,41 @@ class InMemoryBuffer:
         self,
         scope: typing.Optional[tuple[int, int]] = None,
     ) -> typing.Iterator[tuple[int, int]]:
-        """Yield contiguous buffer ranges, optionally clipped to an EA scope."""
+        """Yield ranges contiguous in both buffer offsets and IDA addresses."""
         segments = self._segments or (
             (0, self.imagebase, len(self._buffer)),
         )
+        pending_start: typing.Optional[int] = None
+        pending_end = 0
+        pending_ea_end = 0
         for offset, segment_ea, size in segments:
-            if scope is None:
-                yield offset, offset + size
+            start_ea = segment_ea
+            end_ea = segment_ea + size
+            if scope is not None:
+                start_ea = max(start_ea, scope[0])
+                end_ea = min(end_ea, scope[1])
+                if start_ea >= end_ea:
+                    continue
+
+            start = offset + start_ea - segment_ea
+            end = offset + end_ea - segment_ea
+            if (
+                pending_start is not None
+                and pending_end == start
+                and pending_ea_end == start_ea
+            ):
+                pending_end = end
+                pending_ea_end = end_ea
                 continue
-            start_ea = max(segment_ea, scope[0])
-            end_ea = min(segment_ea + size, scope[1])
-            if start_ea < end_ea:
-                yield offset + start_ea - segment_ea, offset + end_ea - segment_ea
+
+            if pending_start is not None:
+                yield pending_start, pending_end
+            pending_start = start
+            pending_end = end
+            pending_ea_end = end_ea
+
+        if pending_start is not None:
+            yield pending_start, pending_end
 
     def _load_single_segment(self, ea: int):
         """Load only the segment containing ``ea`` (issue #64), recording it in
@@ -1699,8 +1722,12 @@ class UniqueSignatureGenerator:
         # then refine that set in memory as the pattern grows instead of
         # re-scanning per appended instruction. offsets is None until the
         # first scan; buf holds the segment buffer the offsets index into.
-        offsets: typing.Optional[list[int]] = None
+        offsets: typing.Optional["array.array"] = None
+        offset_count = 0
         buf: typing.Optional["InMemoryBuffer"] = None
+        search_ranges: typing.Optional[
+            tuple["array.array", "array.array"]
+        ] = None
         if cfg.scope_to_segment:
             # Issue #64: scope uniqueness to the anchor's segment. Pre-load it so
             # the seed scan and every refinement stay within the segment.
@@ -1774,19 +1801,31 @@ class UniqueSignatureGenerator:
                 elif offsets is None:
                     # Seed once: scan the whole database, keep every match
                     # offset. The candidate count is the exact match count.
-                    offsets, buf = SignatureSearcher.find_all_offsets(
+                    found_offsets, buf = SignatureSearcher.find_all_offsets(
                         f"{sig:ida}", buf=buf
                     )
-                    count = len(offsets)
+                    offsets = array.array("Q", found_offsets)
+                    offset_count = len(offsets)
+                    count = offset_count
+                    if search_ranges is None:
+                        search_ranges = _buffer_search_range_arrays(
+                            buf, len(buf.data())
+                        )
                 else:
                     # Refine the surviving candidates in memory for each byte
                     # appended this iteration; no rescan of the database.
                     data_mv = buf.data()
-                    for j in range(prev_len, len(sig)):
-                        sb = sig[j]
-                        mask = 0x00 if sb.is_wildcard else 0xFF
-                        offsets = _refine_offsets(data_mv, offsets, j, sb.value, mask)
-                    count = len(offsets)
+                    if search_ranges is None:
+                        raise RuntimeError("search ranges are unavailable")
+                    offset_count = _refine_candidate_offsets(
+                        data_mv,
+                        offsets,
+                        offset_count,
+                        sig,
+                        prev_len,
+                        search_ranges,
+                    )
+                    count = offset_count
                 # find_all_offsets polls idaapi_user_canceled inside its scan
                 # loop and bails when set, returning whatever partial offsets
                 # it had so far (often 0). When the call was interrupted, keep
@@ -1797,31 +1836,18 @@ class UniqueSignatureGenerator:
                 if not idaapi_user_canceled():
                     progress.last_match_count = count
                     if count == 1:
-                        sig.trim_signature()
-                        return GeneratedSignature(sig, Match(ea))
+                        result_signature = _validated_trimmed_signature(
+                            sig,
+                            buf,
+                            search_ranges=search_ranges,
+                        )
+                        if result_signature is None:
+                            continue
+                        return GeneratedSignature(result_signature, Match(ea))
 
         if cancel.partial is not None:
             return cancel.partial
         raise Unexpected("Signature not unique (reached end of analysis)")
-
-
-def _refine_offsets(
-    data_mv: memoryview,
-    offsets: list[int],
-    j: int,
-    value: int,
-    mask: int,
-) -> list[int]:
-    """Keep offsets c where (data_mv[c + j] & mask) == (value & mask).
-
-    j is the pattern-relative index of the byte being checked; c is a match
-    start offset into data_mv. Candidates whose c + j runs past the buffer
-    cannot match and are dropped. Used to refine a shrinking candidate set
-    as a signature grows, instead of re-scanning the whole database.
-    """
-    n = len(data_mv)
-    target = value & mask
-    return [c for c in offsets if c + j < n and (data_mv[c + j] & mask) == target]
 
 
 def _refine_offsets_into(
@@ -1832,10 +1858,11 @@ def _refine_offsets_into(
     value: int,
     mask: int,
 ) -> int:
-    """Refine the first ``count`` entries of the uint32 array ``cands`` in
-    place (Cython when available), returning the new count. The function-sig
+    """Refine the first ``count`` unsigned candidates in place.
+
+    Uses Cython when available and returns the new count. The function-sig
     path only reaches this on the SIMD path; the Python branch is a defensive
-    fallback that mirrors _refine_offsets.
+    fallback with identical in-place semantics.
     """
     if SIMD_SPEEDUP_AVAILABLE:
         return simd_scan.refine_offsets(data_mv, cands, count, j, value, mask)
@@ -1848,6 +1875,96 @@ def _refine_offsets_into(
             cands[w] = cands[r]
             w += 1
     return w
+
+
+def _buffer_search_range_arrays(
+    buf: "InMemoryBuffer",
+    buffer_size: int,
+) -> tuple["array.array", "array.array"]:
+    """Materialize the buffer's contiguous search ranges for hot loops."""
+    ranges = (
+        tuple(buf._search_ranges())
+        if isinstance(buf, InMemoryBuffer)
+        else ((0, buffer_size),)
+    )
+    return (
+        array.array("Q", (start for start, _end in ranges)),
+        array.array("Q", (end for _start, end in ranges)),
+    )
+
+
+def _filter_offsets_into_search_ranges(
+    cands: "array.array",
+    count: int,
+    pattern_size: int,
+    range_starts: typing.Sequence[int],
+    range_ends: typing.Sequence[int],
+) -> int:
+    """Compact sorted candidates whose full pattern fits one search range."""
+    if SIMD_SPEEDUP_AVAILABLE:
+        return simd_scan.filter_offsets_by_search_ranges(
+            cands,
+            count,
+            pattern_size,
+            range_starts,
+            range_ends,
+        )
+
+    if count < 0 or count > len(cands):
+        raise ValueError("count is outside the candidate array")
+    if pattern_size <= 0:
+        raise ValueError("pattern_size must be positive")
+    if not range_starts or len(range_starts) != len(range_ends):
+        raise ValueError("search ranges must be non-empty pairs")
+    previous_end: typing.Optional[int] = None
+    for start, end in zip(range_starts, range_ends):
+        if start > end or (previous_end is not None and start < previous_end):
+            raise ValueError("search ranges must be ordered and non-overlapping")
+        previous_end = end
+
+    range_index = 0
+    write_index = 0
+    for read_index in range(count):
+        start = cands[read_index]
+        while range_index < len(range_ends) and start >= range_ends[range_index]:
+            range_index += 1
+        if range_index == len(range_ends):
+            break
+        if (
+            start >= range_starts[range_index]
+            and start + pattern_size <= range_ends[range_index]
+        ):
+            cands[write_index] = start
+            write_index += 1
+    return write_index
+
+
+def _refine_candidate_offsets(
+    data_mv: memoryview,
+    candidates: "array.array",
+    count: int,
+    signature: Signature,
+    start_index: int,
+    search_ranges: tuple[typing.Sequence[int], typing.Sequence[int]],
+) -> int:
+    """Refine and range-compact one persistent candidate array."""
+    for index in range(start_index, len(signature)):
+        signature_byte = signature[index]
+        mask = 0x00 if signature_byte.is_wildcard else 0xFF
+        count = _refine_offsets_into(
+            data_mv,
+            candidates,
+            count,
+            index,
+            signature_byte.value,
+            mask,
+        )
+    return _filter_offsets_into_search_ranges(
+        candidates,
+        count,
+        len(signature),
+        *search_ranges,
+    )
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1923,6 +2040,9 @@ def _seed_via_index(
     sig: "Signature",
     index: typing.Optional["_ByteIndex"],
     buf: "InMemoryBuffer",
+    search_ranges: typing.Optional[
+        tuple[typing.Sequence[int], typing.Sequence[int]]
+    ] = None,
 ) -> typing.Optional[tuple["array.array", int]]:
     """Seed the candidate set from the byte index instead of scanning.
 
@@ -1975,7 +2095,50 @@ def _seed_via_index(
         if sb.is_wildcard:
             continue
         count = _refine_offsets_into(data_mv, cands, count, j, sb.value, 0xFF)
+    if search_ranges is None:
+        search_ranges = _buffer_search_range_arrays(buf, n)
+    count = _filter_offsets_into_search_ranges(
+        cands,
+        count,
+        m,
+        *search_ranges,
+    )
     return cands, count
+
+
+def _validated_trimmed_signature(
+    signature: Signature,
+    buf: typing.Optional["InMemoryBuffer"],
+    *,
+    index: typing.Optional["_ByteIndex"] = None,
+    search_ranges: typing.Optional[
+        tuple[typing.Sequence[int], typing.Sequence[int]]
+    ] = None,
+) -> typing.Optional[Signature]:
+    """Return a unique trimmed form, reusing unchanged signatures."""
+    trim_at = len(signature)
+    while trim_at > 0 and signature[trim_at - 1].is_wildcard:
+        trim_at -= 1
+    if trim_at == len(signature):
+        return signature
+    if trim_at == 0:
+        return None
+
+    trimmed = Signature(signature)
+    del trimmed[trim_at:]
+    if index is not None and buf is not None:
+        seeded = _seed_via_index(
+            trimmed,
+            index,
+            buf,
+            search_ranges=search_ranges,
+        )
+        if seeded is not None:
+            _offsets, count = seeded
+            return trimmed if count == 1 else None
+    if SignatureSearcher.is_unique(f"{trimmed:ida}", buf=buf):
+        return trimmed
+    return None
 
 
 def _decode_function_for_anchors(
@@ -2085,6 +2248,9 @@ class MinimalFunctionSignatureGenerator:
         # 84% of generate() wall time when called per-is_unique.
         buf: typing.Optional["InMemoryBuffer"] = None
         index: typing.Optional["_ByteIndex"] = None
+        search_ranges: typing.Optional[
+            tuple["array.array", "array.array"]
+        ] = None
         if SIMD_SPEEDUP_AVAILABLE:
             with ProgressDialog("Please stand by, copying segments..."):
                 buf = InMemoryBuffer.load(
@@ -2093,7 +2259,9 @@ class MinimalFunctionSignatureGenerator:
                 )
             # Build the 2-byte position index once for the whole search so each
             # anchor seeds with an O(1) lookup instead of a full-buffer scan.
-            index = _ByteIndex.build(buf.data())
+            data_mv = buf.data()
+            index = _ByteIndex.build(data_mv)
+            search_ranges = _buffer_search_range_arrays(buf, len(data_mv))
 
         # Iterate the pre-decoded anchors inside a ProgressBox so the wait
         # box shows live progress (issue #27). enumerate() keeps the index
@@ -2127,7 +2295,10 @@ class MinimalFunctionSignatureGenerator:
 
             sig = self._grow_unique_from_decoded(
                 decoded, anchor_idx, progress.best_size, cfg,
-                buf=buf, progress=progress, index=index,
+                buf=buf,
+                progress=progress,
+                index=index,
+                search_ranges=search_ranges,
             )
             if sig is None:
                 continue
@@ -2157,6 +2328,9 @@ class MinimalFunctionSignatureGenerator:
         buf: typing.Optional["InMemoryBuffer"] = None,
         progress: typing.Optional["_FunctionSigProgress"] = None,
         index: typing.Optional["_ByteIndex"] = None,
+        search_ranges: typing.Optional[
+            tuple[typing.Sequence[int], typing.Sequence[int]]
+        ] = None,
     ) -> typing.Optional[Signature]:
         """Grow a signature from ``decoded[anchor_idx]`` forward until unique.
 
@@ -2173,11 +2347,15 @@ class MinimalFunctionSignatureGenerator:
         fields for the live wait-box display.
         """
         sig = Signature()
-        # SIMD seed-then-refine state: candidates as a uint32 array.array plus a
-        # live count, refined in place by the Cython refine_offsets.
+        # SIMD seed-then-refine state: an unsigned candidate array plus a live
+        # count, refined in place by the Cython refine_offsets.
         offsets: typing.Optional["array.array"] = None
         ocount = 0
         seed_buf = buf
+        if search_ranges is None and seed_buf is not None:
+            search_ranges = _buffer_search_range_arrays(
+                seed_buf, len(seed_buf.data())
+            )
         min_useful = self.MIN_USEFUL_SIG_BYTES
         for i in range(anchor_idx, len(decoded)):
             if (
@@ -2209,8 +2387,14 @@ class MinimalFunctionSignatureGenerator:
                     progress.inner_length = len(sig)
                     progress.inner_matches = None
                 if SignatureSearcher.is_unique(f"{sig:ida}", buf=buf):
-                    sig.trim_signature()
-                    return sig
+                    result_signature = _validated_trimmed_signature(
+                        sig,
+                        seed_buf,
+                        index=index,
+                        search_ranges=search_ranges,
+                    )
+                    if result_signature is not None:
+                        return result_signature
                 continue
 
             if not SIMD_SPEEDUP_AVAILABLE or seed_buf is None:
@@ -2219,7 +2403,12 @@ class MinimalFunctionSignatureGenerator:
                 count = SignatureSearcher.count_matches(f"{sig:ida}", buf=buf)
             elif offsets is None:
                 # Seed once. Prefer the byte index (Dynamic Seed Selection).
-                seeded = _seed_via_index(sig, index, seed_buf)
+                seeded = _seed_via_index(
+                    sig,
+                    index,
+                    seed_buf,
+                    search_ranges=search_ranges,
+                )
                 if seeded is not None:
                     offsets, ocount = seeded
                     count = ocount
@@ -2246,20 +2435,30 @@ class MinimalFunctionSignatureGenerator:
                 # Refine the surviving candidates in place for each byte
                 # appended this iteration; no rescan of the database.
                 data_mv = seed_buf.data()
-                for j in range(prev_len, len(sig)):
-                    sb = sig[j]
-                    mask = 0x00 if sb.is_wildcard else 0xFF
-                    ocount = _refine_offsets_into(
-                        data_mv, offsets, ocount, j, sb.value, mask
-                    )
+                if search_ranges is None:
+                    raise RuntimeError("search ranges are unavailable")
+                ocount = _refine_candidate_offsets(
+                    data_mv,
+                    offsets,
+                    ocount,
+                    sig,
+                    prev_len,
+                    search_ranges,
+                )
                 count = ocount
 
             if progress is not None:
                 progress.inner_length = len(sig)
                 progress.inner_matches = count
             if count == 1:
-                sig.trim_signature()
-                return sig
+                result_signature = _validated_trimmed_signature(
+                    sig,
+                    seed_buf,
+                    index=index,
+                    search_ranges=search_ranges,
+                )
+                if result_signature is not None:
+                    return result_signature
 
         return None
 
@@ -3430,9 +3629,8 @@ class SignatureSearcher:
         )
 
         sig = _SimdSignature(simd_signature)
-        results: list[Match] = []
         base = idaapi.inf_get_min_ea()
-        if (k := sig.size_bytes) == 0:
+        if sig.size_bytes == 0:
             return [
                 Match(
                     base,
@@ -3440,41 +3638,79 @@ class SignatureSearcher:
                 )
             ]
 
-        n = len(data_mv)
-        off = 0
-        # Matches arrive in ascending offset order, so map each offset to its
-        # real address with a forward cursor (amortized O(1) per match); see
-        # InMemoryBuffer.offset_mapper.
-        to_addr = buf.offset_mapper()
-        # Poll cancellation every _CANCEL_POLL_STRIDE matches (see
-        # find_all_offsets) so per-match user_cancelled() overhead does not
-        # dominate a scan over a short, common pattern.
+        return typing.cast(
+            list[Match],
+            SignatureSearcher._scan_simd_ranges(
+                sig,
+                buf,
+                offsets_only=False,
+                imagebase=imagebase,
+                skip_more_than_one=skip_more_than_one,
+                raise_on_cancel=raise_on_cancel,
+            ),
+        )
+
+    @staticmethod
+    def _scan_simd_ranges(
+        sig: "_SimdSignature",
+        buf: "InMemoryBuffer",
+        *,
+        offsets_only: bool,
+        imagebase: typing.Optional[int] = None,
+        skip_more_than_one: bool = False,
+        raise_on_cancel: bool = False,
+    ) -> typing.Union[list[Match], list[int]]:
+        """Scan contiguous ranges into either offsets or address matches."""
+        data_mv = buf.data()
+        ranges = (
+            buf._search_ranges()
+            if isinstance(buf, InMemoryBuffer)
+            else ((0, len(data_mv)),)
+        )
+        offsets: list[int] = []
+        matches: list[Match] = []
+        to_addr = None if offsets_only else buf.offset_mapper()
+        pattern_size = sig.size_bytes
+        scan_bytes = _simd_scan_bytes
+        append_offset = offsets.append
+        append_match = matches.append
         since_poll = 0
         cancel_requested = UIServices.current().cancel_requested
-        while off <= n - k:
-            since_poll += 1
-            if since_poll >= _CANCEL_POLL_STRIDE:
-                since_poll = 0
-                if cancel_requested():
-                    LOGGER.info("Search canceled by user")
-                    if raise_on_cancel:
-                        raise UserCanceledError("Search canceled by user")
-                    break
+        for range_start, range_end in ranges:
+            off = range_start
+            while off <= range_end - pattern_size:
+                since_poll += 1
+                if since_poll >= _CANCEL_POLL_STRIDE:
+                    since_poll = 0
+                    if cancel_requested():
+                        if not offsets_only:
+                            LOGGER.info("Search canceled by user")
+                        if raise_on_cancel:
+                            raise UserCanceledError("Search canceled by user")
+                        return offsets if offsets_only else matches
 
-            idx = _simd_scan_bytes(data_mv[off:], sig)
-            if idx < 0:
-                break
-            address = to_addr(off + idx)
-            results.append(
-                Match(
-                    address,
-                    rva=None if imagebase is None else address - imagebase,
-                )
-            )
-            if skip_more_than_one and len(results) > 1:
-                break
-            off += idx + 1
-        return results
+                idx = scan_bytes(data_mv[off:range_end], sig)
+                if idx < 0:
+                    break
+                off += idx
+                if offsets_only:
+                    append_offset(off)
+                else:
+                    address = to_addr(off)
+                    append_match(
+                        Match(
+                            address,
+                            rva=(
+                                None
+                                if imagebase is None
+                                else address - imagebase
+                            ),
+                        )
+                    )
+                    if skip_more_than_one and len(matches) > 1:
+                        return matches
+                off += 1
+        return offsets if offsets_only else matches
 
     @staticmethod
     def find_all_offsets(
@@ -3489,31 +3725,19 @@ class SignatureSearcher:
         simd_signature, _ = SigText.normalize(ida_signature)
         if buf is None:
             buf = _load_search_buffer()
-        data_mv = buf.data()
         sig = _SimdSignature(simd_signature)
         offsets: list[int] = []
         k = sig.size_bytes
         if k == 0:
             return [0], buf
-        n = len(data_mv)
-        off = 0
-        # Poll cancellation every _CANCEL_POLL_STRIDE matches rather than on
-        # every match: idaapi.user_cancelled() costs ~0.5us per call and a
-        # short, common seed can produce millions of matches, so per-match
-        # polling alone can dominate the scan (observed: 44s of a 76s seed).
-        since_poll = 0
-        cancel_requested = UIServices.current().cancel_requested
-        while off <= n - k:
-            since_poll += 1
-            if since_poll >= _CANCEL_POLL_STRIDE:
-                since_poll = 0
-                if cancel_requested():
-                    break
-            idx = _simd_scan_bytes(data_mv[off:], sig)
-            if idx < 0:
-                break
-            offsets.append(off + idx)
-            off += idx + 1
+        offsets = typing.cast(
+            list[int],
+            SignatureSearcher._scan_simd_ranges(
+                sig,
+                buf,
+                offsets_only=True,
+            ),
+        )
         return offsets, buf
 
     @staticmethod

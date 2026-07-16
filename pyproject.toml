@@ -26,6 +26,7 @@ classifiers = [
     "Intended Audience :: Developers",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Software Development :: Debuggers",
     "Topic :: Software Development :: Disassemblers",
     "Topic :: Software Development :: Libraries :: Python Modules",

@@ -4,6 +4,20 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-07-16
+
+### Added
+
+- **Python 3.14 wheels are included in the existing Linux, Windows, and macOS release matrix.** Installing from PyPI on CPython 3.14 receives the same optional native SIMD search speedups as other supported Python versions.
+- **SigMaker releases are installable through Hex-Rays HCLI.** The release source archive contains the HCLI manifest and plugin entry point, while HCLI installs the matching `sigmaker==1.13.0` wheel automatically so managed installations receive the SIMD extension without a separate `pip install`.
+
+### Fixed
+
+- **PyPI builds now run only for published releases.** Ordinary successful tests on `main` no longer launch an untagged wheel build, and the HCLI manifest version and exact PyPI dependency pin are synchronized from `sigmaker.__version__` during release preparation.
+
+[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.13.0...HEAD
+[1.13.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.12.0...v1.13.0
+
 ## [1.12.0] - 2026-07-16
 
 ### Added
@@ -31,7 +45,6 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 - README now documents the batch search workflow, accepted input forms, export formats, batch search API, and custom formatter registration. A C-style formatter example lives in `examples/batch_search_c_formatter.py`.
 
-[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.12.0...HEAD
 [1.12.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.11.0...v1.12.0
 
 ## [1.11.0] - 2026-07-05

@@ -1,7 +1,11 @@
 import pathlib
 import re
-import tomllib
 import unittest
+
+try:
+    import tomllib
+except ImportError:  # Python 3.10
+    import tomli as tomllib
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]

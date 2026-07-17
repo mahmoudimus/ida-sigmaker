@@ -4720,6 +4720,15 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
         self.assertTrue(sigmaker._Speedups.current().available)
         self.assertIs(sigmaker._Speedups.current().module, module)
 
+    def test_compatibility_exports_follow_configured_backend(self):
+        self.assertFalse(sigmaker.SIMD_SPEEDUP_AVAILABLE)
+
+        module = self._module()
+        self.assertTrue(sigmaker._Speedups.configure(module))
+
+        self.assertTrue(sigmaker.SIMD_SPEEDUP_AVAILABLE)
+        self.assertIs(sigmaker.simd_scan, module)
+
     def test_search_api_selects_speedups_implicitly(self):
         parameters = inspect.signature(
             sigmaker.SignatureSearcher.find_all_offsets

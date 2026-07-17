@@ -241,6 +241,16 @@ class _Speedups:
 _DEFAULT_SPEEDUPS = _Speedups()
 
 
+def __getattr__(name: str) -> object:
+    """Provide legacy optional-speedups exports without mutable globals."""
+    speedups = _Speedups.current()
+    if name == "SIMD_SPEEDUP_AVAILABLE":
+        return speedups.available
+    if name == "simd_scan" and speedups.module is not None:
+        return speedups.module
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 # Context-local state does not cross into a fresh threading.Thread. Its work
 # stays correct with Python fallbacks until the embedding code binds a snapshot.
 

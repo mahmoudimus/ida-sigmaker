@@ -127,8 +127,9 @@ problem, open an [issue](https://github.com/mahmoudimus/ida-sigmaker/issues)
 and include the path from the prompt.
 
 Library and headless users need no special setup. SigMaker never opens an IDA
-dialog outside the graphical plugin, and an unavailable speedup extension is
-logged then bypassed automatically.
+dialog outside the graphical plugin. An absent extension is bypassed silently;
+a discovered stale or incompatible extension is logged, then bypassed
+automatically.
 
 ### SIMD Enabled
 
@@ -637,6 +638,11 @@ checked before any change to the public surface:
       - `current()` returns the services active in the current context.
       - `use(services)` scopes services to one context and restores the
         previous value on exit.
+  - Optional SIMD compatibility
+    - `SIMD_SPEEDUP_AVAILABLE` reports whether the current context has a
+      validated native backend.
+    - `from sigmaker._speedups import simd_scan` remains available when the
+      matching optional speedups wheel is installed.
   - Batch search
     - `BatchSignatureSearcher`
       - Stable attributes: `input_text` and `searchers`.

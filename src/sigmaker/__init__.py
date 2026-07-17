@@ -2175,6 +2175,11 @@ def _refine_candidate_offsets(
     refine_offsets = (
         module.refine_offsets if module is not None else _refine_offsets_into
     )
+    filter_offsets = (
+        module.filter_offsets_by_search_ranges
+        if module is not None
+        else _filter_offsets_into_search_ranges
+    )
     for index in range(start_index, len(signature)):
         signature_byte = signature[index]
         mask = 0x00 if signature_byte.is_wildcard else 0xFF
@@ -2187,11 +2192,7 @@ def _refine_candidate_offsets(
             mask,
         )
 
-    if module is not None:
-        return module.filter_offsets_by_search_ranges(
-            candidates, count, len(signature), *search_ranges
-        )
-    return _filter_offsets_into_search_ranges(
+    return filter_offsets(
         candidates,
         count,
         len(signature),
@@ -2327,6 +2328,11 @@ def _seed_via_index(
     refine_offsets = (
         module.refine_offsets if module is not None else _refine_offsets_into
     )
+    filter_offsets = (
+        module.filter_offsets_by_search_ranges
+        if module is not None
+        else _filter_offsets_into_search_ranges
+    )
     for j in range(m):
         if j in seed_span:
             continue
@@ -2336,14 +2342,7 @@ def _seed_via_index(
         count = refine_offsets(data_mv, cands, count, j, sb.value, 0xFF)
     if search_ranges is None:
         search_ranges = _buffer_search_range_arrays(buf, n)
-    if module is not None:
-        count = module.filter_offsets_by_search_ranges(
-            cands, count, m, *search_ranges
-        )
-    else:
-        count = _filter_offsets_into_search_ranges(
-            cands, count, m, *search_ranges
-        )
+    count = filter_offsets(cands, count, m, *search_ranges)
     return cands, count
 
 

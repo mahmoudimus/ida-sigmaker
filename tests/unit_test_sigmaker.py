@@ -4716,7 +4716,7 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
     def test_compatible_extension_enables_simd(self):
         module = self._module()
 
-        self.assertTrue(sigmaker._configure_speedups(module))
+        self.assertTrue(sigmaker._Speedups.configure(module))
         self.assertTrue(sigmaker._Speedups.current().available)
         self.assertIs(sigmaker._Speedups.current().module, module)
 
@@ -4733,7 +4733,7 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
         buffer = MagicMock()
         buffer.data.return_value = memoryview(bytearray(b"\x90"))
 
-        self.assertTrue(sigmaker._configure_speedups(module))
+        self.assertTrue(sigmaker._Speedups.configure(module))
         offsets, returned = sigmaker.SignatureSearcher.find_all_offsets(
             "90", buf=buffer
         )
@@ -4746,28 +4746,28 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
         module = self._module()
         del module.SPEEDUPS_API_MIN
 
-        self.assertFalse(sigmaker._configure_speedups(module))
+        self.assertFalse(sigmaker._Speedups.configure(module))
         self.assertFalse(sigmaker._Speedups.current().available)
         self.assertIn("SPEEDUPS_API_MIN", sigmaker._Speedups.current().diagnostic)
 
     def test_unsupported_api_range_disables_simd(self):
         module = self._module(SPEEDUPS_API_MIN=2, SPEEDUPS_API_MAX=2)
 
-        self.assertFalse(sigmaker._configure_speedups(module))
+        self.assertFalse(sigmaker._Speedups.configure(module))
         self.assertFalse(sigmaker._Speedups.current().available)
         self.assertIn("out of date", sigmaker._Speedups.current().diagnostic)
 
     def test_non_callable_required_kernel_disables_simd(self):
         module = self._module(refine_offsets=None)
 
-        self.assertFalse(sigmaker._configure_speedups(module))
+        self.assertFalse(sigmaker._Speedups.configure(module))
         self.assertFalse(sigmaker._Speedups.current().available)
         self.assertIn("refine_offsets", sigmaker._Speedups.current().diagnostic)
 
     def test_missing_kernel_at_configuration_uses_python_refinement(self):
         module = self._module()
         del module.refine_offsets
-        self.assertFalse(sigmaker._configure_speedups(module))
+        self.assertFalse(sigmaker._Speedups.configure(module))
         candidates = array.array("Q", [0, 1, 2, 3])
 
         count = sigmaker._refine_offsets_into(
@@ -4788,7 +4788,7 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
             raise AttributeError("inside native refine_offsets")
 
         module = self._module(refine_offsets=raise_inside_native_call)
-        self.assertTrue(sigmaker._configure_speedups(module))
+        self.assertTrue(sigmaker._Speedups.configure(module))
         candidates = array.array("Q", [0])
 
         with self.assertRaisesRegex(AttributeError, "inside native refine_offsets"):
@@ -4806,7 +4806,7 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
     def test_generator_uses_python_fallback_after_stale_kernel_is_rejected(self):
         module = self._module()
         del module.refine_offsets
-        self.assertFalse(sigmaker._configure_speedups(module))
+        self.assertFalse(sigmaker._Speedups.configure(module))
         processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
         generator = sigmaker.UniqueSignatureGenerator(processor)
 
@@ -4885,7 +4885,7 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
             return_value=pathlib.Path("/ida/python/bin/python3"),
         ):
             self.assertFalse(
-                sigmaker._configure_speedups(
+                sigmaker._Speedups.configure(
                     self._module(SPEEDUPS_API_MIN=2, SPEEDUPS_API_MAX=2)
                 )
             )
@@ -4943,7 +4943,7 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
 
     def test_fresh_thread_uses_python_fallback_until_backend_is_bound(self):
         module = self._module()
-        self.assertTrue(sigmaker._configure_speedups(module))
+        self.assertTrue(sigmaker._Speedups.configure(module))
         parent_speedups = sigmaker._Speedups.current()
         observed: list[bool] = []
 

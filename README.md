@@ -639,8 +639,8 @@ checked before any change to the public surface:
       - `use(services)` scopes services to one context and restores the
         previous value on exit.
   - Optional SIMD compatibility
-    - `SIMD_SPEEDUP_AVAILABLE` reports whether the current context has a
-      validated native backend.
+    - `SIMD_SPEEDUP_AVAILABLE` reports whether a validated native backend was
+      loaded during import.
     - `from sigmaker._speedups import simd_scan` remains available when the
       matching optional speedups wheel is installed.
   - Batch search

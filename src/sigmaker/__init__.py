@@ -240,25 +240,15 @@ class _Speedups:
 
 _DEFAULT_SPEEDUPS = _Speedups()
 
-
-def __getattr__(name: str) -> object:
-    """Provide legacy optional-speedups exports without mutable globals."""
-    speedups = _Speedups.current()
-    if name == "SIMD_SPEEDUP_AVAILABLE":
-        return speedups.available
-    if name == "simd_scan" and speedups.module is not None:
-        return speedups.module
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-
-
 # Context-local state does not cross into a fresh threading.Thread. Its work
 # stays correct with Python fallbacks until the embedding code binds a snapshot.
 
 
+SIMD_SPEEDUP_AVAILABLE = False
 with contextlib.suppress(ImportError):
-    from sigmaker._speedups import simd_scan as _imported_simd_scan
+    from sigmaker._speedups import simd_scan
 
-    _Speedups.configure(_imported_simd_scan)
+    _Speedups.configure(simd_scan)
 
 
 def _load_speedups_sibling() -> bool:
@@ -275,6 +265,8 @@ def _load_speedups_sibling() -> bool:
     No-ops for the shipped single-file `sigmaker.py`, which has no sibling
     `_speedups/` directory and relies on the pip-installed extension.
     """
+    global simd_scan
+
     import importlib.machinery
     import importlib.util
 
@@ -294,13 +286,16 @@ def _load_speedups_sibling() -> bool:
             continue
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return _Speedups.configure(module)
+        simd_scan = module
+        return _Speedups.configure(simd_scan)
     return False
 
 
 if not _Speedups.current().available:
     with contextlib.suppress(Exception):
         _load_speedups_sibling()
+
+SIMD_SPEEDUP_AVAILABLE = _Speedups.current().available
 
 
 # How many matches a scan loop processes between cancellation polls.

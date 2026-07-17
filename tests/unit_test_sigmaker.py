@@ -4864,11 +4864,11 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
         )
 
         with patch.object(
-            sigmaker,
-            "_ida_python_interpreter",
+            sigmaker._Speedups,
+            "ida_python_interpreter",
             return_value=pathlib.Path("/ida/python/bin/python3"),
         ):
-            message = sigmaker._speedups_remediation_message()
+            message = sigmaker._Speedups.current().remediation_message()
 
         self.assertIn("hcli plugin upgrade SigMaker", message)
         self.assertIn('"/ida/python/bin/python3" -m pip install --upgrade "sigmaker==1.13.0"', message)
@@ -4880,8 +4880,8 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
         with patch.object(sigmaker, "LOGGER", logger), patch.object(
             logger, "warning"
         ) as warning, patch.object(
-            sigmaker,
-            "_ida_python_interpreter",
+            sigmaker._Speedups,
+            "ida_python_interpreter",
             return_value=pathlib.Path("/ida/python/bin/python3"),
         ):
             self.assertFalse(
@@ -4889,7 +4889,7 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
                     self._module(SPEEDUPS_API_MIN=2, SPEEDUPS_API_MAX=2)
                 )
             )
-            sigmaker._log_speedups_remediation()
+            sigmaker._Speedups.log_remediation()
 
         warning.assert_called_once()
         message = warning.call_args.args[1]
@@ -4908,7 +4908,7 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
             autospec=True,
             side_effect=lambda path: path == expected,
         ):
-            self.assertEqual(sigmaker._ida_python_interpreter(), expected)
+            self.assertEqual(sigmaker._Speedups.ida_python_interpreter(), expected)
 
     def test_speedups_remediation_never_opens_ui_headlessly(self):
         sigmaker._SPEEDUPS_CTX.set(
@@ -4921,7 +4921,7 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
         with patch.object(sigmaker, "_IDA_IS_IDAQ", return_value=False), patch.object(
             sigmaker, "_IDA_WARNING", warning
         ):
-            self.assertFalse(sigmaker._show_speedups_remediation())
+            self.assertFalse(sigmaker._Speedups.show_remediation())
 
         warning.assert_not_called()
 
@@ -4936,8 +4936,8 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
         with patch.object(sigmaker, "_IDA_IS_IDAQ", return_value=True), patch.object(
             sigmaker, "_IDA_WARNING", warning
         ):
-            self.assertTrue(sigmaker._show_speedups_remediation())
-            self.assertFalse(sigmaker._show_speedups_remediation())
+            self.assertTrue(sigmaker._Speedups.show_remediation())
+            self.assertFalse(sigmaker._Speedups.show_remediation())
 
         warning.assert_called_once()
 

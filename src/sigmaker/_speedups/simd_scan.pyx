@@ -10,6 +10,13 @@ import array as py_stdlib_arr_mod        # run-time: the Python array module (co
 from sigmaker._speedups.simd_scan cimport Signature, SimdLevel, simd_support_best_level
 
 
+# Inclusive protocol range supported by this compiled extension. Keep this
+# independent from package versions so a standalone plugin can validate the
+# exact module it loaded before calling any optional kernels.
+SPEEDUPS_API_MIN = 1
+SPEEDUPS_API_MAX = 1
+
+
 ctypedef fused candidate_offset_t:
     unsigned int
     unsigned long long

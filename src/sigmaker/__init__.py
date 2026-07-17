@@ -158,6 +158,13 @@ class _Speedups:
                 )
         return cls(module=module, path=path)
 
+    @classmethod
+    def configure(cls, module: object) -> bool:
+        """Validate and install the optional speedups extension."""
+        speedups = cls.from_module(module)
+        _SPEEDUPS_CTX.set(speedups)
+        return speedups.available
+
 
 _DEFAULT_SPEEDUPS = _Speedups()
 
@@ -166,17 +173,10 @@ _DEFAULT_SPEEDUPS = _Speedups()
 # stays correct with Python fallbacks until the embedding code binds a snapshot.
 
 
-def _configure_speedups(module: object) -> bool:
-    """Enable a structurally compatible optional speedups extension."""
-    speedups = _Speedups.from_module(module)
-    _SPEEDUPS_CTX.set(speedups)
-    return speedups.available
-
-
 with contextlib.suppress(ImportError):
     from sigmaker._speedups import simd_scan as _imported_simd_scan
 
-    _configure_speedups(_imported_simd_scan)
+    _Speedups.configure(_imported_simd_scan)
 
 
 def _load_speedups_sibling() -> bool:
@@ -212,7 +212,7 @@ def _load_speedups_sibling() -> bool:
             continue
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
-        return _configure_speedups(module)
+        return _Speedups.configure(module)
     return False
 
 

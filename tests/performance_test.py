@@ -28,17 +28,6 @@ with warnings.catch_warnings():
     import sigmaker  # noqa: E402
 
 
-def _speedups_module():
-    module = sigmaker._Speedups.current().module
-    if module is None:
-        raise RuntimeError("SIMD speedup not available")
-    return module
-
-
-def _speedups_available() -> bool:
-    return sigmaker._Speedups.current().available
-
-
 # Set up logging for tests
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -233,9 +222,8 @@ class TestBenchmarkPerformance(unittest.TestCase):
 
     def benchmark_simd_vs_python_scanning(self, iterations: int = 10) -> dict:
         """Benchmark SIMD-accelerated scanning vs regular Python scanning."""
-        if not _speedups_available():
+        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
             self.skipTest("SIMD speedup not available")
-        speedups = _speedups_module()
 
         # Create larger test data for meaningful comparison
         test_data = array.array("B", [0x48, 0x8B, 0xC4, 0x48, 0x89, 0x45] * 5000)
@@ -249,8 +237,8 @@ class TestBenchmarkPerformance(unittest.TestCase):
         for _ in range(iterations):
             start_time = time.perf_counter()
             for pattern in patterns:
-                sig = speedups.Signature(pattern)
-                speedups.scan_bytes(data_view, sig)
+                sig = sigmaker._SimdSignature(pattern)
+                sigmaker._simd_scan_bytes(data_view, sig)
             end_time = time.perf_counter()
             simd_times.append(end_time - start_time)
 
@@ -356,7 +344,7 @@ class TestBenchmarkPerformance(unittest.TestCase):
         """
         if not self.ida_available:
             self.skipTest("IDA Pro API not available for benchmarking")
-        if not _speedups_available():
+        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
             self.skipTest("SIMD speedup not available")
 
         func_qty = idaapi.get_func_qty()
@@ -445,7 +433,7 @@ class TestBenchmarkPerformance(unittest.TestCase):
         import time as _time
         from unittest.mock import patch as _patch
 
-        if not _speedups_available():
+        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
             self.skipTest("SIMD speedup not available")
         func_qty = idaapi.get_func_qty()
         best, best_size = None, 0
@@ -504,7 +492,7 @@ class TestBenchmarkPerformance(unittest.TestCase):
             self.benchmark_signature_search,
         ]
 
-        if _speedups_available():
+        if sigmaker.SIMD_SPEEDUP_AVAILABLE:
             benchmarks.append(self.benchmark_simd_vs_python_scanning)
             # Add focused SIMD speedup test
             print("\n🎯 RUNNING FOCUSED SIMD SPEEDUP TEST...")
@@ -656,11 +644,10 @@ class TestBenchmarkPerformance(unittest.TestCase):
 
     def test_simd_speedup_focused(self):
         """Focused test demonstrating SIMD speedup for signature searching."""
-        if not _speedups_available():
+        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
             self.skipTest(
                 "SIMD speedup not available - this test demonstrates the optimization"
             )
-        speedups = _speedups_module()
 
         if not self.ida_available:
             self.skipTest("IDA Pro API not available for benchmarking")
@@ -688,8 +675,8 @@ class TestBenchmarkPerformance(unittest.TestCase):
         for _ in range(iterations):
             start_time = time.perf_counter()
             for pattern in test_patterns:
-                sig = speedups.Signature(pattern)
-                result = speedups.scan_bytes(data_view, sig)
+                sig = sigmaker._SimdSignature(pattern)
+                result = sigmaker._simd_scan_bytes(data_view, sig)
                 # Process result to ensure we're doing work
                 if isinstance(result, list):
                     _ = len(result)
@@ -752,10 +739,9 @@ def main():
     print("🎯 CYTHON vs PYTHON PERFORMANCE DEMONSTRATION")
     print("=" * 80)
 
-    if not _speedups_available():
+    if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
         print("❌ SIMD speedup not available on this system")
         return
-    speedups = _speedups_module()
 
     # Create test data - larger for more dramatic difference
     pattern = [0x48, 0x8B, 0x45, 0xF8, 0x48, 0x89, 0x45, 0xE8] * 2000
@@ -777,8 +763,8 @@ def main():
     for i in range(iterations):
         start_time = time.perf_counter()
         for pattern in test_patterns:
-            sig = speedups.Signature(pattern)
-            speedups.scan_bytes(data_view, sig)
+            sig = sigmaker._SimdSignature(pattern)
+            sigmaker._simd_scan_bytes(data_view, sig)
         end_time = time.perf_counter()
         simd_times.append(end_time - start_time)
         if (i + 1) % 10 == 0:

@@ -40,12 +40,9 @@ from unittest.mock import MagicMock, patch  # noqa: E402
 with patch.dict("sys.modules", {"idaapi": MagicMock(), "idc": MagicMock()}):
     import sigmaker  # noqa: E402
 
-
-def _speedups_module():
-    module = sigmaker._Speedups.current().module
-    if module is None:
-        raise RuntimeError("extension not built; run: python setup.py build_ext --inplace")
-    return module
+assert sigmaker.SIMD_SPEEDUP_AVAILABLE, (
+    "extension not built; run: python setup.py build_ext --inplace"
+)
 
 
 def _best(fn, iters):
@@ -70,7 +67,6 @@ def bench_u1(L, K, iters=3):
     D = make_u1(L)
     mv = memoryview(D)
     n = len(mv)
-    speedups = _speedups_module()
     t_idx = _best(lambda: _time(lambda: sigmaker._ByteIndex.build(mv)), 1)
     idx = sigmaker._ByteIndex.build(mv)
     base = idx.candidates(0x0000)          # ascending absolute positions, key 00 00
@@ -86,7 +82,7 @@ def bench_u1(L, K, iters=3):
 
     # seed-map cost over the same bucket, for "is refine the dominant line?"
     t_seed = _best(lambda: _time(
-        lambda: speedups.seed_offsets(base, 0, K, n)), iters)
+        lambda: sigmaker.simd_scan.seed_offsets(base, 0, K, n)), iters)
     t_refine = _best(one_refine_chain, iters)
     steps = max(1, K - 1)
     touched = steps * C0

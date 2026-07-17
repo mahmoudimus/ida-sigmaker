@@ -89,7 +89,7 @@ _HEADLESS_UI = UIServices()
 _DEFAULT_UI_SERVICES = _HEADLESS_UI
 
 
-class _SimdSignature(typing.Protocol):
+class _SimdSignatureProtocol(typing.Protocol):
     """Native signature shape used by the optional scan extension."""
 
     size_bytes: int
@@ -101,9 +101,13 @@ class _SpeedupsModule(typing.Protocol):
     SPEEDUPS_API_MIN: int
     SPEEDUPS_API_MAX: int
 
-    def Signature(self, ida_signature: str) -> _SimdSignature: ...
+    def Signature(self, ida_signature: str) -> _SimdSignatureProtocol: ...
 
-    def scan_bytes(self, data_mv: memoryview, sig: _SimdSignature) -> int: ...
+    def scan_bytes(
+        self,
+        data_mv: memoryview,
+        sig: _SimdSignatureProtocol,
+    ) -> int: ...
 
     def build_byte_index(
         self, data_mv: memoryview
@@ -296,6 +300,8 @@ SIMD_SPEEDUP_AVAILABLE = False
 with contextlib.suppress(ImportError):
     from sigmaker._speedups import simd_scan
 
+    _SimdSignature = simd_scan.Signature
+    _simd_scan_bytes = simd_scan.scan_bytes
     _Speedups.configure(simd_scan)
 
 
@@ -313,7 +319,7 @@ def _load_speedups_sibling() -> bool:
     No-ops for the shipped single-file `sigmaker.py`, which has no sibling
     `_speedups/` directory and relies on the pip-installed extension.
     """
-    global simd_scan
+    global simd_scan, _SimdSignature, _simd_scan_bytes
 
     import importlib.machinery
     import importlib.util
@@ -335,6 +341,8 @@ def _load_speedups_sibling() -> bool:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         simd_scan = module
+        _SimdSignature = simd_scan.Signature
+        _simd_scan_bytes = simd_scan.scan_bytes
         return _Speedups.configure(simd_scan)
     return False
 
@@ -3898,7 +3906,7 @@ class SignatureSearcher:
 
     @staticmethod
     def _scan_simd_ranges(
-        sig: _SimdSignature,
+        sig: _SimdSignatureProtocol,
         buf: "InMemoryBuffer",
         *,
         offsets_only: bool,

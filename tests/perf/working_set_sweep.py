@@ -34,7 +34,7 @@ from unittest.mock import MagicMock, patch  # noqa: E402
 with patch.dict("sys.modules", {"idaapi": MagicMock(), "idc": MagicMock()}):
     import sigmaker  # noqa: E402
 
-assert sigmaker._Speedups.current().available, (
+assert sigmaker.SIMD_SPEEDUP_AVAILABLE, (
     "extension not built; run: python setup.py build_ext --inplace"
 )
 

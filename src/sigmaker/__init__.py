@@ -89,6 +89,54 @@ _HEADLESS_UI = UIServices()
 _DEFAULT_UI_SERVICES = _HEADLESS_UI
 
 
+class _SimdSignature(typing.Protocol):
+    """Native signature shape used by the optional scan extension."""
+
+    size_bytes: int
+
+
+class _SpeedupsModule(typing.Protocol):
+    """Structurally validated entry points exposed by the native extension."""
+
+    SPEEDUPS_API_MIN: int
+    SPEEDUPS_API_MAX: int
+
+    def Signature(self, ida_signature: str) -> _SimdSignature: ...
+
+    def scan_bytes(self, data_mv: memoryview, sig: _SimdSignature) -> int: ...
+
+    def build_byte_index(
+        self, data_mv: memoryview
+    ) -> tuple["array.array", "array.array"]: ...
+
+    def seed_offsets(
+        self,
+        bucket: "array.array",
+        anchor_offset: int,
+        pattern_size: int,
+        buffer_size: int,
+    ) -> tuple["array.array", int]: ...
+
+    def refine_offsets(
+        self,
+        data_mv: memoryview,
+        candidates: "array.array",
+        count: int,
+        index: int,
+        value: int,
+        mask: int,
+    ) -> int: ...
+
+    def filter_offsets_by_search_ranges(
+        self,
+        candidates: "array.array",
+        count: int,
+        pattern_size: int,
+        range_starts: typing.Sequence[int],
+        range_ends: typing.Sequence[int],
+    ) -> int: ...
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class _Speedups:
     """One validated optional native backend and its local UI state."""
@@ -103,7 +151,7 @@ class _Speedups:
         "filter_offsets_by_search_ranges",
     )
 
-    module: typing.Optional[object] = None
+    module: typing.Optional[_SpeedupsModule] = None
     diagnostic: typing.Optional[str] = None
     path: typing.Optional[pathlib.Path] = None
     notice_shown: bool = False
@@ -156,7 +204,7 @@ class _Speedups:
                     diagnostic=f"the loaded extension is missing required callable {name}",
                     path=path,
                 )
-        return cls(module=module, path=path)
+        return cls(module=typing.cast(_SpeedupsModule, module), path=path)
 
     @classmethod
     def configure(cls, module: object) -> bool:
@@ -3851,7 +3899,7 @@ class SignatureSearcher:
 
     @staticmethod
     def _scan_simd_ranges(
-        sig: object,
+        sig: _SimdSignature,
         buf: "InMemoryBuffer",
         *,
         offsets_only: bool,
@@ -3872,7 +3920,7 @@ class SignatureSearcher:
         offsets: list[int] = []
         matches: list[Match] = []
         to_addr = None if offsets_only else buf.offset_mapper()
-        pattern_size = typing.cast(typing.Any, sig).size_bytes
+        pattern_size = sig.size_bytes
         scan_bytes = module.scan_bytes
         append_offset = offsets.append
         append_match = matches.append
@@ -3932,7 +3980,7 @@ class SignatureSearcher:
             buf = _load_search_buffer()
         sig = module.Signature(simd_signature)
         offsets: list[int] = []
-        k = typing.cast(typing.Any, sig).size_bytes
+        k = sig.size_bytes
         if k == 0:
             return [0], buf
         offsets = typing.cast(

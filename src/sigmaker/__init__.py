@@ -165,6 +165,78 @@ class _Speedups:
         _SPEEDUPS_CTX.set(speedups)
         return speedups.available
 
+    @staticmethod
+    def ida_python_interpreter() -> typing.Optional[pathlib.Path]:
+        """Find an executable under IDA's Python prefix, if one is exposed."""
+        prefix = pathlib.Path(sys.exec_prefix)
+        names = (
+            ("python.exe", "python3.exe")
+            if os.name == "nt"
+            else ("python3", "python")
+        )
+        candidates = [prefix / name for name in names]
+        candidates.extend(prefix / "bin" / name for name in names)
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def remediation_message(self) -> str:
+        """Describe how to update this incompatible extension."""
+        reason = self.diagnostic or "the extension is incompatible"
+        extension_path = str(self.path) if self.path else "unavailable"
+        lines = [
+            "SigMaker disabled optional SIMD speedups.",
+            "",
+            f"Reason: {reason}",
+            f"Loaded extension: {extension_path}",
+            "",
+            "Update the installation, then restart IDA:",
+            "- Installed with HCLI: hcli plugin upgrade SigMaker",
+        ]
+        interpreter = self.ida_python_interpreter()
+        if interpreter is not None:
+            lines.append(
+                "- Installed manually: "
+                f'"{interpreter}" -m pip install --upgrade "sigmaker=={PLUGIN_VERSION}"'
+            )
+        lines.extend(
+            (
+                "",
+                "If the problem remains after updating, report it at:",
+                "https://github.com/mahmoudimus/ida-sigmaker/issues",
+            )
+        )
+        return "\n".join(lines)
+
+    @classmethod
+    def log_remediation(cls) -> None:
+        """Log one startup diagnostic when the optional extension is stale."""
+        speedups = cls.current()
+        if speedups.diagnostic is not None:
+            LOGGER.warning("%s", speedups.remediation_message())
+
+    @classmethod
+    def show_remediation(cls) -> bool:
+        """Show one GUI-only update prompt for an incompatible extension."""
+        speedups = cls.current()
+        if (
+            speedups.notice_shown
+            or speedups.available
+            or speedups.diagnostic is None
+            or not _is_graphical_ida()
+        ):
+            return False
+        if not callable(_IDA_WARNING):
+            return False
+        try:
+            _IDA_WARNING(speedups.remediation_message())
+        except Exception:
+            LOGGER.warning("Unable to display the SIMD speedups update prompt")
+            return False
+        _SPEEDUPS_CTX.set(dataclasses.replace(speedups, notice_shown=True))
+        return True
+
 
 _DEFAULT_SPEEDUPS = _Speedups()
 
@@ -281,80 +353,7 @@ def _is_graphical_ida() -> bool:
         return False
 
 
-def _ida_python_interpreter() -> typing.Optional[pathlib.Path]:
-    """Find an executable under IDA's Python prefix, if one is exposed."""
-    prefix = pathlib.Path(sys.exec_prefix)
-    names = (
-        ("python.exe", "python3.exe")
-        if os.name == "nt"
-        else ("python3", "python")
-    )
-    candidates = [prefix / name for name in names]
-    candidates.extend(prefix / "bin" / name for name in names)
-    for candidate in candidates:
-        if candidate.is_file():
-            return candidate
-    return None
-
-
-def _speedups_remediation_message() -> str:
-    """Describe how to update an incompatible optional speedups extension."""
-    speedups = _Speedups.current()
-    reason = speedups.diagnostic or "the extension is incompatible"
-    extension_path = str(speedups.path) if speedups.path else "unavailable"
-    lines = [
-        "SigMaker disabled optional SIMD speedups.",
-        "",
-        f"Reason: {reason}",
-        f"Loaded extension: {extension_path}",
-        "",
-        "Update the installation, then restart IDA:",
-        "- Installed with HCLI: hcli plugin upgrade SigMaker",
-    ]
-    interpreter = _ida_python_interpreter()
-    if interpreter is not None:
-        lines.append(
-            "- Installed manually: "
-            f'"{interpreter}" -m pip install --upgrade "sigmaker=={PLUGIN_VERSION}"'
-        )
-    lines.extend(
-        (
-            "",
-            "If the problem remains after updating, report it at:",
-            "https://github.com/mahmoudimus/ida-sigmaker/issues",
-        )
-    )
-    return "\n".join(lines)
-
-
-def _log_speedups_remediation() -> None:
-    """Log one startup diagnostic when the optional extension is stale."""
-    if _Speedups.current().diagnostic is not None:
-        LOGGER.warning("%s", _speedups_remediation_message())
-
-
-_log_speedups_remediation()
-
-
-def _show_speedups_remediation() -> bool:
-    """Show one GUI-only update prompt for an incompatible speedups wheel."""
-    speedups = _Speedups.current()
-    if (
-        speedups.notice_shown
-        or speedups.available
-        or speedups.diagnostic is None
-        or not _is_graphical_ida()
-    ):
-        return False
-    if not callable(_IDA_WARNING):
-        return False
-    try:
-        _IDA_WARNING(_speedups_remediation_message())
-    except Exception:
-        LOGGER.warning("Unable to display the SIMD speedups update prompt")
-        return False
-    _SPEEDUPS_CTX.set(dataclasses.replace(speedups, notice_shown=True))
-    return True
+_Speedups.log_remediation()
 
 
 def idaapi_user_canceled() -> bool:
@@ -4839,7 +4838,7 @@ class SigMakerPlugin(idaapi.plugin_t):
     ACTION_STOP_PROFILING: str = "pysigmaker:stop_profiling"
 
     def init(self) -> int:
-        _show_speedups_remediation()
+        _Speedups.show_remediation()
         self._register_actions()
         # Attach actions to the disassembly right-click popup via live UI
         # hooks rather than a one-shot attach_action_to_menu at init. The

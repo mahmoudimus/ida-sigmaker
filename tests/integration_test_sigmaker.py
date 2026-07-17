@@ -25,6 +25,13 @@ with warnings.catch_warnings():
     import sigmaker
 
 
+def _speedups_module():
+    module = sigmaker._Speedups.current().module
+    if module is None:
+        raise unittest.SkipTest("SIMD speedup not available")
+    return module
+
+
 class CoveredIntegrationTest(CoverageTestCase):
     coverage_data_file = ".coverage.integration"
 
@@ -304,7 +311,10 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
         self.assertEqual(payload["entries"][0]["match_count"], 4)
         self.assertIn("match_file_offsets", f"{results:csv}")
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(
+        sigmaker._Speedups.current().available,
+        "SIMD not built",
+    )
     def test_no_simd_nibble_fallback_matches_simd_results(self):
         pattern = "E? 8? 0A 00 00 48 89 C7"
         buf = sigmaker.InMemoryBuffer.load(
@@ -313,7 +323,7 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
         expected = sigmaker.SignatureSearcher.find_all(pattern, buf=buf)
         self.assertGreater(len(expected), 0)
 
-        with patch.object(sigmaker, "SIMD_SPEEDUP_AVAILABLE", False):
+        with sigmaker._Speedups.use(sigmaker._Speedups()):
             actual = sigmaker.SignatureSearcher.find_all(pattern, buf=buf)
 
         self.assertEqual(actual, expected)
@@ -617,12 +627,13 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
             # Test the exact pattern from the failing integration test
             pattern = "E8 ?? ?? ?? ?? 48 89 C7"
             print(f"\n=== Testing pattern '{pattern}' in real binary ===")
+            speedups = _speedups_module()
 
             # Create SIMD signature
-            sig = sigmaker.simd_scan.Signature(pattern)
+            sig = speedups.Signature(pattern)
 
             # Search for the pattern
-            result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+            result = speedups.scan_bytes(data_view, sig)
 
             print(f"Pattern '{pattern}' found at offset: {result}")
 
@@ -644,8 +655,8 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
 
                     # Test exact match at expected location
                     exact_pattern = "E8 80 0A 00 00 48 89 C7"
-                    exact_sig = sigmaker.simd_scan.Signature(exact_pattern)
-                    exact_result = sigmaker.simd_scan.scan_bytes(data_view, exact_sig)
+                    exact_sig = speedups.Signature(exact_pattern)
+                    exact_result = speedups.scan_bytes(data_view, exact_sig)
                     print(f"Exact pattern search result: {exact_result}")
 
                     if exact_result != expected_offset:
@@ -687,7 +698,8 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
 
             # Test the exact pattern from the failing test
             pattern = "E8 ?? ?? ?? ?? 48 89 C7"
-            sig = sigmaker.simd_scan.Signature(pattern)
+            speedups = _speedups_module()
+            sig = speedups.Signature(pattern)
 
             print(f"Testing pattern: {pattern}")
             print(f"Data view type: {type(data_view)}")
@@ -709,7 +721,7 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
                 print(f"Pattern matches expected: {pattern_matches}")
 
             # Now test the SIMD search
-            result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+            result = speedups.scan_bytes(data_view, sig)
             print(f"SIMD search result: {result}")
 
             if result == -1:
@@ -719,14 +731,14 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
 
                 # Test exact pattern without wildcards
                 exact_pattern = "E8 80 0A 00 00 48 89 C7"
-                exact_sig = sigmaker.simd_scan.Signature(exact_pattern)
-                exact_result = sigmaker.simd_scan.scan_bytes(data_view, exact_sig)
+                exact_sig = speedups.Signature(exact_pattern)
+                exact_result = speedups.scan_bytes(data_view, exact_sig)
                 print(f"Exact pattern search result: {exact_result}")
 
                 # Test single byte pattern
                 single_pattern = "E8"
-                single_sig = sigmaker.simd_scan.Signature(single_pattern)
-                single_result = sigmaker.simd_scan.scan_bytes(data_view, single_sig)
+                single_sig = speedups.Signature(single_pattern)
+                single_result = speedups.scan_bytes(data_view, single_sig)
                 print(f"Single byte 'E8' search result: {single_result}")
 
                 if single_result != -1:

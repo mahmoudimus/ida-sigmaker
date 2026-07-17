@@ -26,6 +26,13 @@ SEGMENT_COUNT = 1024
 PATTERN_SIZE = 16
 
 
+def _speedups_module():
+    module = sigmaker._Speedups.current().module
+    if module is None:
+        raise RuntimeError("SIMD extension is not built; run: pip install -e .")
+    return module
+
+
 def _interleaved_medians(left, right, iterations=7):
     left()
     right()
@@ -75,7 +82,8 @@ def _python_filter(candidates, pattern_size, range_starts, range_ends):
 def _benchmark_direct_single_range():
     payload = bytearray((b"\x90" + b"\x00" * 15) * (1 << 18))
     data = memoryview(payload)
-    signature = sigmaker._SimdSignature("90")
+    speedups = _speedups_module()
+    signature = speedups.Signature("90")
     size = len(data)
 
     def original_loop():
@@ -89,7 +97,7 @@ def _benchmark_direct_single_range():
                 since_poll = 0
                 if cancel_requested():
                     break
-            index = sigmaker._simd_scan_bytes(data[offset:], signature)
+            index = speedups.scan_bytes(data[offset:], signature)
             if index < 0:
                 break
             offsets.append(offset + index)
@@ -191,8 +199,7 @@ def _benchmark_candidate_refinement(
 
 
 def main():
-    if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
-        raise RuntimeError("SIMD extension is not built; run: pip install -e .")
+    speedups = _speedups_module()
 
     total_size = SEGMENT_SIZE * SEGMENT_COUNT
     candidate_list = list(range(0, total_size, 4))
@@ -213,7 +220,7 @@ def main():
 
     def converted_cython_filter():
         candidates = array.array("I", candidate_list)
-        count = sigmaker.simd_scan.filter_offsets_by_search_ranges(
+        count = speedups.filter_offsets_by_search_ranges(
             candidates,
             len(candidates),
             PATTERN_SIZE,
@@ -234,7 +241,7 @@ def main():
     for _ in range(7):
         candidates = array.array("I", candidate_list)
         start = time.perf_counter()
-        sigmaker.simd_scan.filter_offsets_by_search_ranges(
+        speedups.filter_offsets_by_search_ranges(
             candidates,
             len(candidates),
             PATTERN_SIZE,

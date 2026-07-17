@@ -10,6 +10,7 @@ import contextlib
 import csv
 import dataclasses
 import gc
+import inspect
 import itertools
 import io
 import json
@@ -88,7 +89,7 @@ def _without_speedups():
 @contextlib.contextmanager
 def _with_test_speedups(**changes):
     module = _test_speedups_module(**changes)
-    with sigmaker._Speedups.use(sigmaker._speedups_from_module(module)):
+    with sigmaker._Speedups.use(sigmaker._Speedups.from_module(module)):
         yield module
 
 
@@ -4719,6 +4720,28 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
         self.assertTrue(sigmaker._Speedups.current().available)
         self.assertIs(sigmaker._Speedups.current().module, module)
 
+    def test_search_api_selects_speedups_implicitly(self):
+        parameters = inspect.signature(
+            sigmaker.SignatureSearcher.find_all_offsets
+        ).parameters
+
+        self.assertNotIn("speedups", parameters)
+
+    def test_find_all_offsets_uses_configured_backend_implicitly(self):
+        scan_bytes = MagicMock(return_value=-1)
+        module = self._module(scan_bytes=scan_bytes)
+        buffer = MagicMock()
+        buffer.data.return_value = memoryview(bytearray(b"\x90"))
+
+        self.assertTrue(sigmaker._configure_speedups(module))
+        offsets, returned = sigmaker.SignatureSearcher.find_all_offsets(
+            "90", buf=buffer
+        )
+
+        self.assertEqual(offsets, [])
+        self.assertIs(returned, buffer)
+        scan_bytes.assert_called_once()
+
     def test_missing_api_declaration_disables_simd(self):
         module = self._module()
         del module.SPEEDUPS_API_MIN
@@ -4852,7 +4875,7 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
         self.assertIn("/tmp/simd_scan.so", message)
         self.assertIn("github.com/mahmoudimus/ida-sigmaker/issues", message)
 
-    def test_runtime_disable_logs_update_commands(self):
+    def test_remediation_log_has_update_commands(self):
         logger = logging.getLogger("sigmaker.speedups-test")
         with patch.object(sigmaker, "LOGGER", logger), patch.object(
             logger, "warning"
@@ -4861,12 +4884,12 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
             "_ida_python_interpreter",
             return_value=pathlib.Path("/ida/python/bin/python3"),
         ):
-            self.assertTrue(sigmaker._configure_speedups(self._module()))
             self.assertFalse(
                 sigmaker._configure_speedups(
                     self._module(SPEEDUPS_API_MIN=2, SPEEDUPS_API_MAX=2)
                 )
             )
+            sigmaker._log_speedups_remediation()
 
         warning.assert_called_once()
         message = warning.call_args.args[1]

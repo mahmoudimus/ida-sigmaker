@@ -21,7 +21,9 @@ import re
 import runpy
 import sys
 import tempfile
+import threading
 import time
+import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -38,6 +40,71 @@ with patch.dict("sys.modules", {"idaapi": MagicMock(), "idc": MagicMock()}):
 
 
 SigText = sigmaker.SigText
+
+
+class _TestSpeedupSignature:
+    def __init__(self, ida_signature):
+        self.size_bytes = len(sigmaker.SigText.normalize(ida_signature)[1])
+
+
+def _test_speedups_module(**changes):
+    def refine_offsets(data_mv, cands, count, j, value, mask):
+        target = value & mask
+        write_index = 0
+        for read_index in range(count):
+            candidate = cands[read_index]
+            if (
+                candidate + j < len(data_mv)
+                and (data_mv[candidate + j] & mask) == target
+            ):
+                cands[write_index] = candidate
+                write_index += 1
+        return write_index
+
+    values = {
+        "SPEEDUPS_API_MIN": 1,
+        "SPEEDUPS_API_MAX": 1,
+        "Signature": _TestSpeedupSignature,
+        "scan_bytes": lambda *_args: -1,
+        "build_byte_index": lambda *_args: (
+            array.array("I", [0] * 65537), array.array("I")
+        ),
+        "seed_offsets": lambda bucket, *_args: (
+            array.array("I", bucket), len(bucket)
+        ),
+        "refine_offsets": refine_offsets,
+        "filter_offsets_by_search_ranges": lambda _cands, count, *_args: count,
+    }
+    values.update(changes)
+    return types.SimpleNamespace(**values)
+
+
+@contextlib.contextmanager
+def _without_speedups():
+    with sigmaker._Speedups.use(sigmaker._Speedups()):
+        yield
+
+
+@contextlib.contextmanager
+def _with_test_speedups(**changes):
+    module = _test_speedups_module(**changes)
+    with sigmaker._Speedups.use(sigmaker._speedups_from_module(module)):
+        yield module
+
+
+def _speedups_module():
+    module = sigmaker._Speedups.current().module
+    if module is None:
+        raise RuntimeError("test requires the optional speedups extension")
+    return module
+
+
+def _speedups_signature(*args, **kwargs):
+    return _speedups_module().Signature(*args, **kwargs)
+
+
+def _speedups_scan_bytes(*args, **kwargs):
+    return _speedups_module().scan_bytes(*args, **kwargs)
 
 
 # Set up logging for tests
@@ -96,7 +163,7 @@ def make_buf_with_pattern(
     return bytes(b)
 
 
-def _mask_bytes(sig: sigmaker.simd_scan.Signature):
+def _mask_bytes(sig):
     m = sig.mask_ptr()
     return None if m is None else bytes(m)
 
@@ -581,7 +648,7 @@ class TestErrorHandling(CoveredUnitTest):
 
 
 @unittest.skipUnless(
-    sigmaker.SIMD_SPEEDUP_AVAILABLE,
+    sigmaker._Speedups.current().available,
     "SIMD speedup not available or _simd_scan module not compiled",
 )
 class TestSimdScanIntegration(CoveredUnitTest):
@@ -589,14 +656,14 @@ class TestSimdScanIntegration(CoveredUnitTest):
 
     def test_signature_reuse(self):
         """Test reusing the same signature object multiple times."""
-        sig = sigmaker._SimdSignature("48 8B C4")
+        sig = _speedups_signature("48 8B C4")
 
         # Test with different data sets
         test_data1 = array.array("B", [0x48, 0x8B, 0xC4, 0x48, 0x89])
         test_data2 = array.array("B", [0xFF, 0x48, 0x8B, 0xC4, 0x00])
 
-        result1 = sigmaker._simd_scan_bytes(memoryview(test_data1), sig)
-        result2 = sigmaker._simd_scan_bytes(memoryview(test_data2), sig)
+        result1 = _speedups_scan_bytes(memoryview(test_data1), sig)
+        result2 = _speedups_scan_bytes(memoryview(test_data2), sig)
 
         self.assertEqual(result1, 0)
         self.assertEqual(result2, 1)
@@ -604,9 +671,9 @@ class TestSimdScanIntegration(CoveredUnitTest):
     def test_multiple_signatures(self):
         """Test scanning with multiple different signature objects."""
         signatures = [
-            sigmaker._SimdSignature("48 8B"),
-            sigmaker._SimdSignature("8B C4"),
-            sigmaker._SimdSignature("C4 48"),
+            _speedups_signature("48 8B"),
+            _speedups_signature("8B C4"),
+            _speedups_signature("C4 48"),
         ]
 
         test_data = array.array("B", [0x48, 0x8B, 0xC4, 0x48, 0x89, 0x45])
@@ -614,14 +681,14 @@ class TestSimdScanIntegration(CoveredUnitTest):
 
         results = []
         for sig in signatures:
-            result = sigmaker._simd_scan_bytes(data_view, sig)
+            result = _speedups_scan_bytes(data_view, sig)
             results.append(result)
 
         self.assertEqual(results, [0, 1, 2])  # Each pattern found at expected position
 
 
 @unittest.skipUnless(
-    sigmaker.SIMD_SPEEDUP_AVAILABLE,
+    sigmaker._Speedups.current().available,
     "SIMD speedup not available or _simd_scan module not compiled",
 )
 class TestSimdScanSignature(CoveredUnitTest):
@@ -630,7 +697,7 @@ class TestSimdScanSignature(CoveredUnitTest):
     def test_signature_creation_basic(self):
         """Test basic signature creation without mask."""
         sig_str = "48 8B C4"
-        sig = sigmaker._SimdSignature(sig_str)
+        sig = _speedups_signature(sig_str)
 
         self.assertEqual(sig.size_bytes, 3)
         self.assertFalse(sig.has_mask)
@@ -647,7 +714,7 @@ class TestSimdScanSignature(CoveredUnitTest):
         """Test signature creation with explicit mask."""
         sig_str = "48 8B C4"
         mask_str = "FF FF 00"
-        sig = sigmaker._SimdSignature(sig_str, mask=mask_str)
+        sig = _speedups_signature(sig_str, mask=mask_str)
 
         self.assertEqual(sig.size_bytes, 3)
         self.assertTrue(sig.has_mask)
@@ -661,7 +728,7 @@ class TestSimdScanSignature(CoveredUnitTest):
     def test_signature_creation_with_wildcards(self):
         """Test signature creation with wildcard nibbles."""
         sig_str = "48 8B ??"
-        sig = sigmaker._SimdSignature(sig_str)
+        sig = _speedups_signature(sig_str)
 
         self.assertEqual(sig.size_bytes, 3)
         self.assertTrue(sig.has_mask)  # Wildcards create implicit mask
@@ -669,24 +736,24 @@ class TestSimdScanSignature(CoveredUnitTest):
     def test_signature_creation_invalid_format(self):
         """Test signature creation with invalid format."""
         with self.assertRaises(ValueError):
-            sigmaker._SimdSignature("48 8")  # Invalid format (incomplete byte pair)
+            _speedups_signature("48 8")  # Invalid format (incomplete byte pair)
 
     def test_signature_creation_empty(self):
         """Test signature creation with empty string."""
         with self.assertRaises(ValueError):
-            sigmaker._SimdSignature("")
+            _speedups_signature("")
 
     def test_signature_creation_invalid_hex(self):
         """Test signature creation with invalid hex characters."""
         with self.assertRaises(ValueError):
-            sigmaker._SimdSignature("XX 8B C4")  # Invalid hex
+            _speedups_signature("XX 8B C4")  # Invalid hex
 
     def test_signature_simd_kind_setting(self):
         """Test SIMD kind setting and getting."""
-        sig = sigmaker._SimdSignature("48 8B C4")
+        sig = _speedups_signature("48 8B C4")
 
         # Default should be best level available
-        self.assertEqual(sig.simd_kind(), sigmaker.simd_scan.simd_best_level())
+        self.assertEqual(sig.simd_kind(), _speedups_module().simd_best_level())
 
         # Test AVX2 setting
         sig.set_simd_kind(2)
@@ -702,17 +769,17 @@ class TestSimdScanSignature(CoveredUnitTest):
 
     def test_signature_with_simd_kind_constructor(self):
         """Test signature creation with SIMD kind in constructor."""
-        sig = sigmaker._SimdSignature("48 8B C4", simd_kind=2)
+        sig = _speedups_signature("48 8B C4", simd_kind=2)
         self.assertEqual(sig.simd_kind(), 2)
 
-        sig = sigmaker._SimdSignature("48 8B C4", simd_kind=3)
+        sig = _speedups_signature("48 8B C4", simd_kind=3)
         self.assertEqual(sig.simd_kind(), 3)
 
-        sig = sigmaker._SimdSignature("48 8B C4", simd_kind=4)
+        sig = _speedups_signature("48 8B C4", simd_kind=4)
         self.assertEqual(sig.simd_kind(), 4)
 
         # Invalid SIMD kind should default to 1 (SIMD_SCALAR)
-        sig = sigmaker._SimdSignature("48 8B C4", simd_kind=5)
+        sig = _speedups_signature("48 8B C4", simd_kind=5)
         self.assertEqual(sig.simd_kind(), 1)
 
 
@@ -729,7 +796,7 @@ class TestMacOSx86Integration(CoveredUnitTest):
 
     def test_simd_scan_best_level(self):
         """Test the simd_best_level function."""
-        self.assertEqual(sigmaker.simd_scan.simd_best_level(), 3)
+        self.assertEqual(_speedups_module().simd_best_level(), 3)
 
 
 @unittest.skipUnless(
@@ -746,7 +813,7 @@ class TestMacOSARMIntegration(CoveredUnitTest):
     def test_simd_scan_best_level(self):
         """Test the simd_best_level function."""
         self.assertEqual(
-            sigmaker.simd_scan.simd_best_level(), 4
+            _speedups_module().simd_best_level(), 4
         )  # SIMD_ARM_NEON always available on ARM
 
 
@@ -764,7 +831,7 @@ class TestLinux86Integration(CoveredUnitTest):
     def test_simd_scan_best_level(self):
         """Test the simd_best_level function."""
         self.assertIn(
-            sigmaker.simd_scan.simd_best_level(), [2, 3]
+            _speedups_module().simd_best_level(), [2, 3]
         )  # either SSE2 or AVX2
 
 
@@ -775,12 +842,12 @@ class TestWindowsIntegration(CoveredUnitTest):
     def test_simd_scan_best_level(self):
         """Test the simd_best_level function."""
         self.assertIn(
-            sigmaker.simd_scan.simd_best_level(), [2, 3]
+            _speedups_module().simd_best_level(), [2, 3]
         )  # either SSE2 or AVX2
 
 
 @unittest.skipUnless(
-    sigmaker.SIMD_SPEEDUP_AVAILABLE,
+    sigmaker._Speedups.current().available,
     "SIMD speedup not available or _simd_scan module not compiled",
 )
 class TestSimdScanParsingHelpers(CoveredUnitTest):
@@ -817,14 +884,14 @@ class TestSimdScanParsingHelpers(CoveredUnitTest):
         for nibble, expected in test_cases:
             with self.subTest(nibble=nibble):
                 sig_str = "{0}0".format(nibble)
-                sig = sigmaker._SimdSignature(sig_str)
+                sig = _speedups_signature(sig_str)
                 data = sig.data_ptr()
                 self.assertEqual(data[0], expected)
 
     def test_wildcard_parsing(self):
         """Test wildcard nibble parsing."""
         # Test wildcard nibbles
-        sig = sigmaker._SimdSignature("??")
+        sig = _speedups_signature("??")
         self.assertTrue(sig.has_mask)
 
         # Check that wildcards are properly handled
@@ -838,7 +905,7 @@ class TestSimdScanParsingHelpers(CoveredUnitTest):
 
     def test_mixed_wildcard_parsing(self):
         """Test mixed wildcard and hex nibble parsing."""
-        sig = sigmaker._SimdSignature("?F ?0")
+        sig = _speedups_signature("?F ?0")
         self.assertTrue(sig.has_mask)
 
         data = sig.data_ptr()
@@ -854,7 +921,7 @@ class TestSimdScanParsingHelpers(CoveredUnitTest):
 
 
 @unittest.skipUnless(
-    sigmaker.SIMD_SPEEDUP_AVAILABLE,
+    sigmaker._Speedups.current().available,
     "SIMD speedup not available or _simd_scan module not compiled",
 )
 class TestSimdScanBytes(CoveredUnitTest):
@@ -868,63 +935,63 @@ class TestSimdScanBytes(CoveredUnitTest):
 
     def test_scan_bytes_exact_match(self):
         """Test scanning for an exact match."""
-        sig = sigmaker._SimdSignature("48 8B C4")
-        result = sigmaker._simd_scan_bytes(self.data_view, sig)
+        sig = _speedups_signature("48 8B C4")
+        result = _speedups_scan_bytes(self.data_view, sig)
         self.assertEqual(result, 0)  # Found at position 0
 
     def test_scan_bytes_partial_match(self):
         """Test scanning for a partial match."""
-        sig = sigmaker._SimdSignature("48 89 45")
-        result = sigmaker._simd_scan_bytes(self.data_view, sig)
+        sig = _speedups_signature("48 89 45")
+        result = _speedups_scan_bytes(self.data_view, sig)
         self.assertEqual(result, 3)  # Found at position 3
 
     def test_scan_bytes_no_match(self):
         """Test scanning when pattern is not found."""
-        sig = sigmaker._SimdSignature("FF FF FF")
-        result = sigmaker._simd_scan_bytes(self.data_view, sig)
+        sig = _speedups_signature("FF FF FF")
+        result = _speedups_scan_bytes(self.data_view, sig)
         self.assertEqual(result, -1)  # Not found
 
     def test_scan_bytes_with_wildcards(self):
         """Test scanning with wildcard bytes."""
-        sig = sigmaker._SimdSignature("48 ?? C4")
-        result = sigmaker._simd_scan_bytes(self.data_view, sig)
+        sig = _speedups_signature("48 ?? C4")
+        result = _speedups_scan_bytes(self.data_view, sig)
         self.assertEqual(result, 0)  # Found at position 0
 
     def test_scan_bytes_empty_signature(self):
         """Test scanning with empty signature."""
-        sig = sigmaker._SimdSignature(
+        sig = _speedups_signature(
             "48 8B C4 48 89 45 F8"
         )  # Exact match for entire data
-        result = sigmaker._simd_scan_bytes(self.data_view, sig)
+        result = _speedups_scan_bytes(self.data_view, sig)
         self.assertEqual(result, 0)
 
     def test_scan_bytes_larger_than_data(self):
         """Test scanning with signature larger than data."""
-        sig = sigmaker._SimdSignature("48 8B C4 48 89 45 F8 FF FF")
-        result = sigmaker._simd_scan_bytes(self.data_view, sig)
+        sig = _speedups_signature("48 8B C4 48 89 45 F8 FF FF")
+        result = _speedups_scan_bytes(self.data_view, sig)
         self.assertEqual(result, -1)  # Not found (too large)
 
     def test_scan_bytes_empty_data(self):
         """Test scanning in empty data."""
         empty_data = array.array("B", [])
         empty_view = memoryview(empty_data)
-        sig = sigmaker._SimdSignature("48 8B")
-        result = sigmaker._simd_scan_bytes(empty_view, sig)
+        sig = _speedups_signature("48 8B")
+        result = _speedups_scan_bytes(empty_view, sig)
         self.assertEqual(result, -1)
 
     def test_scan_bytes_single_byte(self):
         """Test scanning for single byte patterns."""
-        sig = sigmaker._SimdSignature("48")
-        result = sigmaker._simd_scan_bytes(self.data_view, sig)
+        sig = _speedups_signature("48")
+        result = _speedups_scan_bytes(self.data_view, sig)
         self.assertEqual(result, 0)  # First byte
 
-        sig = sigmaker._SimdSignature("45")
-        result = sigmaker._simd_scan_bytes(self.data_view, sig)
+        sig = _speedups_signature("45")
+        result = _speedups_scan_bytes(self.data_view, sig)
         self.assertEqual(result, 5)  # Found at position 5
 
 
 @unittest.skipUnless(
-    sigmaker.SIMD_SPEEDUP_AVAILABLE,
+    sigmaker._Speedups.current().available,
     "SIMD speedup not available or _simd_scan module not compiled",
 )
 class TestSimdScanEdgeCases(CoveredUnitTest):
@@ -938,21 +1005,21 @@ class TestSimdScanEdgeCases(CoveredUnitTest):
             pattern_parts.append("48 8B")
         large_pattern = " ".join(pattern_parts)
 
-        sig = sigmaker._SimdSignature(large_pattern)
+        sig = _speedups_signature(large_pattern)
         self.assertEqual(sig.size_bytes, 256)
 
         # Test scanning with large pattern
         test_data = array.array("B", [0x48, 0x8B] * 130)  # Enough data
         data_view = memoryview(test_data)
 
-        result = sigmaker._simd_scan_bytes(data_view, sig)
+        result = _speedups_scan_bytes(data_view, sig)
         self.assertEqual(result, 0)  # Should find at beginning
 
     def test_signature_complex_mask(self):
         """Test signature with complex mask patterns."""
         # Pattern with alternating wildcards
         sig_str = "48 ? 8B ? C4 ? 89"
-        sig = sigmaker._SimdSignature(sig_str)
+        sig = _speedups_signature(sig_str)
 
         self.assertTrue(sig.has_mask)
         self.assertEqual(sig.size_bytes, 7)
@@ -964,7 +1031,7 @@ class TestSimdScanEdgeCases(CoveredUnitTest):
         # Create many signatures to test memory management
         signatures = []
         for i in range(1000):
-            sig = sigmaker._SimdSignature("48 8B {0:02X}".format(i % 256))
+            sig = _speedups_signature("48 8B {0:02X}".format(i % 256))
             signatures.append(sig)
 
         # Force garbage collection
@@ -976,7 +1043,7 @@ class TestSimdScanEdgeCases(CoveredUnitTest):
 
     def test_simd_kind_persistence(self):
         """Test that SIMD kind setting persists correctly."""
-        sig = sigmaker._SimdSignature("48 8B C4")
+        sig = _speedups_signature("48 8B C4")
 
         # Test all valid SIMD kinds
         for kind in [1, 2, 3, 4]:
@@ -985,7 +1052,7 @@ class TestSimdScanEdgeCases(CoveredUnitTest):
 
 
 @unittest.skipUnless(
-    sigmaker.SIMD_SPEEDUP_AVAILABLE,
+    sigmaker._Speedups.current().available,
     "SIMD speedup not available or _simd_scan module not compiled",
 )
 class TestSimdScanPerformance(CoveredUnitTest):
@@ -997,10 +1064,10 @@ class TestSimdScanPerformance(CoveredUnitTest):
         test_data = array.array("B", [0x48, 0x8B, 0xC4, 0x48, 0x89, 0x45])
         data_view = memoryview(test_data)
 
-        sig = sigmaker._SimdSignature("48 8B")
+        sig = _speedups_signature("48 8B")
 
         start_time = time.time()
-        result = sigmaker._simd_scan_bytes(data_view, sig)
+        result = _speedups_scan_bytes(data_view, sig)
         end_time = time.time()
 
         self.assertEqual(result, 0)
@@ -1012,10 +1079,10 @@ class TestSimdScanPerformance(CoveredUnitTest):
         test_data = array.array("B", [0x48, 0x8B] * 512)
         data_view = memoryview(test_data)
 
-        sig = sigmaker._SimdSignature("48 8B")
+        sig = _speedups_signature("48 8B")
 
         start_time = time.time()
-        result = sigmaker._simd_scan_bytes(data_view, sig)
+        result = _speedups_scan_bytes(data_view, sig)
         end_time = time.time()
 
         self.assertEqual(result, 0)
@@ -1037,10 +1104,10 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
 
         # Create SIMD signature
         sig_str = "E8 12 34 56 78 48 89 C7"
-        sig = sigmaker.simd_scan.Signature(sig_str)
+        sig = _speedups_module().Signature(sig_str)
 
         # Scan for the pattern
-        result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+        result = _speedups_module().scan_bytes(data_view, sig)
 
         # Should find the pattern at offset 4 (after the 4 NOP bytes)
         self.assertEqual(result, 4, f"Expected match at offset 4, got {result}")
@@ -1049,7 +1116,7 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
         """Test that SIMD signature construction works correctly for wildcard patterns."""
         # Test pattern: "E8 ?? ?? ?? ?? 48 89 C7"
         pattern = "E8 ?? ?? ?? ?? 48 89 C7"
-        sig = sigmaker.simd_scan.Signature(pattern)
+        sig = _speedups_module().Signature(pattern)
 
         # Get the internal data and mask
         data_size = sig.size()
@@ -1092,7 +1159,7 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
         test_data = b"\xe8\x80\x0a\x00\x00\x48\x89\xc7"  # Our known pattern
         data_view = memoryview(test_data)
 
-        result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+        result = _speedups_module().scan_bytes(data_view, sig)
         print(f"Search result for exact match: {result}")
 
         self.assertEqual(result, 0, f"Should find pattern at offset 0, got {result}")
@@ -1109,10 +1176,10 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
 
         # Create SIMD signature with wildcards
         sig_str = "E8 ?? ?? ?? ?? 48 89 C7"
-        sig = sigmaker.simd_scan.Signature(sig_str)
+        sig = _speedups_module().Signature(sig_str)
 
         # Scan for the pattern
-        result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+        result = _speedups_module().scan_bytes(data_view, sig)
 
         # Should find the pattern at offset 4
         self.assertEqual(result, 4, f"Expected match at offset 4, got {result}")
@@ -1125,10 +1192,10 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
 
         # Create SIMD signature
         sig_str = "E8 12 34 56 78 48 89 C7"
-        sig = sigmaker.simd_scan.Signature(sig_str)
+        sig = _speedups_module().Signature(sig_str)
 
         # Scan for the pattern
-        result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+        result = _speedups_module().scan_bytes(data_view, sig)
 
         # Should not find the pattern
         self.assertEqual(result, -1, f"Expected no match (-1), got {result}")
@@ -1142,10 +1209,10 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
 
         # Create SIMD signature
         sig_str = "E8 12 34 56 78 48 89 C7"
-        sig = sigmaker.simd_scan.Signature(sig_str)
+        sig = _speedups_module().Signature(sig_str)
 
         # Scan for the first occurrence
-        result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+        result = _speedups_module().scan_bytes(data_view, sig)
 
         # Should find the first pattern at offset 0
         self.assertEqual(result, 0, f"Expected first match at offset 0, got {result}")
@@ -1160,10 +1227,10 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
 
         # Create SIMD signature
         sig_str = "E8 12 34 56 78 48 89 C7"
-        sig = sigmaker.simd_scan.Signature(sig_str)
+        sig = _speedups_module().Signature(sig_str)
 
         # Scan for the pattern
-        result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+        result = _speedups_module().scan_bytes(data_view, sig)
 
         # Should find the pattern at offset 4
         self.assertEqual(result, 4, f"Expected match at offset 4, got {result}")
@@ -1172,15 +1239,15 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
         """Test SIMD signature creation with various edge cases."""
         # Test empty signature
         with self.assertRaises(ValueError):
-            sig = sigmaker.simd_scan.Signature("")
+            sig = _speedups_module().Signature("")
 
         # Test invalid hex
         with self.assertRaises(ValueError):
-            sig = sigmaker.simd_scan.Signature("GG")
+            sig = _speedups_module().Signature("GG")
 
         # Test odd number of characters
         with self.assertRaises(ValueError):
-            sig = sigmaker.simd_scan.Signature("E812")
+            sig = _speedups_module().Signature("E812")
 
     def test_simd_scan_empty_data(self):
         """Test SIMD scanning with empty data."""
@@ -1188,9 +1255,9 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
         data_view = memoryview(test_data)
 
         sig_str = "E8 12 34 56 78 48 89 C7"
-        sig = sigmaker.simd_scan.Signature(sig_str)
+        sig = _speedups_module().Signature(sig_str)
 
-        result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+        result = _speedups_module().scan_bytes(data_view, sig)
         self.assertEqual(result, -1, f"Expected no match for empty data, got {result}")
 
     def test_simd_scan_pattern_larger_than_data(self):
@@ -1199,9 +1266,9 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
         data_view = memoryview(test_data)
 
         sig_str = "E8 12 34 56 78 48 89 C7"  # 8 bytes
-        sig = sigmaker.simd_scan.Signature(sig_str)
+        sig = _speedups_module().Signature(sig_str)
 
-        result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+        result = _speedups_module().scan_bytes(data_view, sig)
         self.assertEqual(
             result, -1, f"Expected no match when pattern > data, got {result}"
         )
@@ -1220,16 +1287,16 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
 
         # Test exact match first
         exact_sig_str = "E8 AA BB CC DD 48 89 C7"
-        exact_sig = sigmaker.simd_scan.Signature(exact_sig_str)
-        exact_result = sigmaker.simd_scan.scan_bytes(data_view, exact_sig)
+        exact_sig = _speedups_module().Signature(exact_sig_str)
+        exact_result = _speedups_module().scan_bytes(data_view, exact_sig)
         self.assertEqual(
             exact_result, 4, f"Exact match should be at offset 4, got {exact_result}"
         )
 
         # Test with wildcards
         wildcard_sig_str = "E8 ?? ?? ?? ?? 48 89 C7"
-        wildcard_sig = sigmaker.simd_scan.Signature(wildcard_sig_str)
-        wildcard_result = sigmaker.simd_scan.scan_bytes(data_view, wildcard_sig)
+        wildcard_sig = _speedups_module().Signature(wildcard_sig_str)
+        wildcard_result = _speedups_module().scan_bytes(data_view, wildcard_sig)
         self.assertEqual(
             wildcard_result,
             4,
@@ -1258,10 +1325,10 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
         self.assertEqual(norm_text, "E8 ?? ?? ?? ?? 48 89 C7")
 
         # Create SIMD signature
-        sig = sigmaker.simd_scan.Signature(norm_text)
+        sig = _speedups_module().Signature(norm_text)
 
         # Scan
-        result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+        result = _speedups_module().scan_bytes(data_view, sig)
 
         # Should find the pattern
         self.assertEqual(result, 4, f"Should find pattern at offset 4, got {result}")
@@ -1302,8 +1369,8 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
         # Test finding each pattern
         for name, pattern in patterns_to_test:
             sig_str = " ".join(f"{b:02X}" for b in pattern)
-            sig = sigmaker.simd_scan.Signature(sig_str)
-            result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+            sig = _speedups_module().Signature(sig_str)
+            result = _speedups_module().scan_bytes(data_view, sig)
 
             expected_offset = offsets[name]
             self.assertEqual(
@@ -1340,8 +1407,8 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
             test_data = b"\x90\x90" + pattern_bytes + b"\x90\x90"
             data_view = memoryview(test_data)
 
-            sig = sigmaker.simd_scan.Signature(sig_str)
-            result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+            sig = _speedups_module().Signature(sig_str)
+            result = _speedups_module().scan_bytes(data_view, sig)
 
             self.assertEqual(
                 result,
@@ -1381,8 +1448,8 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
         print("\n=== Debug: Testing patterns in simulated binary ===")
         for sig_str in test_patterns:
             try:
-                sig = sigmaker.simd_scan.Signature(sig_str)
-                result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+                sig = _speedups_module().Signature(sig_str)
+                result = _speedups_module().scan_bytes(data_view, sig)
                 status = "FOUND" if result != -1 else "NOT FOUND"
                 print(f"Pattern '{sig_str}': {status} at offset {result}")
             except Exception as e:
@@ -1391,8 +1458,8 @@ class TestStandaloneSimdScanning(CoveredUnitTest):
         # The integration test expects to find the pattern at some offset
         # If our simulated binary doesn't contain it, that's why the test fails
         integration_pattern = "E8 ?? ?? ?? ?? 48 89 C7"
-        sig = sigmaker.simd_scan.Signature(integration_pattern)
-        result = sigmaker.simd_scan.scan_bytes(data_view, sig)
+        sig = _speedups_module().Signature(integration_pattern)
+        result = _speedups_module().scan_bytes(data_view, sig)
 
         if result == -1:
             self.skipTest(
@@ -1447,19 +1514,19 @@ class TestSigTextAndSignatureParsing(CoveredUnitTest):
 
     def test_signature_mask_full_and_nibble(self):
         # Full-byte wildcards
-        sig = sigmaker.simd_scan.Signature("11 ?? 22 ?? 33")
+        sig = _speedups_module().Signature("11 ?? 22 ?? 33")
         self.assertEqual(sig.size(), 5)
         self.assertEqual(bytes(sig.data_ptr()), b"\x11\x00\x22\x00\x33")
         self.assertEqual(_mask_bytes(sig), b"\xff\x00\xff\x00\xff")
 
         # Nibble wildcards: upper/lower nibble masking
-        sig2 = sigmaker.simd_scan.Signature("?1 2? 3?")
+        sig2 = _speedups_module().Signature("?1 2? 3?")
         self.assertEqual(sig2.size(), 3)
         self.assertEqual(bytes(sig2.data_ptr()), b"\x01\x20\x30")
         self.assertEqual(_mask_bytes(sig2), b"\x0f\xf0\xf0")
 
         # Mixed concrete & wildcard nibbles across several tokens
-        sig3 = sigmaker.simd_scan.Signature("4? ?F ?? 7A A7")
+        sig3 = _speedups_module().Signature("4? ?F ?? 7A A7")
         self.assertEqual(bytes(sig3.data_ptr()), b"\x40\x0f\x00\x7a\xa7")
         self.assertEqual(_mask_bytes(sig3), b"\xf0\x0f\x00\xff\xff")
 
@@ -1477,13 +1544,13 @@ class TestSigTextAndSignatureParsing(CoveredUnitTest):
         ]
         for s in bad:
             with self.assertRaises((ValueError, AssertionError), msg=f"input={s!r}"):
-                sigmaker.simd_scan.Signature(s)
+                _speedups_module().Signature(s)
 
     def test_signature_bytes_and_mask_roundtrip(self):
         # Generate all hex bytes 00..FF and make sure each parses correctly alone.
         for hi, lo in itertools.product("0123456789ABCDEF", repeat=2):
             tok = f"{hi}{lo}"
-            sig = sigmaker.simd_scan.Signature(tok)
+            sig = _speedups_module().Signature(tok)
             self.assertEqual(sig.size(), 1)
             self.assertEqual(bytes(sig.data_ptr()), bytes([int(tok, 16)]))
             self.assertIsNone(sig.mask_ptr())
@@ -1742,11 +1809,7 @@ class TestSignatureSearcherInput(CoveredUnitTest):
         msg.assert_called_once_with("Unrecognized signature type\n")
 
     def test_search_accepts_nibble_wildcards_without_simd(self):
-        with patch.object(
-            sigmaker,
-            "SIMD_SPEEDUP_AVAILABLE",
-            False,
-        ), patch.object(
+        with _without_speedups(), patch.object(
             sigmaker.SignatureSearcher,
             "find_all",
             return_value=[],
@@ -1920,7 +1983,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         self.assertEqual(results[0].search_pattern, "48 8B ? 90 90")
         self.assertEqual(results[0].normalized_signature, "48 8B ?? 90 90")
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_search_rejects_match_across_address_gap(self):
         buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
         buf._buffer.extend(b"\xAA\xDD\xF1\xBB")
@@ -1953,11 +2016,10 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         for simd_available, text in cases:
             with self.subTest(simd_available=simd_available):
                 loaded = MagicMock(imagebase=0x140000000)
-                with patch.object(
-                    sigmaker,
-                    "SIMD_SPEEDUP_AVAILABLE",
-                    simd_available,
-                ), patch.object(
+                speedups = (
+                    _with_test_speedups() if simd_available else _without_speedups()
+                )
+                with speedups, patch.object(
                     sigmaker,
                     "ProgressDialog",
                     MagicMock(),
@@ -1988,11 +2050,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         loaded = MagicMock()
         loaded.imagebase = 0x1000
 
-        with patch.object(
-            sigmaker,
-            "SIMD_SPEEDUP_AVAILABLE",
-            False,
-        ), patch.object(
+        with _without_speedups(), patch.object(
             sigmaker,
             "ProgressDialog",
             MagicMock(),
@@ -2020,11 +2078,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         self.assertEqual(normal_call.kwargs["scope"], (0x3000, 0x3400))
 
     def test_search_does_not_load_simd_buffer_for_invalid_or_empty_batch(self):
-        with patch.object(
-            sigmaker,
-            "SIMD_SPEEDUP_AVAILABLE",
-            True,
-        ), patch.object(
+        with _with_test_speedups(), patch.object(
             sigmaker.InMemoryBuffer,
             "load",
         ) as load:
@@ -2040,11 +2094,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
     def test_search_passes_resolved_scope_to_non_simd_scan(self):
         seg = MagicMock(start_ea=0x3000, end_ea=0x3400)
 
-        with patch.object(
-            sigmaker,
-            "SIMD_SPEEDUP_AVAILABLE",
-            False,
-        ), patch.object(
+        with _without_speedups(), patch.object(
             sigmaker.idaapi,
             "getseg",
             return_value=seg,
@@ -2071,11 +2121,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         )
 
     def test_search_scope_without_segment_falls_back_to_whole_database(self):
-        with patch.object(
-            sigmaker,
-            "SIMD_SPEEDUP_AVAILABLE",
-            False,
-        ), patch.object(
+        with _without_speedups(), patch.object(
             sigmaker.idaapi,
             "getseg",
             return_value=None,
@@ -2095,11 +2141,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         loaded = MagicMock()
         loaded.imagebase = 0x1000
 
-        with patch.object(
-            sigmaker,
-            "SIMD_SPEEDUP_AVAILABLE",
-            True,
-        ), patch.object(
+        with _with_test_speedups(), patch.object(
             sigmaker,
             "ProgressDialog",
             MagicMock(),
@@ -2281,11 +2323,7 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         self.assertIn("Unrecognized", results[0].error)
 
     def test_search_propagates_real_ida_scan_cancellation(self):
-        with patch.object(
-            sigmaker,
-            "SIMD_SPEEDUP_AVAILABLE",
-            False,
-        ), patch.object(
+        with _without_speedups(), patch.object(
             sigmaker.idaapi,
             "BADADDR",
             0xFFFFFFFFFFFFFFFF,
@@ -2331,18 +2369,10 @@ class TestBatchSignatureSearcher(CoveredUnitTest):
         shared_buf.data.return_value = memoryview(b"\x90\x90")
         shared_buf.offset_mapper.return_value = lambda offset: 0x1000 + offset
 
-        with patch.object(
-            sigmaker,
-            "SIMD_SPEEDUP_AVAILABLE",
-            True,
-        ), patch.object(
+        with _with_test_speedups(scan_bytes=MagicMock(return_value=0)), patch.object(
             sigmaker,
             "_CANCEL_POLL_STRIDE",
             1,
-        ), patch.object(
-            sigmaker,
-            "_simd_scan_bytes",
-            return_value=0,
         ), patch.object(
             sigmaker.idaapi,
             "inf_get_min_ea",
@@ -2818,19 +2848,19 @@ class TestBatchSearchFormatters(CoveredUnitTest):
 class TestSIMDScannerEquivalence(CoveredUnitTest):
     def _assert_match_all_kinds(self, hay: bytes, pat: str, expect: int):
         # Portable
-        s0 = sigmaker.simd_scan.Signature(pat, simd_kind=0)
+        s0 = _speedups_module().Signature(pat, simd_kind=0)
         s0.set_simd_kind(0)
-        off0 = sigmaker.simd_scan.scan_bytes(memoryview(hay), s0)
+        off0 = _speedups_module().scan_bytes(memoryview(hay), s0)
 
         # AVX2 (will fall back if not compiled for x86; still must be correct)
-        s1 = sigmaker.simd_scan.Signature(pat, simd_kind=1)
+        s1 = _speedups_module().Signature(pat, simd_kind=1)
         s1.set_simd_kind(1)
-        off1 = sigmaker.simd_scan.scan_bytes(memoryview(hay), s1)
+        off1 = _speedups_module().scan_bytes(memoryview(hay), s1)
 
         # NEON (same story: correct even if compiled w/o NEON)
-        s2 = sigmaker.simd_scan.Signature(pat, simd_kind=2)
+        s2 = _speedups_module().Signature(pat, simd_kind=2)
         s2.set_simd_kind(2)
-        off2 = sigmaker.simd_scan.scan_bytes(memoryview(hay), s2)
+        off2 = _speedups_module().scan_bytes(memoryview(hay), s2)
 
         # Collect results
         results = [(off0, "portable"), (off1, "AVX2"), (off2, "NEON")]
@@ -3298,6 +3328,7 @@ class TestSearchCancellation(CoveredUnitTest):
 
     def setUp(self):
         """Set up test fixtures."""
+        self._speedups_token = sigmaker._SPEEDUPS_CTX.set(sigmaker._Speedups())
         # Store the original idaapi_user_canceled function if it exists
         self.original_user_canceled = getattr(
             sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
@@ -3305,6 +3336,7 @@ class TestSearchCancellation(CoveredUnitTest):
 
     def tearDown(self):
         """Restore original functions."""
+        sigmaker._SPEEDUPS_CTX.reset(self._speedups_token)
         sigmaker.idaapi_user_canceled = self.original_user_canceled
 
     def test_find_all_cancellation_basic(self):
@@ -3336,10 +3368,6 @@ class TestSearchCancellation(CoveredUnitTest):
         ]
         sigmaker.idaapi.bin_search = mock_bin_search
 
-        # Disable SIMD to test the regular path
-        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
-
         try:
             with sigmaker.UIServices.use(
                 sigmaker.UIServices(cancel_requested=mock_user_canceled)
@@ -3353,8 +3381,7 @@ class TestSearchCancellation(CoveredUnitTest):
             # Verify user_canceled was called
             self.assertGreater(call_count[0], 0)
         finally:
-            # Restore SIMD setting
-            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+            pass
 
     def test_find_all_no_cancellation(self):
         """Test that find_all works normally when not canceled."""
@@ -3380,10 +3407,6 @@ class TestSearchCancellation(CoveredUnitTest):
         ]
         sigmaker.idaapi.bin_search = mock_bin_search
 
-        # Disable SIMD to test the regular path
-        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
-
         try:
             results = sigmaker.SignatureSearcher.find_all("48 8B C4")
 
@@ -3393,8 +3416,7 @@ class TestSearchCancellation(CoveredUnitTest):
             self.assertEqual(int(results[1]), 0x2000)
             self.assertEqual(int(results[2]), 0x3000)
         finally:
-            # Restore SIMD setting
-            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+            pass
 
     def test_find_all_rejects_nonadvancing_native_search(self):
         bin_search = MagicMock(
@@ -3405,10 +3427,6 @@ class TestSearchCancellation(CoveredUnitTest):
             ]
         )
         with patch.object(
-            sigmaker,
-            "SIMD_SPEEDUP_AVAILABLE",
-            False,
-        ), patch.object(
             sigmaker.idaapi,
             "BADADDR",
             0xFFFFFFFFFFFFFFFF,
@@ -3476,10 +3494,6 @@ class TestSearchCancellation(CoveredUnitTest):
         ]
         sigmaker.idaapi.bin_search = mock_bin_search
 
-        # Disable SIMD to test the regular path
-        original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
-
         try:
             with sigmaker.UIServices.use(
                 sigmaker.UIServices(cancel_requested=mock_user_canceled)
@@ -3490,8 +3504,7 @@ class TestSearchCancellation(CoveredUnitTest):
             self.assertGreater(len(results), 0)
             self.assertLess(len(results), 4)
         finally:
-            # Restore SIMD setting
-            sigmaker.SIMD_SPEEDUP_AVAILABLE = original_simd
+            pass
 
     def test_simd_cancellation_returns_partial_results_by_default(self):
         shared_buf = MagicMock()
@@ -3500,18 +3513,10 @@ class TestSearchCancellation(CoveredUnitTest):
         shared_buf.data.return_value = memoryview(b"\x90\x90")
         shared_buf.offset_mapper.return_value = lambda offset: 0x1000 + offset
 
-        with patch.object(
-            sigmaker,
-            "SIMD_SPEEDUP_AVAILABLE",
-            True,
-        ), patch.object(
+        with _with_test_speedups(scan_bytes=MagicMock(return_value=0)), patch.object(
             sigmaker,
             "_CANCEL_POLL_STRIDE",
             1,
-        ), patch.object(
-            sigmaker,
-            "_simd_scan_bytes",
-            return_value=0,
         ), patch.object(
             sigmaker.idaapi,
             "inf_get_min_ea",
@@ -3694,13 +3699,12 @@ class TestUIServices(CoveredUnitTest):
 
 class TestNibbleWildcardFallback(CoveredUnitTest):
     def setUp(self):
-        self._simd_available = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        self._speedups_token = sigmaker._SPEEDUPS_CTX.set(sigmaker._Speedups())
         self._user_canceled = sigmaker.idaapi_user_canceled
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
         sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
 
     def tearDown(self):
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = self._simd_available
+        sigmaker._SPEEDUPS_CTX.reset(self._speedups_token)
         sigmaker.idaapi_user_canceled = self._user_canceled
 
     @staticmethod
@@ -4001,14 +4005,13 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
     """policy=permissive returns a partial GeneratedSignature on cancel.
 
     These tests drive the non-SIMD fallback path (count_matches per step) by
-    forcing SIMD_SPEEDUP_AVAILABLE off, so the patched count_matches stays the
+    binding the no-speedups context, so the patched count_matches stays the
     source of the match count. The partial-on-cancel / progress-message
     behavior under test is identical on both code paths.
     """
 
     def setUp(self):
-        self._original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+        self._speedups_token = sigmaker._SPEEDUPS_CTX.set(sigmaker._Speedups())
         self.original_user_canceled = getattr(
             sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
         )
@@ -4042,7 +4045,7 @@ class TestUniqueSignatureGeneratorPartialOnCancel(CoveredUnitTest):
         self._dialog_patcher.stop()
         self._is_code_patcher.stop()
         sigmaker.idaapi_user_canceled = self.original_user_canceled
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = self._original_simd
+        sigmaker._SPEEDUPS_CTX.reset(self._speedups_token)
 
     def _make_generator(self, cancel_after_iterations: int):
         """Construct a UniqueSignatureGenerator whose progress_reporter cancels
@@ -4283,7 +4286,7 @@ class TestUniqueSignatureGeneratorSeedThenRefine(CoveredUnitTest):
             ask_longer_signature=False,
         )
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_seed_once_then_refine_to_unique(self):
         processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
         gen = sigmaker.UniqueSignatureGenerator(processor)
@@ -4321,7 +4324,7 @@ class TestUniqueSignatureGeneratorSeedThenRefine(CoveredUnitTest):
         # Two 0x90 bytes survive to uniqueness (offset 0: 0x90 0x90).
         self.assertEqual(len(result.signature), 2)
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_wildcard_growth_drops_candidate_across_address_gap(self):
         append_count = 0
         processor = MagicMock()
@@ -4364,7 +4367,7 @@ class TestUniqueSignatureGeneratorSeedThenRefine(CoveredUnitTest):
         self.assertEqual(append_count, 3)
         self.assertEqual(len(result.signature), 3)
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_trailing_wildcard_gap_only_uniqueness_is_rejected(self):
         append_count = 0
         processor = MagicMock()
@@ -4637,7 +4640,7 @@ class TestSignatureSearcherCountMatches(CoveredUnitTest):
 
 def _refine_offsets_with_python_fallback(data, offsets, index, value, mask):
     candidates = array.array("Q", offsets)
-    with patch.object(sigmaker, "SIMD_SPEEDUP_AVAILABLE", False):
+    with _without_speedups():
         count = sigmaker._refine_offsets_into(
             data,
             candidates,
@@ -4696,6 +4699,243 @@ class TestRefineOffsetsInto(CoveredUnitTest):
         )
 
 
+class TestSpeedupsCompatibility(CoveredUnitTest):
+    """Optional extension compatibility is validated before its kernels run."""
+
+    def setUp(self):
+        self._speedups_token = sigmaker._SPEEDUPS_CTX.set(sigmaker._Speedups())
+
+    def tearDown(self):
+        sigmaker._SPEEDUPS_CTX.reset(self._speedups_token)
+
+    @staticmethod
+    def _module(**changes):
+        return _test_speedups_module(**changes)
+
+    def test_compatible_extension_enables_simd(self):
+        module = self._module()
+
+        self.assertTrue(sigmaker._configure_speedups(module))
+        self.assertTrue(sigmaker._Speedups.current().available)
+        self.assertIs(sigmaker._Speedups.current().module, module)
+
+    def test_missing_api_declaration_disables_simd(self):
+        module = self._module()
+        del module.SPEEDUPS_API_MIN
+
+        self.assertFalse(sigmaker._configure_speedups(module))
+        self.assertFalse(sigmaker._Speedups.current().available)
+        self.assertIn("SPEEDUPS_API_MIN", sigmaker._Speedups.current().diagnostic)
+
+    def test_unsupported_api_range_disables_simd(self):
+        module = self._module(SPEEDUPS_API_MIN=2, SPEEDUPS_API_MAX=2)
+
+        self.assertFalse(sigmaker._configure_speedups(module))
+        self.assertFalse(sigmaker._Speedups.current().available)
+        self.assertIn("out of date", sigmaker._Speedups.current().diagnostic)
+
+    def test_non_callable_required_kernel_disables_simd(self):
+        module = self._module(refine_offsets=None)
+
+        self.assertFalse(sigmaker._configure_speedups(module))
+        self.assertFalse(sigmaker._Speedups.current().available)
+        self.assertIn("refine_offsets", sigmaker._Speedups.current().diagnostic)
+
+    def test_missing_kernel_at_configuration_uses_python_refinement(self):
+        module = self._module()
+        del module.refine_offsets
+        self.assertFalse(sigmaker._configure_speedups(module))
+        candidates = array.array("Q", [0, 1, 2, 3])
+
+        count = sigmaker._refine_offsets_into(
+            memoryview(bytearray(b"\x90\x48\x90\x48\x90")),
+            candidates,
+            len(candidates),
+            1,
+            0x48,
+            0xFF,
+        )
+
+        self.assertEqual(list(candidates[:count]), [0, 2])
+        self.assertFalse(sigmaker._Speedups.current().available)
+        self.assertIn("refine_offsets", sigmaker._Speedups.current().diagnostic)
+
+    def test_native_attribute_error_propagates_without_disabling_simd(self):
+        def raise_inside_native_call(*_args):
+            raise AttributeError("inside native refine_offsets")
+
+        module = self._module(refine_offsets=raise_inside_native_call)
+        self.assertTrue(sigmaker._configure_speedups(module))
+        candidates = array.array("Q", [0])
+
+        with self.assertRaisesRegex(AttributeError, "inside native refine_offsets"):
+            sigmaker._refine_offsets_into(
+                memoryview(bytearray(b"\x90\x90")),
+                candidates,
+                1,
+                0,
+                0x90,
+                0xFF,
+            )
+
+        self.assertTrue(sigmaker._Speedups.current().available)
+
+    def test_generator_uses_python_fallback_after_stale_kernel_is_rejected(self):
+        module = self._module()
+        del module.refine_offsets
+        self.assertFalse(sigmaker._configure_speedups(module))
+        processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        generator = sigmaker.UniqueSignatureGenerator(processor)
+
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=True,
+            wildcard_optimized=False,
+            ask_longer_signature=False,
+        )
+        dialog = MagicMock()
+        dialog.__enter__.return_value = dialog
+        with patch.object(
+            sigmaker, "idaapi_user_canceled", return_value=False
+        ), patch.object(
+            sigmaker, "is_address_marked_as_code", return_value=True
+        ), patch.object(
+            sigmaker, "ProgressDialog", return_value=dialog
+        ), patch.object(
+            sigmaker.idaapi, "BADADDR", 0xFFFFFFFFFFFFFFFF
+        ), patch.object(
+            sigmaker.idaapi, "decode_insn", return_value=1
+        ), patch.object(
+            sigmaker.idaapi, "get_byte", return_value=0x90
+        ), patch.object(
+            sigmaker.idaapi, "get_bytes", return_value=b"\x90"
+        ), patch.object(
+            sigmaker.idaapi, "get_func", return_value=None
+        ), patch.object(
+            sigmaker.SignatureSearcher,
+            "count_matches",
+            side_effect=[2, 1],
+        ) as count_matches, patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all_offsets",
+            side_effect=AssertionError("stale speedups must not seed with SIMD"),
+        ):
+            result = generator.generate(
+                0x1000,
+                cfg,
+                policy=sigmaker.GenerationPolicy.strict(),
+            )
+
+        self.assertEqual(result.status, sigmaker.GenerationStatus.UNIQUE)
+        self.assertEqual(len(result.signature), 2)
+        self.assertEqual(count_matches.call_count, 2)
+        self.assertFalse(sigmaker._Speedups.current().available)
+
+    def test_speedups_remediation_message_has_hcli_and_manual_commands(self):
+        sigmaker._SPEEDUPS_CTX.set(
+            sigmaker._Speedups(
+                diagnostic="missing required callable refine_offsets",
+                path=pathlib.Path("/tmp/simd_scan.so"),
+            )
+        )
+
+        with patch.object(
+            sigmaker,
+            "_ida_python_interpreter",
+            return_value=pathlib.Path("/ida/python/bin/python3"),
+        ):
+            message = sigmaker._speedups_remediation_message()
+
+        self.assertIn("hcli plugin upgrade SigMaker", message)
+        self.assertIn('"/ida/python/bin/python3" -m pip install --upgrade "sigmaker==1.13.0"', message)
+        self.assertIn("/tmp/simd_scan.so", message)
+        self.assertIn("github.com/mahmoudimus/ida-sigmaker/issues", message)
+
+    def test_runtime_disable_logs_update_commands(self):
+        logger = logging.getLogger("sigmaker.speedups-test")
+        with patch.object(sigmaker, "LOGGER", logger), patch.object(
+            logger, "warning"
+        ) as warning, patch.object(
+            sigmaker,
+            "_ida_python_interpreter",
+            return_value=pathlib.Path("/ida/python/bin/python3"),
+        ):
+            self.assertTrue(sigmaker._configure_speedups(self._module()))
+            self.assertFalse(
+                sigmaker._configure_speedups(
+                    self._module(SPEEDUPS_API_MIN=2, SPEEDUPS_API_MAX=2)
+                )
+            )
+
+        warning.assert_called_once()
+        message = warning.call_args.args[1]
+        self.assertIn("hcli plugin upgrade SigMaker", message)
+        self.assertIn('"/ida/python/bin/python3" -m pip install --upgrade', message)
+
+    def test_ida_python_interpreter_uses_exec_prefix(self):
+        prefix = pathlib.Path("/ida/python")
+        expected = prefix / "bin" / "python3"
+
+        with patch.object(
+            sigmaker.sys, "exec_prefix", str(prefix)
+        ), patch.object(
+            pathlib.Path,
+            "is_file",
+            autospec=True,
+            side_effect=lambda path: path == expected,
+        ):
+            self.assertEqual(sigmaker._ida_python_interpreter(), expected)
+
+    def test_speedups_remediation_never_opens_ui_headlessly(self):
+        sigmaker._SPEEDUPS_CTX.set(
+            sigmaker._Speedups(
+                diagnostic="missing required callable refine_offsets"
+            )
+        )
+        warning = MagicMock()
+
+        with patch.object(sigmaker, "_IDA_IS_IDAQ", return_value=False), patch.object(
+            sigmaker, "_IDA_WARNING", warning
+        ):
+            self.assertFalse(sigmaker._show_speedups_remediation())
+
+        warning.assert_not_called()
+
+    def test_speedups_remediation_warns_once_in_graphical_ida(self):
+        sigmaker._SPEEDUPS_CTX.set(
+            sigmaker._Speedups(
+                diagnostic="missing required callable refine_offsets"
+            )
+        )
+        warning = MagicMock()
+
+        with patch.object(sigmaker, "_IDA_IS_IDAQ", return_value=True), patch.object(
+            sigmaker, "_IDA_WARNING", warning
+        ):
+            self.assertTrue(sigmaker._show_speedups_remediation())
+            self.assertFalse(sigmaker._show_speedups_remediation())
+
+        warning.assert_called_once()
+
+    def test_fresh_thread_uses_python_fallback_until_backend_is_bound(self):
+        module = self._module()
+        self.assertTrue(sigmaker._configure_speedups(module))
+        parent_speedups = sigmaker._Speedups.current()
+        observed: list[bool] = []
+
+        def worker():
+            observed.append(sigmaker._Speedups.current().available)
+            with sigmaker._Speedups.use(parent_speedups):
+                observed.append(sigmaker._Speedups.current().available)
+
+        thread = threading.Thread(target=worker)
+        thread.start()
+        thread.join()
+
+        self.assertEqual(observed, [False, True])
+
+
 class TestFindAllOffsets(CoveredUnitTest):
     """find_all_offsets returns raw buffer offsets plus the buffer used."""
 
@@ -4714,7 +4954,7 @@ class TestFindAllOffsets(CoveredUnitTest):
         buf.file_size = len(b)
         return buf
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_offsets_match_find_all_positions(self):
         # Pattern "90" should be found at every 0x90 byte; offsets are
         # buffer-relative (0-based), and the returned buf is the one passed.
@@ -4776,15 +5016,14 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
     """Iterates every instruction in a function and returns the shortest unique signature.
 
     These tests drive the non-SIMD fallback path (count_matches per step) by
-    forcing SIMD_SPEEDUP_AVAILABLE off, so a patched count_matches stays the
+    binding the no-speedups context, so a patched count_matches stays the
     source of the match count. The anchor-selection / pruning logic under test
     is identical on both code paths; the SIMD seed-then-refine path is covered
     separately and against the real binary in the integration suite.
     """
 
     def setUp(self):
-        self._original_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
+        self._speedups_token = sigmaker._SPEEDUPS_CTX.set(sigmaker._Speedups())
         self.original_user_canceled = getattr(
             sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
         )
@@ -4827,7 +5066,7 @@ class TestMinimalFunctionSignatureGenerator(CoveredUnitTest):
         self._load_patcher.stop()
         self._dialog_patcher.stop()
         sigmaker.idaapi_user_canceled = self.original_user_canceled
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = self._original_simd
+        sigmaker._SPEEDUPS_CTX.reset(self._speedups_token)
 
     def _make_pfn(self, start_ea: int, end_ea: int):
         pfn = MagicMock()
@@ -5130,7 +5369,7 @@ class TestMinimalFunctionSignatureGeneratorSeedThenRefine(CoveredUnitTest):
             max_single_signature_length=max_len,
         )
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_seed_is_deferred_until_min_then_refines(self):
         processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
         gen = sigmaker.MinimalFunctionSignatureGenerator(processor)
@@ -5167,7 +5406,7 @@ class TestMinimalFunctionSignatureGeneratorSeedThenRefine(CoveredUnitTest):
         )
         self.assertEqual(len(result.signature), 5)
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_wildcard_growth_drops_candidate_across_address_gap(self):
         pattern = b"\x10\x20\x30\x40\x50"
         seed_buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
@@ -5222,7 +5461,7 @@ class TestMinimalFunctionSignatureGeneratorSeedThenRefine(CoveredUnitTest):
         self.assertTrue(signature[5].is_wildcard)
         self.assertFalse(signature[6].is_wildcard)
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_short_trimmed_nonunique_pattern_keeps_growing(self):
         seed_buf = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/x"))
         seed_buf._buffer.extend(b"\x10\x20\x30\x40\x50\x60")
@@ -5283,25 +5522,21 @@ class TestSignatureSearcherBufferCache(CoveredUnitTest):
         fake_buf.file_size = size
         return fake_buf
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_find_all_simd_skips_load_when_buf_provided(self):
         """When _find_all_simd is given a buf=..., it must NOT call InMemoryBuffer.load."""
-        with patch.object(
+        with _with_test_speedups(scan_bytes=MagicMock(return_value=-1)), patch.object(
             sigmaker.InMemoryBuffer, "load"
-        ) as mp_load, patch.object(
-            sigmaker, "_simd_scan_bytes", return_value=-1
-        ), patch.object(sigmaker, "ProgressDialog"):
+        ) as mp_load, patch.object(sigmaker, "ProgressDialog"):
             sigmaker.SignatureSearcher._find_all_simd("48 8B C4", buf=self._fake_buf())
         mp_load.assert_not_called()
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_find_all_simd_loads_when_buf_is_none(self):
         """When _find_all_simd is given buf=None (default), it loads fresh (today's behavior)."""
-        with patch.object(
+        with _with_test_speedups(scan_bytes=MagicMock(return_value=-1)), patch.object(
             sigmaker.InMemoryBuffer, "load", return_value=self._fake_buf()
-        ) as mp_load, patch.object(
-            sigmaker, "_simd_scan_bytes", return_value=-1
-        ), patch.object(sigmaker, "ProgressDialog"):
+        ) as mp_load, patch.object(sigmaker, "ProgressDialog"):
             sigmaker.SignatureSearcher._find_all_simd("48 8B C4")
         mp_load.assert_called_once()
 
@@ -5990,7 +6225,7 @@ class TestSeedViaIndex(CoveredUnitTest):
         sig = self._sig([(0x90, False), (0x91, False)])
         self.assertIsNone(sigmaker._seed_via_index(sig, None, buf))
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_rejects_seed_that_exists_only_across_address_gap(self):
         buf = self._segmented_buffer(b"\x00\xAA", b"\xBB\x00")
         index = sigmaker._ByteIndex.build(buf.data())
@@ -5998,7 +6233,7 @@ class TestSeedViaIndex(CoveredUnitTest):
         candidates, count = sigmaker._seed_via_index(sig, index, buf)
         self.assertEqual(list(candidates[:count]), [])
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_keeps_valid_seeds_around_gap_candidate(self):
         buf = self._segmented_buffer(b"\xAA\xBB\xAA", b"\xBB\xAA\xBB")
         index = sigmaker._ByteIndex.build(buf.data())
@@ -6129,7 +6364,7 @@ class TestValidatedTrimmedSignature(CoveredUnitTest):
 class TestByteIndexOneByte(CoveredUnitTest):
     """1-byte bucket accessors derived from the 2-byte index."""
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_bucket_size1_and_candidates1(self):
         # 0x90 appears at offsets 0,2,4,6 but only 0,2,4 are 2-byte-window
         # starts (offset 6 is the last byte, n-1, not a window start).
@@ -6140,7 +6375,7 @@ class TestByteIndexOneByte(CoveredUnitTest):
         self.assertEqual(idx.bucket_size1(0xEE), 0)
         self.assertEqual(list(idx.candidates1(0xEE)), [])
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_bucket_size1_equals_sum_of_two_byte_buckets(self):
         import random
         rng = random.Random(7)
@@ -6154,7 +6389,7 @@ class TestByteIndexOneByte(CoveredUnitTest):
 class TestByteIndex(CoveredUnitTest):
     """The _ByteIndex holder over build_byte_index."""
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_build_and_lookup(self):
         data = memoryview(bytearray(b"\x01\x02\x01\x02\x03"))
         idx = sigmaker._ByteIndex.build(data)
@@ -6163,7 +6398,7 @@ class TestByteIndex(CoveredUnitTest):
         self.assertEqual(idx.bucket_size(key), 2)
         self.assertEqual(sorted(idx.candidates(key)), [0, 2])
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_build_returns_none_for_short_buffer(self):
         self.assertIsNone(
             sigmaker._ByteIndex.build(memoryview(bytearray(b"\x01")))
@@ -6189,7 +6424,7 @@ class TestIndexSeedEquivalence(CoveredUnitTest):
                 out.append(c)
         return out
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_index_seed_equals_brute_force(self):
         import random
         rng = random.Random(99)
@@ -6212,7 +6447,7 @@ class TestIndexSeedEquivalence(CoveredUnitTest):
             )
             self.assertIn(anchor, seeded)
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_wildcard_heavy_one_byte_path_equals_brute_force(self):
         import random
         rng = random.Random(2026)
@@ -6235,7 +6470,7 @@ class TestIndexSeedEquivalence(CoveredUnitTest):
                              f"anchor {anchor}: 1-byte path != brute force")
             self.assertIn(anchor, seeded)
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_end_of_buffer_pattern_found(self):
         # Pattern at the very end of the buffer, with its only exact byte as
         # the last pattern byte -> exercises the n-1 boundary handling.
@@ -6265,45 +6500,56 @@ class TestRefineOffsetsCython(CoveredUnitTest):
         import array
         return array.array("I", items)
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
+    def test_declares_supported_speedups_api(self):
+        self.assertLessEqual(
+            _speedups_module().SPEEDUPS_API_MIN,
+            sigmaker._Speedups.REQUIRED_API,
+        )
+        self.assertLessEqual(
+            sigmaker._Speedups.REQUIRED_API,
+            _speedups_module().SPEEDUPS_API_MAX,
+        )
+
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_exact_byte_compacts_in_place(self):
         data = memoryview(bytearray(b"\x90\x48\x90\x48\x90"))
         cands = self._arr([0, 1, 2, 3])
-        n = sigmaker.simd_scan.refine_offsets(data, cands, 4, 1, 0x48, 0xFF)
+        n = _speedups_module().refine_offsets(data, cands, 4, 1, 0x48, 0xFF)
         self.assertEqual(n, 2)
         self.assertEqual(list(cands[:n]), [0, 2])
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_full_wildcard_keeps_all(self):
         data = memoryview(bytearray(b"\x01\x02\x03\x04"))
         cands = self._arr([0, 1, 2])
-        n = sigmaker.simd_scan.refine_offsets(data, cands, 3, 1, 0x00, 0x00)
+        n = _speedups_module().refine_offsets(data, cands, 3, 1, 0x00, 0x00)
         self.assertEqual(n, 3)
         self.assertEqual(list(cands[:n]), [0, 1, 2])
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_nibble_mask(self):
         data = memoryview(bytearray(b"\x4A\x4B\x9C"))
         cands = self._arr([0, 1, 2])
-        n = sigmaker.simd_scan.refine_offsets(data, cands, 3, 0, 0x40, 0xF0)
+        n = _speedups_module().refine_offsets(data, cands, 3, 0, 0x40, 0xF0)
         self.assertEqual(n, 2)
         self.assertEqual(list(cands[:n]), [0, 1])
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_out_of_bounds_dropped(self):
         data = memoryview(bytearray(b"\x90\x90"))
         cands = self._arr([0, 1])
-        n = sigmaker.simd_scan.refine_offsets(data, cands, 2, 2, 0x90, 0xFF)
+        n = _speedups_module().refine_offsets(data, cands, 2, 2, 0x90, 0xFF)
         self.assertEqual(n, 0)
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_empty(self):
         data = memoryview(bytearray(b"\x90"))
         cands = self._arr([])
-        n = sigmaker.simd_scan.refine_offsets(data, cands, 0, 0, 0x90, 0xFF)
+        n = _speedups_module().refine_offsets(data, cands, 0, 0, 0x90, 0xFF)
         self.assertEqual(n, 0)
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_matches_python_refine(self):
         import array, random
         rng = random.Random(11)
@@ -6322,24 +6568,24 @@ class TestRefineOffsetsCython(CoveredUnitTest):
                 and (mv[candidate + j] & mask) == target
             ]
             arr = array.array("I", cand_list)
-            n = sigmaker.simd_scan.refine_offsets(mv, arr, len(cand_list), j, value, mask)
+            n = _speedups_module().refine_offsets(mv, arr, len(cand_list), j, value, mask)
             self.assertEqual(sorted(arr[:n]), sorted(py))
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_supports_uint64_candidate_array(self):
         data = memoryview(bytearray(b"\x90\x48\x90\x48\x90"))
         candidates = array.array("Q", [0, 1, 2, 3])
-        count = sigmaker.simd_scan.refine_offsets(
+        count = _speedups_module().refine_offsets(
             data, candidates, 4, 1, 0x48, 0xFF
         )
         self.assertEqual(count, 2)
         self.assertEqual(list(candidates[:count]), [0, 2])
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_uint64_candidate_past_py_ssize_is_dropped(self):
         data = memoryview(bytearray(b"\x90"))
         candidates = array.array("Q", [(1 << 64) - 1])
-        count = sigmaker.simd_scan.refine_offsets(
+        count = _speedups_module().refine_offsets(
             data, candidates, 1, 0, 0x90, 0xFF
         )
         self.assertEqual(count, 0)
@@ -6392,7 +6638,7 @@ class TestSearchRangeCandidateFilter(CoveredUnitTest):
     def test_keeps_candidate_ending_exactly_at_range_end(self):
         self.assertEqual(self._filter([2], 2, [0], [4]), [2])
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_supports_offsets_past_four_gibibytes(self):
         start = 0x1_0000_0000
         candidates = array.array("Q", [start])
@@ -6406,7 +6652,7 @@ class TestSearchRangeCandidateFilter(CoveredUnitTest):
         self.assertEqual(count, 1)
         self.assertEqual(candidates[0], start)
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_rejects_candidate_whose_end_would_overflow_uint64(self):
         maximum = (1 << 64) - 1
         candidates = array.array("Q", [maximum - 1])
@@ -6420,7 +6666,7 @@ class TestSearchRangeCandidateFilter(CoveredUnitTest):
         self.assertEqual(count, 0)
 
     def test_python_fallback_matches_expected_ranges(self):
-        with patch.object(sigmaker, "SIMD_SPEEDUP_AVAILABLE", False):
+        with _without_speedups():
             self.assertEqual(
                 self._filter([0, 2, 3, 4, 6, 7], 2, [0, 4], [4, 8]),
                 [0, 2, 4, 6],
@@ -6459,7 +6705,7 @@ class TestSearchRangeCandidateFilter(CoveredUnitTest):
                     )
 
     def test_randomized_python_and_cython_results_match(self):
-        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
+        if not sigmaker._Speedups.current().available:
             self.skipTest("SIMD speedup not available")
         rng = random.Random(8675309)
         for _ in range(200):
@@ -6471,7 +6717,7 @@ class TestSearchRangeCandidateFilter(CoveredUnitTest):
                 rng.sample(range(total), rng.randint(0, min(total, 200)))
             )
             pattern_size = rng.randint(1, 24)
-            with patch.object(sigmaker, "SIMD_SPEEDUP_AVAILABLE", False):
+            with _without_speedups():
                 expected = self._filter(
                     candidates, pattern_size, starts, ends
                 )
@@ -6484,21 +6730,21 @@ class TestSearchRangeCandidateFilter(CoveredUnitTest):
 class TestBuildByteIndex(CoveredUnitTest):
     """The Cython 2-byte counting-sort index."""
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_heads_and_positions_shape(self):
         data = memoryview(bytearray(b"\x01\x02\x01\x02\x03"))
-        heads, positions = sigmaker.simd_scan.build_byte_index(data)
+        heads, positions = _speedups_module().build_byte_index(data)
         self.assertEqual(len(heads), 65537)
         self.assertEqual(len(positions), len(data) - 1)  # 4 windows
         self.assertEqual(heads[0], 0)
         self.assertEqual(heads[65536], len(data) - 1)
         self.assertTrue(all(heads[i] <= heads[i + 1] for i in range(65536)))
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_bucket_contains_correct_offsets(self):
         # windows: (0)01 02, (1)02 01, (2)01 02, (3)02 03
         data = memoryview(bytearray(b"\x01\x02\x01\x02\x03"))
-        heads, positions = sigmaker.simd_scan.build_byte_index(data)
+        heads, positions = _speedups_module().build_byte_index(data)
         key_0102 = (0x01 << 8) | 0x02
         start, end = heads[key_0102], heads[key_0102 + 1]
         self.assertEqual(sorted(positions[start:end]), [0, 2])
@@ -6507,9 +6753,9 @@ class TestBuildByteIndex(CoveredUnitTest):
         self.assertEqual(sorted(positions[s2:e2]), [3])
         self.assertEqual(end - start, 2)  # bucket_size of 01 02
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_short_buffer_returns_empty_positions(self):
-        heads, positions = sigmaker.simd_scan.build_byte_index(
+        heads, positions = _speedups_module().build_byte_index(
             memoryview(bytearray(b"\x01"))
         )
         self.assertEqual(len(positions), 0)
@@ -6525,12 +6771,12 @@ class TestSeedOffsetsKernel(unittest.TestCase):
         return [p - s for p in bucket if p >= s and (p - s) + m <= n]
 
     def setUp(self):
-        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
+        if not sigmaker._Speedups.current().available:
             self.skipTest("SIMD speedup not available")
 
     def _check(self, bucket, s, m, n):
         import array as _arr
-        arr, count = sigmaker.simd_scan.seed_offsets(
+        arr, count = _speedups_module().seed_offsets(
             _arr.array("I", bucket), s, m, n
         )
         self.assertEqual(len(arr), len(bucket) + 1)   # capacity = bucket+1
@@ -6571,7 +6817,7 @@ class TestSeedDeferredWhenAllWildcard(unittest.TestCase):
     scan) until an exact byte appears, then seeds via the index."""
 
     def setUp(self):
-        if not sigmaker.SIMD_SPEEDUP_AVAILABLE:
+        if not sigmaker._Speedups.current().available:
             self.skipTest("SIMD speedup not available")
         self._orig_canceled = getattr(
             sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
@@ -6942,25 +7188,25 @@ class TestSearchAddressMapping(unittest.TestCase):
             [(1, 3)],
         )
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_find_all_simd_reports_real_address_in_second_segment(self):
         buf = self._two_segment_buffer()
         matches = sigmaker.SignatureSearcher._find_all_simd("F1 B5 04 00", buf=buf)
         self.assertEqual([int(m.address) for m in matches], [0x1F78000])
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_find_all_simd_accepts_match_across_contiguous_segments(self):
         buf = self._adjacent_segment_buffer()
         matches = sigmaker.SignatureSearcher._find_all_simd("BB CC", buf=buf)
         self.assertEqual([int(match.address) for match in matches], [0x1001])
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_find_all_simd_rejects_match_across_address_gap(self):
         buf = self._two_segment_buffer()
         matches = sigmaker.SignatureSearcher._find_all_simd("DD F1", buf=buf)
         self.assertEqual(matches, [])
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_find_all_offsets_rejects_match_across_address_gap(self):
         buf = self._two_segment_buffer()
         offsets, returned = sigmaker.SignatureSearcher.find_all_offsets(
@@ -6969,7 +7215,7 @@ class TestSearchAddressMapping(unittest.TestCase):
         self.assertIs(returned, buf)
         self.assertEqual(offsets, [])
 
-    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_find_all_offsets_accepts_match_across_contiguous_segments(self):
         buf = self._adjacent_segment_buffer()
         offsets, returned = sigmaker.SignatureSearcher.find_all_offsets(
@@ -7046,18 +7292,17 @@ class TestSearchScope(unittest.TestCase):
     that segment instead of the whole database."""
 
     def setUp(self):
-        self._saved_simd = sigmaker.SIMD_SPEEDUP_AVAILABLE
+        self._speedups_token = sigmaker._SPEEDUPS_CTX.set(sigmaker._Speedups())
         self._saved_canceled = sigmaker.idaapi_user_canceled
         sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
 
     def tearDown(self):
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = self._saved_simd
+        sigmaker._SPEEDUPS_CTX.reset(self._speedups_token)
         sigmaker.idaapi_user_canceled = self._saved_canceled
 
     def test_find_all_scope_bounds_binsearch_to_segment(self):
         # non-SIMD path: bin_search runs over [scope_start, scope_end), not the
         # whole [min_ea, max_ea).
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = False
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
         sigmaker.idaapi.inf_get_min_ea = MagicMock(return_value=0x1000)
         sigmaker.idaapi.inf_get_max_ea = MagicMock(return_value=0xFFFFFF)
@@ -7080,8 +7325,7 @@ class TestSearchScope(unittest.TestCase):
     def test_find_all_scope_loads_single_segment_for_simd(self):
         # SIMD path: a scoped search with no buffer loads only that segment and
         # threads it into the scan.
-        sigmaker.SIMD_SPEEDUP_AVAILABLE = True
-        with patch.object(sigmaker, "ProgressDialog", MagicMock()), \
+        with _with_test_speedups(), patch.object(sigmaker, "ProgressDialog", MagicMock()), \
                 patch.object(sigmaker.InMemoryBuffer, "load") as load, \
                 patch.object(
                     sigmaker.SignatureSearcher, "_find_all_simd", return_value=[]

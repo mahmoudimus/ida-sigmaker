@@ -106,6 +106,30 @@ selects the wheel for the active CPython version and architecture. SigMaker
 uses the extension automatically when it is available and shows its status in
 the top-right menu bar:
 
+### Compatibility and updates
+
+The speedup wheel is optional. SigMaker validates the API range and required
+native entry points on the exact extension module it loaded before enabling
+SIMD. A stale, partial, or incompatible wheel is disabled before it can affect
+a search; the pure-Python implementation continues with the same results.
+
+In interactive IDA, SigMaker shows one update prompt per process with the
+loaded extension path and the applicable command:
+
+- HCLI install: `hcli plugin upgrade SigMaker`
+- Manual or standalone install:
+  `"<IDA Python from sys.exec_prefix>" -m pip install --upgrade "sigmaker==<plugin version>"`
+
+Restart IDA after updating. The manual command intentionally derives its
+interpreter from `sys.exec_prefix`; embedded IDA hosts can report `ida.exe` as
+`sys.executable`, which cannot run pip. If updating does not resolve the
+problem, open an [issue](https://github.com/mahmoudimus/ida-sigmaker/issues)
+and include the path from the prompt.
+
+Library and headless users need no special setup. SigMaker never opens an IDA
+dialog outside the graphical plugin, and an unavailable speedup extension is
+logged then bypassed automatically.
+
 ### SIMD Enabled
 
 ![](./assets/simd_enabled.png)

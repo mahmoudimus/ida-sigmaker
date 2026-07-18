@@ -5135,7 +5135,11 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
             message = sigmaker._Speedups.current().remediation_message()
 
         self.assertIn("hcli plugin upgrade SigMaker", message)
-        self.assertIn('"/ida/python/bin/python3" -m pip install --upgrade "sigmaker==1.13.0"', message)
+        self.assertIn(
+            '"/ida/python/bin/python3" -m pip install --upgrade '
+            f'"sigmaker=={sigmaker.PLUGIN_VERSION}"',
+            message,
+        )
         self.assertIn("/tmp/simd_scan.so", message)
         self.assertIn("github.com/mahmoudimus/ida-sigmaker/issues", message)
 

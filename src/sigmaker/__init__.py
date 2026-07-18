@@ -1925,9 +1925,11 @@ class UniqueSignatureGenerator:
         self,
         processor: InstructionProcessor,
         progress_reporter: typing.Optional[ProgressReporter] = None,
+        buf: typing.Optional["InMemoryBuffer"] = None,
     ):
         self.processor = processor
         self.progress_reporter = progress_reporter
+        self.buf = buf
 
     def generate(
         self,
@@ -1973,11 +1975,11 @@ class UniqueSignatureGenerator:
         # first scan; buf holds the segment buffer the offsets index into.
         offsets: typing.Optional["array.array"] = None
         offset_count = 0
-        buf: typing.Optional["InMemoryBuffer"] = None
+        buf = self.buf
         search_ranges: typing.Optional[
             tuple["array.array", "array.array"]
         ] = None
-        if cfg.scope_to_segment:
+        if cfg.scope_to_segment and buf is None:
             # Issue #64: scope uniqueness to the anchor's segment. Pre-load it so
             # the seed scan and every refinement stay within the segment.
             buf = InMemoryBuffer.load(
@@ -2851,6 +2853,7 @@ class SignatureMaker:
         self,
         for_range: bool,
         progress_reporter: typing.Optional[ProgressReporter],
+        buf: typing.Optional["InMemoryBuffer"] = None,
     ) -> UniqueSignatureGenerator | RangeSignatureGenerator:
         """Factory method to create the appropriate signature generator.
 
@@ -2866,7 +2869,7 @@ class SignatureMaker:
         """
         if for_range:
             return RangeSignatureGenerator(self._instruction_processor, progress_reporter)
-        return UniqueSignatureGenerator(self._instruction_processor, progress_reporter)
+        return UniqueSignatureGenerator(self._instruction_processor, progress_reporter, buf)
 
     def make_signature(
         self,
@@ -2876,6 +2879,7 @@ class SignatureMaker:
         *,
         progress_reporter: typing.Optional[ProgressReporter] = None,
         policy: GenerationPolicy = GenerationPolicy.strict(),
+        buf: typing.Optional["InMemoryBuffer"] = None,
     ) -> GeneratedSignature:
         """Creates a signature for a single address (unique) or an address range.
 
@@ -2885,6 +2889,7 @@ class SignatureMaker:
             end: Optional ending address for range-based signatures
             progress_reporter: Optional progress reporter for cancellation and updates.
                               If not provided, one will be created based on cfg.enable_continue_prompt.
+            buf: Optional preloaded search buffer reused by the SIMD path.
 
         Returns:
             A GeneratedSignature containing the signature and metadata
@@ -2917,7 +2922,11 @@ class SignatureMaker:
 
         if end is None:
             # Create unique signature generator via factory method
-            generator = self._create_generator(for_range=False, progress_reporter=progress_reporter)
+            generator = self._create_generator(
+                for_range=False,
+                progress_reporter=progress_reporter,
+                buf=buf,
+            )
             # UniqueSignatureGenerator.generate returns a GeneratedSignature
             # directly so it can carry status + match_count on cancel.
             return generator.generate(start_ea, cfg, policy=policy)
@@ -2930,6 +2939,37 @@ class SignatureMaker:
         generator = self._create_generator(for_range=True, progress_reporter=progress_reporter)
         sig = generator.generate(start_ea, end, cfg)
         return GeneratedSignature(sig)
+
+
+class _XrefSearchBuffers:
+    """Own the reusable SIMD search buffers for one Xref operation."""
+
+    def __init__(self, cfg: SigMakerConfig) -> None:
+        self._scope_to_segment = cfg.scope_to_segment
+        self._buffers: dict[typing.Optional[int], InMemoryBuffer] = {}
+
+    def for_ea(self, ea: int) -> typing.Optional[InMemoryBuffer]:
+        """Return the database or containing-segment buffer for ``ea``."""
+        if not _Speedups.current().available:
+            return None
+
+        scope_ea: typing.Optional[int] = None
+        if self._scope_to_segment:
+            segment = idaapi.getseg(ea)
+            if segment is not None:
+                scope_ea = int(segment.start_ea)
+
+        buf = self._buffers.get(scope_ea)
+        if buf is None:
+            if scope_ea is None:
+                buf = InMemoryBuffer.load(mode=InMemoryBuffer.LoadMode.SEGMENTS)
+            else:
+                buf = InMemoryBuffer.load(
+                    mode=InMemoryBuffer.LoadMode.SEGMENTS,
+                    scope_ea=scope_ea,
+                )
+            self._buffers[scope_ea] = buf
+        return buf
 
 
 class XrefFinder:
@@ -2961,6 +3001,7 @@ class XrefFinder:
         xref_signatures: list[GeneratedSignature] = []
         ui = UIServices.current()
         shortest_len = cfg.max_xref_signature_length + 1
+        buffers = _XrefSearchBuffers(cfg)
 
         # Keep one cancelable wait box for the full operation. Candidate
         # generation reuses it rather than nesting its normal wait box.
@@ -2998,7 +3039,11 @@ class XrefFinder:
 
                     try:
                         # Public API: returns SignatureResult
-                        result = self.signature_maker.make_signature(frm_ea, cfg_no_prompt)
+                        result = self.signature_maker.make_signature(
+                            frm_ea,
+                            cfg_no_prompt,
+                            buf=buffers.for_ea(frm_ea),
+                        )
                         sig: typing.Optional[Signature] = result.signature
                     except UserCanceledError:
                         break

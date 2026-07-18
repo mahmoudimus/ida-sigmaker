@@ -654,7 +654,7 @@ checked before any change to the public surface:
 
 - **Stable method signatures**
   - Signature generation
-    - `SignatureMaker.make_signature(ea, cfg, end=None, *, progress_reporter=None, policy=GenerationPolicy.strict())`
+    - `SignatureMaker.make_signature(ea, cfg, end=None, *, progress_reporter=None, policy=GenerationPolicy.strict(), buf=None)`
   - Cross-reference generation
     - `XrefFinder.find_xrefs(ea, cfg)`
     - `XrefFinder.count_code_xrefs_to(ea)`

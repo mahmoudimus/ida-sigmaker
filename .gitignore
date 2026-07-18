@@ -170,6 +170,9 @@ Dockerfile
 # ignore ida db
 **/*.i64
 
+# Local Codex planning artifacts
+/docs/superpowers/
+
 # C
 build/
 # Cython debug symbols

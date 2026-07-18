@@ -4287,6 +4287,29 @@ class TestUniqueSignatureGeneratorSeedThenRefine(CoveredUnitTest):
             ask_longer_signature=False,
         )
 
+    def test_signature_maker_uses_supplied_buffer_for_simd_seed(self):
+        supplied_buffer = MagicMock()
+        supplied_buffer.data.return_value = memoryview(bytearray(b"\x90"))
+        observed_buffers: list[object] = []
+
+        def find_all_offsets(_ida_signature, buf=None):
+            observed_buffers.append(buf)
+            return [0], supplied_buffer
+
+        with _with_test_speedups(), patch.object(
+            sigmaker.SignatureSearcher,
+            "find_all_offsets",
+            side_effect=find_all_offsets,
+        ):
+            result = sigmaker.SignatureMaker().make_signature(
+                0x1000,
+                self._make_cfg(),
+                buf=supplied_buffer,
+            )
+
+        self.assertEqual(result.status, sigmaker.GenerationStatus.UNIQUE)
+        self.assertEqual(observed_buffers, [supplied_buffer])
+
     @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_seed_once_then_refine_to_unique(self):
         processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
@@ -4583,6 +4606,108 @@ class TestXrefFinderCancellation(CoveredUnitTest):
         self.assertIn("Processing XREF 1", messages[0])
         self.assertNotIn(" of ", messages[0])
         self.assertEqual(nested_progress_values, [False])
+
+    def test_reuses_one_database_buffer_for_every_xref_candidate(self):
+        finder = self._finder()
+        generated = sigmaker.GeneratedSignature(self._sig(0x40))
+        shared_buffer = MagicMock()
+
+        with _with_test_speedups(), patch.object(
+            sigmaker.InMemoryBuffer,
+            "load",
+            return_value=shared_buffer,
+        ) as load, patch.object(
+            sigmaker.XrefFinder,
+            "iter_code_xrefs_to",
+            return_value=iter([0x1010, 0x1020, 0x1030]),
+        ), patch.object(
+            sigmaker.SignatureMaker,
+            "make_signature",
+            return_value=generated,
+        ) as make_signature:
+            result = finder.find_xrefs(0x2000, self._cfg())
+
+        self.assertEqual(len(result.signatures), 3)
+        load.assert_called_once_with(mode=sigmaker.InMemoryBuffer.LoadMode.SEGMENTS)
+        self.assertEqual(
+            [call.kwargs.get("buf") for call in make_signature.call_args_list],
+            [shared_buffer, shared_buffer, shared_buffer],
+        )
+
+    def test_reuses_one_buffer_per_scoped_segment(self):
+        finder = self._finder()
+        generated = sigmaker.GeneratedSignature(self._sig(0x40))
+        first_segment = types.SimpleNamespace(start_ea=0x1000)
+        second_segment = types.SimpleNamespace(start_ea=0x2000)
+        first_buffer = MagicMock()
+        second_buffer = MagicMock()
+        cfg = dataclasses.replace(self._cfg(), scope_to_segment=True)
+
+        def getseg(ea):
+            return first_segment if ea < 0x2000 else second_segment
+
+        with _with_test_speedups(), patch.object(
+            sigmaker.idaapi,
+            "getseg",
+            side_effect=getseg,
+        ), patch.object(
+            sigmaker.InMemoryBuffer,
+            "load",
+            side_effect=[first_buffer, second_buffer],
+        ) as load, patch.object(
+            sigmaker.XrefFinder,
+            "iter_code_xrefs_to",
+            return_value=iter([0x1010, 0x1020, 0x2010]),
+        ), patch.object(
+            sigmaker.SignatureMaker,
+            "make_signature",
+            return_value=generated,
+        ) as make_signature:
+            result = finder.find_xrefs(0x3000, cfg)
+
+        self.assertEqual(len(result.signatures), 3)
+        self.assertEqual(
+            [call.kwargs for call in load.call_args_list],
+            [
+                {
+                    "mode": sigmaker.InMemoryBuffer.LoadMode.SEGMENTS,
+                    "scope_ea": 0x1000,
+                },
+                {
+                    "mode": sigmaker.InMemoryBuffer.LoadMode.SEGMENTS,
+                    "scope_ea": 0x2000,
+                },
+            ],
+        )
+        self.assertEqual(
+            [call.kwargs.get("buf") for call in make_signature.call_args_list],
+            [first_buffer, first_buffer, second_buffer],
+        )
+
+    def test_does_not_prepare_xref_buffers_without_speedups(self):
+        finder = self._finder()
+        generated = sigmaker.GeneratedSignature(self._sig(0x40))
+
+        with _without_speedups(), patch.object(
+            sigmaker.InMemoryBuffer,
+            "load",
+        ) as load, patch.object(
+            sigmaker.XrefFinder,
+            "iter_code_xrefs_to",
+            return_value=iter([0x1010, 0x1020]),
+        ), patch.object(
+            sigmaker.SignatureMaker,
+            "make_signature",
+            return_value=generated,
+        ) as make_signature:
+            result = finder.find_xrefs(0x2000, self._cfg())
+
+        self.assertEqual(len(result.signatures), 2)
+        load.assert_not_called()
+        self.assertEqual(
+            [call.kwargs.get("buf") for call in make_signature.call_args_list],
+            [None, None],
+        )
 
     def test_cancel_during_xref_enumeration_skips_signature_generation(self):
         finder = self._finder()

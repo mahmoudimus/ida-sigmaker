@@ -4,6 +4,17 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-07-18
+
+### Changed
+
+- **Direct Xref generation starts immediately and remains cancelable.** SigMaker no longer walks every Xref to pre-count it before generating the first signature. One visible progress dialog stays active throughout the action, and cancellation is polled before enumeration and between candidates.
+- **One Xref action reuses its SIMD search buffer.** Database-wide generation loads the searchable bytes once; segment-scoped generation reuses one buffer per containing segment. Candidate signatures still retain their existing uniqueness scope, ordering, cancellation behavior, and no-SIMD fallback. ([#82](https://github.com/mahmoudimus/ida-sigmaker/issues/82))
+
+### Fixed
+
+- **Stale optional SIMD wheels no longer crash SigMaker.** SigMaker validates the extension's callable API before using it. Incompatible wheels fall back to the existing Python implementation and show HCLI and IDA-Python update commands, while compatible installed wheels continue to enable SIMD automatically. ([#79](https://github.com/mahmoudimus/ida-sigmaker/issues/79))
+
 ## [1.13.0] - 2026-07-16
 
 ### Added
@@ -15,7 +26,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 - **PyPI builds now run only for published releases.** Ordinary successful tests on `main` no longer launch an untagged wheel build, and the HCLI manifest version and exact PyPI dependency pin are synchronized from `sigmaker.__version__` during release preparation.
 
-[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.13.0...HEAD
+[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.0...HEAD
+[1.14.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.12.0...v1.13.0
 
 ## [1.12.0] - 2026-07-16

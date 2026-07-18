@@ -62,6 +62,10 @@ def _never_cancel() -> bool:
     return False
 
 
+def _ignore_progress_message(message: str) -> None:
+    """Discard progress updates when the host has no UI."""
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class UIServices:
     """Context-local UI hooks selected for the current IDA host."""
@@ -70,6 +74,10 @@ class UIServices:
     progress: typing.Callable[..., typing.ContextManager[object]] = _null_progress
     #: Cheap predicate polled periodically by long-running search loops.
     cancel_requested: typing.Callable[[], bool] = _never_cancel
+    #: Update the message shown by the current progress scope, when there is one.
+    replace_progress_message: typing.Callable[[str], None] = _ignore_progress_message
+    #: Whether a nested operation may open its own progress scope.
+    allow_nested_progress: bool = True
     _ctx = _UI_SERVICES_CTX
 
     @classmethod
@@ -1988,9 +1996,12 @@ class UniqueSignatureGenerator:
                 match_count=progress.last_match_count,
             )
 
-        with _CancelToPartial(policy, build_partial) as cancel:
-            for cur_ea, ins, ins_len in ProgressBox(
-                InstructionWalker(ea),
+        instructions: typing.Iterable[tuple[int, idaapi.insn_t, int]] = (
+            InstructionWalker(ea)
+        )
+        if UIServices.current().allow_nested_progress:
+            instructions = ProgressBox(
+                instructions,
                 initial_message=(
                     "Create unique signature (from cursor address)\n\n"
                     "Growing a pattern from the current address until it "
@@ -1998,10 +2009,13 @@ class UniqueSignatureGenerator:
                     "Press Cancel to stop"
                 ),
                 format_message=progress,
-            ):
+            )
+
+        with _CancelToPartial(policy, build_partial) as cancel:
+            for cur_ea, ins, ins_len in instructions:
                 # Modal continue-prompt opt-in (issue #18) still goes through
-                # the progress reporter. The wait-box cancel is already handled
-                # by ProgressBox raising UserCanceledError.
+                # the reporter. ProgressBox handles its own wait-box cancel;
+                # composite operations retain their outer wait box instead.
                 if (
                     self.progress_reporter is not None
                     and self.progress_reporter.should_cancel()
@@ -2946,10 +2960,10 @@ class XrefFinder:
         """Find XREF signatures to a given address."""
         xref_signatures: list[GeneratedSignature] = []
         ui = UIServices.current()
+        shortest_len = cfg.max_xref_signature_length + 1
 
-        # Open a cancelable wait box before the first xref lookup. Each
-        # candidate generator owns its own wait box, so only keep this scope
-        # around the preflight lookup and stream the remaining xrefs lazily.
+        # Keep one cancelable wait box for the full operation. Candidate
+        # generation reuses it rather than nesting its normal wait box.
         with ui.progress(
             "Find shortest XREF signature\n\n"
             "Enumerating code XREFs...\n\n"
@@ -2960,32 +2974,45 @@ class XrefFinder:
             xref_sources = iter(self.iter_code_xrefs_to(ea))
             first_xref = next(xref_sources, None)
 
-        if first_xref is None:
-            return XrefGeneratedSignature([])
+            if first_xref is None:
+                return XrefGeneratedSignature([])
 
-        # Non-interactive during xref search
-        cfg_no_prompt = dataclasses.replace(cfg, ask_longer_signature=False)
+            # Non-interactive during xref search
+            cfg_no_prompt = dataclasses.replace(cfg, ask_longer_signature=False)
 
-        for frm_ea in itertools.chain((first_xref,), xref_sources):
-            if ui.cancel_requested():
-                break
+            candidate_ui = dataclasses.replace(ui, allow_nested_progress=False)
+            with UIServices.use(candidate_ui):
+                for index, frm_ea in enumerate(
+                    itertools.chain((first_xref,), xref_sources), start=1
+                ):
+                    ui.replace_progress_message(
+                        f"Find shortest XREF signature\n\n"
+                        f"Processing XREF {index}...\n\n"
+                        f"Suitable Signatures: {len(xref_signatures)}\n"
+                        "Shortest Signature: "
+                        f"{shortest_len if shortest_len <= cfg.max_xref_signature_length else 0} Bytes\n\n"
+                        "Press Cancel to stop"
+                    )
+                    if ui.cancel_requested():
+                        break
 
-            try:
-                # Public API: returns SignatureResult
-                result = self.signature_maker.make_signature(frm_ea, cfg_no_prompt)
-                sig: typing.Optional[Signature] = result.signature
-            except UserCanceledError:
-                break
-            except Exception:
-                sig = None
+                    try:
+                        # Public API: returns SignatureResult
+                        result = self.signature_maker.make_signature(frm_ea, cfg_no_prompt)
+                        sig: typing.Optional[Signature] = result.signature
+                    except UserCanceledError:
+                        break
+                    except Exception:
+                        sig = None
 
-            if sig is None:
-                continue
+                    if sig is None:
+                        continue
 
-            xref_signatures.append(GeneratedSignature(sig, Match(frm_ea)))
+                    shortest_len = min(shortest_len, len(sig))
+                    xref_signatures.append(GeneratedSignature(sig, Match(frm_ea)))
 
-        xref_signatures.sort()
-        return XrefGeneratedSignature(xref_signatures)
+            xref_signatures.sort()
+            return XrefGeneratedSignature(xref_signatures)
 
 
 @dataclasses.dataclass(slots=True)
@@ -4389,6 +4416,7 @@ def _ida_ui_services() -> UIServices:
     return UIServices(
         progress=ProgressDialog,
         cancel_requested=idaapi_user_canceled,
+        replace_progress_message=idaapi.replace_wait_box,
     )
 
 

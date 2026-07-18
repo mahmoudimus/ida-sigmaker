@@ -4547,6 +4547,43 @@ class TestXrefFinderCancellation(CoveredUnitTest):
         self.assertTrue(scope.entered)
         self.assertIn("Enumerating", scope.initial_message)
 
+    def test_keeps_one_xref_wait_box_with_indeterminate_status(self):
+        _RecordingXrefProgressScope.instances = []
+        finder = self._finder()
+        generated = sigmaker.GeneratedSignature(self._sig(0x40))
+        messages: list[str] = []
+        ui = sigmaker.UIServices(
+            progress=_RecordingXrefProgressScope,
+            cancel_requested=lambda: False,
+            replace_progress_message=messages.append,
+            allow_nested_progress=True,
+        )
+        nested_progress_values: list[bool] = []
+
+        def make_signature(*_args, **_kwargs):
+            nested_progress_values.append(
+                sigmaker.UIServices.current().allow_nested_progress
+            )
+            return generated
+
+        with sigmaker.UIServices.use(ui), patch.object(
+            sigmaker.XrefFinder,
+            "iter_code_xrefs_to",
+            side_effect=lambda _ea: iter([0x1010]),
+        ), patch.object(
+            sigmaker.SignatureMaker,
+            "make_signature",
+            side_effect=make_signature,
+        ):
+            result = finder.find_xrefs(0x2000, self._cfg())
+
+        self.assertEqual(len(result.signatures), 1)
+        self.assertEqual(len(_RecordingXrefProgressScope.instances), 1)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Processing XREF 1", messages[0])
+        self.assertNotIn(" of ", messages[0])
+        self.assertEqual(nested_progress_values, [False])
+
     def test_cancel_during_xref_enumeration_skips_signature_generation(self):
         finder = self._finder()
 

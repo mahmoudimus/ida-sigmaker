@@ -98,9 +98,6 @@ class _SimdSignatureProtocol(typing.Protocol):
 class _SpeedupsModule(typing.Protocol):
     """Structurally validated entry points exposed by the native extension."""
 
-    SPEEDUPS_API_MIN: int
-    SPEEDUPS_API_MAX: int
-
     def Signature(self, ida_signature: str) -> _SimdSignatureProtocol: ...
 
     def scan_bytes(
@@ -179,29 +176,43 @@ class _Speedups:
 
     @classmethod
     def from_module(cls, module: object) -> "_Speedups":
-        """Return enabled or disabled state after validating ``module``."""
+        """Return enabled or disabled state after validating ``module``.
+
+        Marker-less extensions predate the API-range declaration. They remain
+        eligible when they satisfy the complete callable contract.
+        """
         module_path = getattr(module, "__file__", None)
         path = pathlib.Path(module_path) if isinstance(module_path, str) else None
-        api_min = getattr(module, "SPEEDUPS_API_MIN", None)
-        api_max = getattr(module, "SPEEDUPS_API_MAX", None)
-        if type(api_min) is not int or type(api_max) is not int:
-            return cls(
-                diagnostic=(
-                    "the loaded extension must declare integer SPEEDUPS_API_MIN "
-                    "and SPEEDUPS_API_MAX values"
-                ),
-                path=path,
-            )
-        if api_min > api_max:
-            return cls(
-                diagnostic="the loaded extension declares an invalid speedups API range",
-                path=path,
-            )
-        if not api_min <= cls.REQUIRED_API <= api_max:
-            return cls(
-                diagnostic="the loaded SIMD speedups extension is out of date; update SigMaker",
-                path=path,
-            )
+        marker_missing = object()
+        api_min = getattr(module, "SPEEDUPS_API_MIN", marker_missing)
+        api_max = getattr(module, "SPEEDUPS_API_MAX", marker_missing)
+        if api_min is not marker_missing or api_max is not marker_missing:
+            if (
+                api_min is marker_missing
+                or api_max is marker_missing
+                or type(api_min) is not int
+                or type(api_max) is not int
+            ):
+                return cls(
+                    diagnostic=(
+                        "the loaded extension has an incomplete or invalid "
+                        "speedups API declaration"
+                    ),
+                    path=path,
+                )
+            if api_min > api_max:
+                return cls(
+                    diagnostic="the loaded extension declares an invalid speedups API range",
+                    path=path,
+                )
+            if not api_min <= cls.REQUIRED_API <= api_max:
+                return cls(
+                    diagnostic=(
+                        "the loaded SIMD speedups extension is out of date; "
+                        "update SigMaker"
+                    ),
+                    path=path,
+                )
         for name in cls.REQUIRED_SYMBOLS:
             if not callable(getattr(module, name, None)):
                 return cls(

@@ -108,10 +108,12 @@ the top-right menu bar:
 
 ### Compatibility and updates
 
-The speedup wheel is optional. SigMaker validates the API range and required
-native entry points on the exact extension module it loaded before enabling
-SIMD. A stale, partial, or incompatible wheel is disabled before it can affect
-a search; the pure-Python implementation continues with the same results.
+The speedup wheel is optional. SigMaker validates the required native entry
+points on the exact extension module it loaded before enabling SIMD. Newer
+wheels also declare an API range; older wheels without that declaration remain
+eligible when they provide the complete native contract. A stale, partial, or
+incompatible wheel is disabled before it can affect a search; the pure-Python
+implementation continues with the same results.
 
 In interactive IDA, SigMaker shows one update prompt per process with the
 loaded extension path and the applicable command:

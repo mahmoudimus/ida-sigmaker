@@ -4746,13 +4746,32 @@ class TestSpeedupsCompatibility(CoveredUnitTest):
         self.assertIs(returned, buffer)
         scan_bytes.assert_called_once()
 
-    def test_missing_api_declaration_disables_simd(self):
+    def test_markerless_legacy_extension_uses_structural_validation(self):
+        module = self._module()
+        del module.SPEEDUPS_API_MIN
+        del module.SPEEDUPS_API_MAX
+
+        self.assertTrue(sigmaker._Speedups.configure(module))
+        self.assertTrue(sigmaker._Speedups.current().available)
+        self.assertIs(sigmaker._Speedups.current().module, module)
+
+    def test_partial_api_declaration_disables_simd(self):
         module = self._module()
         del module.SPEEDUPS_API_MIN
 
         self.assertFalse(sigmaker._Speedups.configure(module))
         self.assertFalse(sigmaker._Speedups.current().available)
-        self.assertIn("SPEEDUPS_API_MIN", sigmaker._Speedups.current().diagnostic)
+        self.assertIn("API declaration", sigmaker._Speedups.current().diagnostic)
+
+    def test_markerless_legacy_extension_without_kernel_disables_simd(self):
+        module = self._module()
+        del module.SPEEDUPS_API_MIN
+        del module.SPEEDUPS_API_MAX
+        del module.refine_offsets
+
+        self.assertFalse(sigmaker._Speedups.configure(module))
+        self.assertFalse(sigmaker._Speedups.current().available)
+        self.assertIn("refine_offsets", sigmaker._Speedups.current().diagnostic)
 
     def test_unsupported_api_range_disables_simd(self):
         module = self._module(SPEEDUPS_API_MIN=2, SPEEDUPS_API_MAX=2)

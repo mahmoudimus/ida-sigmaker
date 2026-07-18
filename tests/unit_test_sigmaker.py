@@ -4480,18 +4480,22 @@ class TestGeneratedSignatureDisplay(CoveredUnitTest):
         fa.assert_not_called()
 
 
-class _FakeXrefProgressDialog:
-    """Minimal progress dialog for XrefFinder unit tests."""
+class _RecordingXrefProgressScope:
+    """Records the XREF collection scope selected through UIServices."""
 
-    def __init__(self) -> None:
-        self.messages: list[str] = []
+    instances: list["_RecordingXrefProgressScope"] = []
 
-    def user_canceled(self) -> bool:
-        return False
+    def __init__(self, message: str = "") -> None:
+        self.initial_message = message
+        self.entered = False
+        type(self).instances.append(self)
 
-    def replace_message(self, msg: str) -> None:
-        self.messages.append(msg)
+    def __enter__(self) -> "_RecordingXrefProgressScope":
+        self.entered = True
+        return self
 
+    def __exit__(self, *_args: object) -> None:
+        return None
 
 class TestXrefFinderCancellation(CoveredUnitTest):
     """Cancel during one XREF candidate stops and keeps prior results."""
@@ -4510,22 +4514,135 @@ class TestXrefFinderCancellation(CoveredUnitTest):
         sig.append(sigmaker.SignatureByte(value + 1, False))
         return sig
 
+    @staticmethod
+    def _ui(cancel_requested=lambda: False) -> sigmaker.UIServices:
+        return sigmaker.UIServices(
+            progress=_RecordingXrefProgressScope,
+            cancel_requested=cancel_requested,
+        )
+
     def _finder(self) -> sigmaker.XrefFinder:
-        finder = sigmaker.XrefFinder()
-        finder.progress_dialog = _FakeXrefProgressDialog()
-        return finder
+        return sigmaker.XrefFinder()
+
+    def test_enumerates_xrefs_once_inside_injected_progress_scope(self):
+        _RecordingXrefProgressScope.instances = []
+        finder = self._finder()
+        generated = sigmaker.GeneratedSignature(self._sig(0x40))
+
+        with sigmaker.UIServices.use(self._ui()), patch.object(
+            sigmaker.XrefFinder,
+            "iter_code_xrefs_to",
+            side_effect=lambda _ea: iter([0x1010]),
+        ) as iter_xrefs, patch.object(
+            sigmaker.SignatureMaker,
+            "make_signature",
+            return_value=generated,
+        ):
+            result = finder.find_xrefs(0x2000, self._cfg())
+
+        self.assertEqual(iter_xrefs.call_count, 1)
+        self.assertEqual(len(result.signatures), 1)
+        self.assertEqual(len(_RecordingXrefProgressScope.instances), 1)
+        scope = _RecordingXrefProgressScope.instances[0]
+        self.assertTrue(scope.entered)
+        self.assertIn("Enumerating", scope.initial_message)
+
+    def test_keeps_one_xref_wait_box_with_indeterminate_status(self):
+        _RecordingXrefProgressScope.instances = []
+        finder = self._finder()
+        generated = sigmaker.GeneratedSignature(self._sig(0x40))
+        messages: list[str] = []
+        ui = sigmaker.UIServices(
+            progress=_RecordingXrefProgressScope,
+            cancel_requested=lambda: False,
+            replace_progress_message=messages.append,
+            allow_nested_progress=True,
+        )
+        nested_progress_values: list[bool] = []
+
+        def make_signature(*_args, **_kwargs):
+            nested_progress_values.append(
+                sigmaker.UIServices.current().allow_nested_progress
+            )
+            return generated
+
+        with sigmaker.UIServices.use(ui), patch.object(
+            sigmaker.XrefFinder,
+            "iter_code_xrefs_to",
+            side_effect=lambda _ea: iter([0x1010]),
+        ), patch.object(
+            sigmaker.SignatureMaker,
+            "make_signature",
+            side_effect=make_signature,
+        ):
+            result = finder.find_xrefs(0x2000, self._cfg())
+
+        self.assertEqual(len(result.signatures), 1)
+        self.assertEqual(len(_RecordingXrefProgressScope.instances), 1)
+        self.assertEqual(len(messages), 1)
+        self.assertIn("Processing XREF 1", messages[0])
+        self.assertNotIn(" of ", messages[0])
+        self.assertEqual(nested_progress_values, [False])
+
+    def test_cancel_during_xref_enumeration_skips_signature_generation(self):
+        finder = self._finder()
+
+        with sigmaker.UIServices.use(self._ui(lambda: True)), patch.object(
+            sigmaker,
+            "idaapi_user_canceled",
+            return_value=False,
+        ), patch.object(
+            sigmaker.XrefFinder,
+            "iter_code_xrefs_to",
+            side_effect=lambda _ea: iter([0x1010]),
+        ), patch.object(
+            sigmaker.SignatureMaker,
+            "make_signature",
+        ) as make_signature:
+            result = finder.find_xrefs(0x2000, self._cfg())
+
+        self.assertEqual(result.signatures, [])
+        make_signature.assert_not_called()
+
+    def test_starts_generation_before_xref_enumeration_finishes(self):
+        finder = self._finder()
+        generated = sigmaker.GeneratedSignature(self._sig(0x40))
+        events: list[str] = []
+
+        def xrefs(_ea):
+            events.append("first xref")
+            yield 0x1010
+            events.append("second xref")
+            yield 0x1020
+
+        def make_signature(*_args, **_kwargs):
+            events.append("generate")
+            return generated
+
+        with sigmaker.UIServices.use(self._ui()), patch.object(
+            sigmaker.XrefFinder,
+            "iter_code_xrefs_to",
+            side_effect=xrefs,
+        ), patch.object(
+            sigmaker.SignatureMaker,
+            "make_signature",
+            side_effect=make_signature,
+        ):
+            result = finder.find_xrefs(0x2000, self._cfg())
+
+        self.assertEqual(len(result.signatures), 2)
+        self.assertLess(events.index("generate"), events.index("second xref"))
 
     def test_cancel_inside_candidate_generation_returns_prior_xrefs(self):
         finder = self._finder()
         first = sigmaker.GeneratedSignature(self._sig(0x40))
         third = sigmaker.GeneratedSignature(self._sig(0x50))
 
-        with patch.object(sigmaker.XrefFinder, "count_code_xrefs_to", return_value=3), \
-                patch.object(
-                    sigmaker.XrefFinder,
-                    "iter_code_xrefs_to",
-                    return_value=iter([0x1010, 0x1020, 0x1030]),
-                ), patch.object(
+        with patch.object(
+            sigmaker.XrefFinder,
+            "iter_code_xrefs_to",
+            return_value=iter([0x1010, 0x1020, 0x1030]),
+        ), patch.object(
                     sigmaker.SignatureMaker,
                     "make_signature",
                     side_effect=[
@@ -4546,12 +4663,11 @@ class TestXrefFinderCancellation(CoveredUnitTest):
         first = sigmaker.GeneratedSignature(self._sig(0x40))
         third = sigmaker.GeneratedSignature(self._sig(0x50))
 
-        with patch.object(sigmaker.XrefFinder, "count_code_xrefs_to", return_value=3), \
-                patch.object(
-                    sigmaker.XrefFinder,
-                    "iter_code_xrefs_to",
-                    return_value=iter([0x1010, 0x1020, 0x1030]),
-                ), patch.object(
+        with patch.object(
+            sigmaker.XrefFinder,
+            "iter_code_xrefs_to",
+            return_value=iter([0x1010, 0x1020, 0x1030]),
+        ), patch.object(
                     sigmaker.SignatureMaker,
                     "make_signature",
                     side_effect=[

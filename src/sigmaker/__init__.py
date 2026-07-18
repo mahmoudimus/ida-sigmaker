@@ -15,6 +15,7 @@ import dataclasses
 import enum
 import functools
 import io
+import itertools
 import json
 import logging
 import os
@@ -61,6 +62,10 @@ def _never_cancel() -> bool:
     return False
 
 
+def _ignore_progress_message(message: str) -> None:
+    """Discard progress updates when the host has no UI."""
+
+
 @dataclasses.dataclass(frozen=True, slots=True)
 class UIServices:
     """Context-local UI hooks selected for the current IDA host."""
@@ -69,6 +74,10 @@ class UIServices:
     progress: typing.Callable[..., typing.ContextManager[object]] = _null_progress
     #: Cheap predicate polled periodically by long-running search loops.
     cancel_requested: typing.Callable[[], bool] = _never_cancel
+    #: Update the message shown by the current progress scope, when there is one.
+    replace_progress_message: typing.Callable[[str], None] = _ignore_progress_message
+    #: Whether a nested operation may open its own progress scope.
+    allow_nested_progress: bool = True
     _ctx = _UI_SERVICES_CTX
 
     @classmethod
@@ -1987,9 +1996,12 @@ class UniqueSignatureGenerator:
                 match_count=progress.last_match_count,
             )
 
-        with _CancelToPartial(policy, build_partial) as cancel:
-            for cur_ea, ins, ins_len in ProgressBox(
-                InstructionWalker(ea),
+        instructions: typing.Iterable[tuple[int, idaapi.insn_t, int]] = (
+            InstructionWalker(ea)
+        )
+        if UIServices.current().allow_nested_progress:
+            instructions = ProgressBox(
+                instructions,
                 initial_message=(
                     "Create unique signature (from cursor address)\n\n"
                     "Growing a pattern from the current address until it "
@@ -1997,10 +2009,13 @@ class UniqueSignatureGenerator:
                     "Press Cancel to stop"
                 ),
                 format_message=progress,
-            ):
+            )
+
+        with _CancelToPartial(policy, build_partial) as cancel:
+            for cur_ea, ins, ins_len in instructions:
                 # Modal continue-prompt opt-in (issue #18) still goes through
-                # the progress reporter. The wait-box cancel is already handled
-                # by ProgressBox raising UserCanceledError.
+                # the reporter. ProgressBox handles its own wait-box cancel;
+                # composite operations retain their outer wait box instead.
                 if (
                     self.progress_reporter is not None
                     and self.progress_reporter.should_cancel()
@@ -2921,7 +2936,6 @@ class XrefFinder:
     """Handles finding and generating signatures for XREF addresses."""
 
     def __init__(self):
-        self.progress_dialog = ProgressDialog()
         self.signature_maker = SignatureMaker()
 
     @classmethod
@@ -2945,45 +2959,60 @@ class XrefFinder:
     def find_xrefs(self, ea: int, cfg: SigMakerConfig) -> XrefGeneratedSignature:
         """Find XREF signatures to a given address."""
         xref_signatures: list[GeneratedSignature] = []
-
-        total = self.count_code_xrefs_to(ea)
-        if total == 0:
-            return XrefGeneratedSignature([])
-
-        # Non-interactive during xref search
-        cfg_no_prompt = dataclasses.replace(cfg, ask_longer_signature=False)
-
+        ui = UIServices.current()
         shortest_len = cfg.max_xref_signature_length + 1
 
-        for i, frm_ea in enumerate(self.iter_code_xrefs_to(ea), start=1):
-            if self.progress_dialog.user_canceled():
-                break
+        # Keep one cancelable wait box for the full operation. Candidate
+        # generation reuses it rather than nesting its normal wait box.
+        with ui.progress(
+            "Find shortest XREF signature\n\n"
+            "Enumerating code XREFs...\n\n"
+            "Press Cancel to stop"
+        ):
+            if ui.cancel_requested():
+                return XrefGeneratedSignature([])
+            xref_sources = iter(self.iter_code_xrefs_to(ea))
+            first_xref = next(xref_sources, None)
 
-            self.progress_dialog.replace_message(
-                f"Find shortest XREF signature\n\n"
-                f"Processing xref {i} of {total} ({(i / total) * 100.0:.1f}%)...\n\n"
-                f"Suitable Signatures: {len(xref_signatures)}\n"
-                f"Shortest Signature: {shortest_len if shortest_len <= cfg.max_xref_signature_length else 0} Bytes"
-            )
+            if first_xref is None:
+                return XrefGeneratedSignature([])
 
-            try:
-                # Public API: returns SignatureResult
-                result = self.signature_maker.make_signature(frm_ea, cfg_no_prompt)
-                sig: typing.Optional[Signature] = result.signature
-            except UserCanceledError:
-                break
-            except Exception:
-                sig = None
+            # Non-interactive during xref search
+            cfg_no_prompt = dataclasses.replace(cfg, ask_longer_signature=False)
 
-            if sig is None:
-                continue
+            candidate_ui = dataclasses.replace(ui, allow_nested_progress=False)
+            with UIServices.use(candidate_ui):
+                for index, frm_ea in enumerate(
+                    itertools.chain((first_xref,), xref_sources), start=1
+                ):
+                    ui.replace_progress_message(
+                        f"Find shortest XREF signature\n\n"
+                        f"Processing XREF {index}...\n\n"
+                        f"Suitable Signatures: {len(xref_signatures)}\n"
+                        "Shortest Signature: "
+                        f"{shortest_len if shortest_len <= cfg.max_xref_signature_length else 0} Bytes\n\n"
+                        "Press Cancel to stop"
+                    )
+                    if ui.cancel_requested():
+                        break
 
-            if len(sig) < shortest_len:
-                shortest_len = len(sig)
-            xref_signatures.append(GeneratedSignature(sig, Match(frm_ea)))
+                    try:
+                        # Public API: returns SignatureResult
+                        result = self.signature_maker.make_signature(frm_ea, cfg_no_prompt)
+                        sig: typing.Optional[Signature] = result.signature
+                    except UserCanceledError:
+                        break
+                    except Exception:
+                        sig = None
 
-        xref_signatures.sort()
-        return XrefGeneratedSignature(xref_signatures)
+                    if sig is None:
+                        continue
+
+                    shortest_len = min(shortest_len, len(sig))
+                    xref_signatures.append(GeneratedSignature(sig, Match(frm_ea)))
+
+            xref_signatures.sort()
+            return XrefGeneratedSignature(xref_signatures)
 
 
 @dataclasses.dataclass(slots=True)
@@ -4387,6 +4416,7 @@ def _ida_ui_services() -> UIServices:
     return UIServices(
         progress=ProgressDialog,
         cancel_requested=idaapi_user_canceled,
+        replace_progress_message=idaapi.replace_wait_box,
     )
 
 
@@ -5098,10 +5128,9 @@ class SigMakerPlugin(idaapi.plugin_t):
                 f"{hex(pfn.start_ea)}; trying xref signatures...\n"
             )
 
-        with ProgressDialog(
-            "Falling back to xref signatures...\n\nPress Cancel to stop"
-        ):
-            xref_result = XrefFinder().find_xrefs(pfn.start_ea, config)
+        # XrefFinder opens its own bounded preflight wait box, then each
+        # candidate generator owns its cancelable wait box.
+        xref_result = XrefFinder().find_xrefs(pfn.start_ea, config)
 
         if xref_result.signatures:
             best = xref_result.signatures[0]

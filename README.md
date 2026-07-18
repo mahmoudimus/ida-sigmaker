@@ -94,7 +94,7 @@ The user directory is a location where IDA stores some of the global settings an
 Default location:
 
 - On Windows: `%APPDATA%\Hex-Rays\IDA Pro`
-- On macOS: `~/Library/Application Support/IDA Pro`
+- On macOS: `~/.idapro`
 - On Linux: `~/.idapro`
 
 ## SIMD Speedups

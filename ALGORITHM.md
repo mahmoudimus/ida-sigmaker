@@ -453,9 +453,9 @@ tight C:
   interpreter lock, which keeps the UI live and leaves headroom for the
   SIMD scan path used when the index is unavailable.
 
-When the extension is absent, `SIMD_SPEEDUP_AVAILABLE` is `False` and pure-Python
-fallbacks produce **identical** results (cross-checked in the test suite); the
-plugin still works, just without the speedups.
+When the extension is absent or incompatible, SigMaker automatically selects
+pure-Python fallbacks with **identical** results (cross-checked in the test
+suite); the plugin still works, just without the speedups.
 
 ### A note on `cimport array` vs `import array`
 

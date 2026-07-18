@@ -21,12 +21,16 @@ import os
 import pathlib
 import re
 import string
+import sys
 import time
 import traceback
 import typing
 
 import idaapi
 import idc
+
+_IDA_IS_IDAQ = idaapi.is_idaq
+_IDA_WARNING = idaapi.warning
 
 __author__ = "mahmoudimus"
 __version__ = "1.13.0"
@@ -41,6 +45,9 @@ WILDCARD_POLICY_CTX: contextvars.ContextVar["WildcardPolicy"] = contextvars.Cont
 )
 _UI_SERVICES_CTX: contextvars.ContextVar["UIServices"] = contextvars.ContextVar(
     "ui_services"
+)
+_SPEEDUPS_CTX: contextvars.ContextVar["_Speedups"] = contextvars.ContextVar(
+    "speedups"
 )
 
 
@@ -82,14 +89,231 @@ _HEADLESS_UI = UIServices()
 _DEFAULT_UI_SERVICES = _HEADLESS_UI
 
 
+class _SimdSignatureProtocol(typing.Protocol):
+    """Native signature shape used by the optional scan extension."""
+
+    size_bytes: int
+
+
+class _SpeedupsModule(typing.Protocol):
+    """Structurally validated entry points exposed by the native extension."""
+
+    def Signature(self, ida_signature: str) -> _SimdSignatureProtocol: ...
+
+    def scan_bytes(
+        self,
+        data_mv: memoryview,
+        sig: _SimdSignatureProtocol,
+    ) -> int: ...
+
+    def build_byte_index(
+        self, data_mv: memoryview
+    ) -> tuple["array.array", "array.array"]: ...
+
+    def seed_offsets(
+        self,
+        bucket: "array.array",
+        anchor_offset: int,
+        pattern_size: int,
+        buffer_size: int,
+    ) -> tuple["array.array", int]: ...
+
+    def refine_offsets(
+        self,
+        data_mv: memoryview,
+        candidates: "array.array",
+        count: int,
+        index: int,
+        value: int,
+        mask: int,
+    ) -> int: ...
+
+    def filter_offsets_by_search_ranges(
+        self,
+        candidates: "array.array",
+        count: int,
+        pattern_size: int,
+        range_starts: typing.Sequence[int],
+        range_ends: typing.Sequence[int],
+    ) -> int: ...
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _Speedups:
+    """One validated optional native backend and its local UI state."""
+
+    REQUIRED_API: typing.ClassVar[int] = 1
+    REQUIRED_SYMBOLS: typing.ClassVar[tuple[str, ...]] = (
+        "Signature",
+        "scan_bytes",
+        "build_byte_index",
+        "seed_offsets",
+        "refine_offsets",
+        "filter_offsets_by_search_ranges",
+    )
+
+    module: typing.Optional[_SpeedupsModule] = None
+    diagnostic: typing.Optional[str] = None
+    path: typing.Optional[pathlib.Path] = None
+    notice_shown: bool = False
+
+    @property
+    def available(self) -> bool:
+        return self.module is not None
+
+    @classmethod
+    def current(cls) -> "_Speedups":
+        return _SPEEDUPS_CTX.get(_DEFAULT_SPEEDUPS)
+
+    @classmethod
+    @contextlib.contextmanager
+    def use(cls, speedups: "_Speedups") -> typing.Iterator["_Speedups"]:
+        token = _SPEEDUPS_CTX.set(speedups)
+        try:
+            yield speedups
+        finally:
+            _SPEEDUPS_CTX.reset(token)
+
+    @classmethod
+    def from_module(cls, module: object) -> "_Speedups":
+        """Return enabled or disabled state after validating ``module``.
+
+        Marker-less extensions predate the API-range declaration. They remain
+        eligible when they satisfy the complete callable contract.
+        """
+        module_path = getattr(module, "__file__", None)
+        path = pathlib.Path(module_path) if isinstance(module_path, str) else None
+        marker_missing = object()
+        api_min = getattr(module, "SPEEDUPS_API_MIN", marker_missing)
+        api_max = getattr(module, "SPEEDUPS_API_MAX", marker_missing)
+        if api_min is not marker_missing or api_max is not marker_missing:
+            if (
+                api_min is marker_missing
+                or api_max is marker_missing
+                or type(api_min) is not int
+                or type(api_max) is not int
+            ):
+                return cls(
+                    diagnostic=(
+                        "the loaded extension has an incomplete or invalid "
+                        "speedups API declaration"
+                    ),
+                    path=path,
+                )
+            if api_min > api_max:
+                return cls(
+                    diagnostic="the loaded extension declares an invalid speedups API range",
+                    path=path,
+                )
+            if not api_min <= cls.REQUIRED_API <= api_max:
+                return cls(
+                    diagnostic=(
+                        "the loaded SIMD speedups extension is out of date; "
+                        "update SigMaker"
+                    ),
+                    path=path,
+                )
+        for name in cls.REQUIRED_SYMBOLS:
+            if not callable(getattr(module, name, None)):
+                return cls(
+                    diagnostic=f"the loaded extension is missing required callable {name}",
+                    path=path,
+                )
+        return cls(module=typing.cast(_SpeedupsModule, module), path=path)
+
+    @classmethod
+    def configure(cls, module: object) -> bool:
+        """Validate and install the optional speedups extension."""
+        speedups = cls.from_module(module)
+        _SPEEDUPS_CTX.set(speedups)
+        return speedups.available
+
+    @staticmethod
+    def ida_python_interpreter() -> typing.Optional[pathlib.Path]:
+        """Find an executable under IDA's Python prefix, if one is exposed."""
+        prefix = pathlib.Path(sys.exec_prefix)
+        names = (
+            ("python.exe", "python3.exe")
+            if os.name == "nt"
+            else ("python3", "python")
+        )
+        candidates = [prefix / name for name in names]
+        candidates.extend(prefix / "bin" / name for name in names)
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+        return None
+
+    def remediation_message(self) -> str:
+        """Describe how to update this incompatible extension."""
+        reason = self.diagnostic or "the extension is incompatible"
+        extension_path = str(self.path) if self.path else "unavailable"
+        lines = [
+            "SigMaker disabled optional SIMD speedups.",
+            "",
+            f"Reason: {reason}",
+            f"Loaded extension: {extension_path}",
+            "",
+            "Update the installation, then restart IDA:",
+            "- Installed with HCLI: hcli plugin upgrade SigMaker",
+        ]
+        interpreter = self.ida_python_interpreter()
+        if interpreter is not None:
+            lines.append(
+                "- Installed manually: "
+                f'"{interpreter}" -m pip install --upgrade "sigmaker=={PLUGIN_VERSION}"'
+            )
+        lines.extend(
+            (
+                "",
+                "If the problem remains after updating, report it at:",
+                "https://github.com/mahmoudimus/ida-sigmaker/issues",
+            )
+        )
+        return "\n".join(lines)
+
+    @classmethod
+    def log_remediation(cls) -> None:
+        """Log one startup diagnostic when the optional extension is stale."""
+        speedups = cls.current()
+        if speedups.diagnostic is not None:
+            LOGGER.warning("%s", speedups.remediation_message())
+
+    @classmethod
+    def show_remediation(cls) -> bool:
+        """Show one GUI-only update prompt for an incompatible extension."""
+        speedups = cls.current()
+        if (
+            speedups.notice_shown
+            or speedups.available
+            or speedups.diagnostic is None
+            or not _is_graphical_ida()
+        ):
+            return False
+        if not callable(_IDA_WARNING):
+            return False
+        try:
+            _IDA_WARNING(speedups.remediation_message())
+        except Exception:
+            LOGGER.warning("Unable to display the SIMD speedups update prompt")
+            return False
+        _SPEEDUPS_CTX.set(dataclasses.replace(speedups, notice_shown=True))
+        return True
+
+
+_DEFAULT_SPEEDUPS = _Speedups()
+
+# Context-local state does not cross into a fresh threading.Thread. Its work
+# stays correct with Python fallbacks until the embedding code binds a snapshot.
+
+
 SIMD_SPEEDUP_AVAILABLE = False
 with contextlib.suppress(ImportError):
     from sigmaker._speedups import simd_scan
 
     _SimdSignature = simd_scan.Signature
     _simd_scan_bytes = simd_scan.scan_bytes
-
-    SIMD_SPEEDUP_AVAILABLE = True
+    _Speedups.configure(simd_scan)
 
 
 def _load_speedups_sibling() -> bool:
@@ -106,7 +330,8 @@ def _load_speedups_sibling() -> bool:
     No-ops for the shipped single-file `sigmaker.py`, which has no sibling
     `_speedups/` directory and relies on the pip-installed extension.
     """
-    global simd_scan, _SimdSignature, _simd_scan_bytes, SIMD_SPEEDUP_AVAILABLE
+    global simd_scan, _SimdSignature, _simd_scan_bytes
+
     import importlib.machinery
     import importlib.util
 
@@ -127,16 +352,17 @@ def _load_speedups_sibling() -> bool:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         simd_scan = module
-        _SimdSignature = module.Signature
-        _simd_scan_bytes = module.scan_bytes
-        SIMD_SPEEDUP_AVAILABLE = True
-        return True
+        _SimdSignature = simd_scan.Signature
+        _simd_scan_bytes = simd_scan.scan_bytes
+        return _Speedups.configure(simd_scan)
     return False
 
 
-if not SIMD_SPEEDUP_AVAILABLE:
+if not _Speedups.current().available:
     with contextlib.suppress(Exception):
         _load_speedups_sibling()
+
+SIMD_SPEEDUP_AVAILABLE = _Speedups.current().available
 
 
 # How many matches a scan loop processes between cancellation polls.
@@ -187,7 +413,19 @@ LOGGER = configure_logging()
 DEBUGGING_MODE = False
 
 _IDA_USER_CANCELLED = getattr(idaapi, "user_cancelled", None)
-_IDA_IS_IDAQ = getattr(idaapi, "is_idaq", None)
+
+
+def _is_graphical_ida() -> bool:
+    """Return whether this IDAPython host has the interactive IDA UI."""
+    if not callable(_IDA_IS_IDAQ):
+        return False
+    try:
+        return _IDA_IS_IDAQ() is True
+    except Exception:
+        return False
+
+
+_Speedups.log_remediation()
 
 
 def idaapi_user_canceled() -> bool:
@@ -1713,6 +1951,8 @@ class UniqueSignatureGenerator:
         if not is_address_marked_as_code(ea):
             raise Unexpected("Cannot create code signature for data")
 
+        speedups = _Speedups.current()
+        use_speedups = speedups.available
         sig = Signature()
         start_fn = idaapi.get_func(ea)
         bytes_since_last_check = 0
@@ -1794,7 +2034,7 @@ class UniqueSignatureGenerator:
                 )
                 bytes_since_last_check += ins_len
 
-                if not SIMD_SPEEDUP_AVAILABLE:
+                if not use_speedups:
                     # Non-SIMD builds have no in-memory buffer to refine
                     # against, so fall back to the per-step rescan.
                     count = SignatureSearcher.count_matches(f"{sig:ida}", buf=buf)
@@ -1864,8 +2104,9 @@ def _refine_offsets_into(
     path only reaches this on the SIMD path; the Python branch is a defensive
     fallback with identical in-place semantics.
     """
-    if SIMD_SPEEDUP_AVAILABLE:
-        return simd_scan.refine_offsets(data_mv, cands, count, j, value, mask)
+    module = _Speedups.current().module
+    if module is not None:
+        return module.refine_offsets(data_mv, cands, count, j, value, mask)
     n = len(data_mv)
     target = value & mask
     w = 0
@@ -1901,8 +2142,9 @@ def _filter_offsets_into_search_ranges(
     range_ends: typing.Sequence[int],
 ) -> int:
     """Compact sorted candidates whose full pattern fits one search range."""
-    if SIMD_SPEEDUP_AVAILABLE:
-        return simd_scan.filter_offsets_by_search_ranges(
+    module = _Speedups.current().module
+    if module is not None:
+        return module.filter_offsets_by_search_ranges(
             cands,
             count,
             pattern_size,
@@ -1948,10 +2190,19 @@ def _refine_candidate_offsets(
     search_ranges: tuple[typing.Sequence[int], typing.Sequence[int]],
 ) -> int:
     """Refine and range-compact one persistent candidate array."""
+    module = _Speedups.current().module
+    refine_offsets = (
+        module.refine_offsets if module is not None else _refine_offsets_into
+    )
+    filter_offsets = (
+        module.filter_offsets_by_search_ranges
+        if module is not None
+        else _filter_offsets_into_search_ranges
+    )
     for index in range(start_index, len(signature)):
         signature_byte = signature[index]
         mask = 0x00 if signature_byte.is_wildcard else 0xFF
-        count = _refine_offsets_into(
+        count = refine_offsets(
             data_mv,
             candidates,
             count,
@@ -1959,7 +2210,8 @@ def _refine_candidate_offsets(
             signature_byte.value,
             mask,
         )
-    return _filter_offsets_into_search_ranges(
+
+    return filter_offsets(
         candidates,
         count,
         len(signature),
@@ -1971,19 +2223,23 @@ def _refine_candidate_offsets(
 class _ByteIndex:
     """A 2-byte bucket position index over the segment buffer.
 
-    Wraps simd_scan.build_byte_index. bucket_size is O(1) and candidates is
-    O(bucket). Built once per generate() and discarded; reused across all
-    anchors in that one search.
+    Wraps the validated native build_byte_index kernel. bucket_size is O(1)
+    and candidates is O(bucket). Built once per generate() and discarded;
+    reused across all anchors in that one search.
     """
 
     heads: "array.array"
     positions: "array.array"
 
     @classmethod
-    def build(cls, data_mv: memoryview) -> typing.Optional["_ByteIndex"]:
-        if not SIMD_SPEEDUP_AVAILABLE or len(data_mv) < 2:
+    def build(
+        cls,
+        data_mv: memoryview,
+    ) -> typing.Optional["_ByteIndex"]:
+        module = _Speedups.current().module
+        if module is None or len(data_mv) < 2:
             return None
-        heads, positions = simd_scan.build_byte_index(data_mv)
+        heads, positions = module.build_byte_index(data_mv)
         return cls(heads, positions)
 
     def bucket_size(self, key: int) -> int:
@@ -2054,6 +2310,7 @@ def _seed_via_index(
     """
     if index is None:
         return None
+    module = _Speedups.current().module
     run = _select_seed_run(sig, index)
     if run is None:
         return None
@@ -2064,10 +2321,9 @@ def _seed_via_index(
     raw = index.candidates(key) if width == 2 else index.candidates1(key)
     # Map each hit at offset p back to a pattern start p - s, keeping only
     # candidates whose full pattern fits in the buffer. The Cython kernel does
-    # this in one nogil pass; the genexp is the defensive fallback (unreachable
-    # in practice, since index is None without SIMD).
-    if SIMD_SPEEDUP_AVAILABLE:
-        cands, count = simd_scan.seed_offsets(raw, s, m, n)
+    # this in one nogil pass; the genexp is the defensive fallback.
+    if module is not None:
+        cands, count = module.seed_offsets(raw, s, m, n)
     else:
         cands = array.array(
             "I", (p - s for p in raw if p >= s and (p - s) + m <= n)
@@ -2088,21 +2344,24 @@ def _seed_via_index(
             count += 1
     # Refine against every exact byte except the seed run's byte(s).
     seed_span = (s, s + 1) if width == 2 else (s,)
+    refine_offsets = (
+        module.refine_offsets if module is not None else _refine_offsets_into
+    )
+    filter_offsets = (
+        module.filter_offsets_by_search_ranges
+        if module is not None
+        else _filter_offsets_into_search_ranges
+    )
     for j in range(m):
         if j in seed_span:
             continue
         sb = sig[j]
         if sb.is_wildcard:
             continue
-        count = _refine_offsets_into(data_mv, cands, count, j, sb.value, 0xFF)
+        count = refine_offsets(data_mv, cands, count, j, sb.value, 0xFF)
     if search_ranges is None:
         search_ranges = _buffer_search_range_arrays(buf, n)
-    count = _filter_offsets_into_search_ranges(
-        cands,
-        count,
-        m,
-        *search_ranges,
-    )
+    count = filter_offsets(cands, count, m, *search_ranges)
     return cands, count
 
 
@@ -2243,6 +2502,8 @@ class MinimalFunctionSignatureGenerator:
         if not decoded:
             raise Unexpected("No unique signature within function")
 
+        speedups = _Speedups.current()
+        use_speedups = speedups.available
         # Load the segment buffer once and reuse it across every is_unique
         # call. Profiling against a real binary showed _load_segments was
         # 84% of generate() wall time when called per-is_unique.
@@ -2251,7 +2512,7 @@ class MinimalFunctionSignatureGenerator:
         search_ranges: typing.Optional[
             tuple["array.array", "array.array"]
         ] = None
-        if SIMD_SPEEDUP_AVAILABLE:
+        if use_speedups:
             with ProgressDialog("Please stand by, copying segments..."):
                 buf = InMemoryBuffer.load(
                     mode=InMemoryBuffer.LoadMode.SEGMENTS,
@@ -2347,6 +2608,7 @@ class MinimalFunctionSignatureGenerator:
         fields for the live wait-box display.
         """
         sig = Signature()
+        use_speedups = _Speedups.current().available
         # SIMD seed-then-refine state: an unsigned candidate array plus a live
         # count, refined in place by the Cython refine_offsets.
         offsets: typing.Optional["array.array"] = None
@@ -2397,7 +2659,7 @@ class MinimalFunctionSignatureGenerator:
                         return result_signature
                 continue
 
-            if not SIMD_SPEEDUP_AVAILABLE or seed_buf is None:
+            if not use_speedups or seed_buf is None:
                 # Non-SIMD builds have no in-memory buffer to refine against,
                 # so fall back to the per-step rescan.
                 count = SignatureSearcher.count_matches(f"{sig:ida}", buf=buf)
@@ -3613,6 +3875,9 @@ class SignatureSearcher:
         imagebase: typing.Optional[int] = None,
         raise_on_cancel: bool = False,
     ) -> list[Match]:
+        module = _Speedups.current().module
+        if module is None:
+            raise RuntimeError("SIMD search requires an active speedups backend")
         simd_signature, _ = SigText.normalize(ida_signature)
         if buf is None:
             buf = _load_search_buffer()
@@ -3628,7 +3893,7 @@ class SignatureSearcher:
             len(data_mv),
         )
 
-        sig = _SimdSignature(simd_signature)
+        sig = module.Signature(simd_signature)
         base = idaapi.inf_get_min_ea()
         if sig.size_bytes == 0:
             return [
@@ -3652,7 +3917,7 @@ class SignatureSearcher:
 
     @staticmethod
     def _scan_simd_ranges(
-        sig: "_SimdSignature",
+        sig: _SimdSignatureProtocol,
         buf: "InMemoryBuffer",
         *,
         offsets_only: bool,
@@ -3661,6 +3926,9 @@ class SignatureSearcher:
         raise_on_cancel: bool = False,
     ) -> typing.Union[list[Match], list[int]]:
         """Scan contiguous ranges into either offsets or address matches."""
+        module = _Speedups.current().module
+        if module is None:
+            raise RuntimeError("SIMD search requires an active speedups backend")
         data_mv = buf.data()
         ranges = (
             buf._search_ranges()
@@ -3671,7 +3939,7 @@ class SignatureSearcher:
         matches: list[Match] = []
         to_addr = None if offsets_only else buf.offset_mapper()
         pattern_size = sig.size_bytes
-        scan_bytes = _simd_scan_bytes
+        scan_bytes = module.scan_bytes
         append_offset = offsets.append
         append_match = matches.append
         since_poll = 0
@@ -3722,10 +3990,13 @@ class SignatureSearcher:
         refinement; reusing the returned buf keeps subsequent refinement on
         the same bytes. SIMD path only.
         """
+        module = _Speedups.current().module
+        if module is None:
+            raise RuntimeError("SIMD search requires an active speedups backend")
         simd_signature, _ = SigText.normalize(ida_signature)
         if buf is None:
             buf = _load_search_buffer()
-        sig = _SimdSignature(simd_signature)
+        sig = module.Signature(simd_signature)
         offsets: list[int] = []
         k = sig.size_bytes
         if k == 0:
@@ -3750,8 +4021,7 @@ class SignatureSearcher:
         imagebase: typing.Optional[int] = None,
         raise_on_cancel: bool = False,
     ) -> list[Match]:
-        # Use SIMD if available
-        if SIMD_SPEEDUP_AVAILABLE:
+        if _Speedups.current().available:
             if buf is None and scope is not None:
                 # Scope the SIMD scan to one segment by loading only its bytes;
                 # offset_mapper resolves the match offsets back to real
@@ -3875,6 +4145,7 @@ class BatchSignatureSearcher:
         scope = SignatureSearcher._scope_for_ea(scope_ea)
         active_buf = buf
         imagebase = SearchResults.current_imagebase(active_buf)
+        speedups_available = _Speedups.current().available
 
         for searcher in searchers:
             try:
@@ -3884,7 +4155,7 @@ class BatchSignatureSearcher:
 
                 matches = match_cache.get(normalized)
                 if matches is None:
-                    uses_buffer = SIMD_SPEEDUP_AVAILABLE or (
+                    uses_buffer = speedups_available or (
                         SignatureSearcher._has_nibble_wildcards(normalized)
                     )
                     if uses_buffer and active_buf is None:
@@ -4121,13 +4392,7 @@ def _ida_ui_services() -> UIServices:
 
 def _select_default_ui_services() -> UIServices:
     """Use IDA UI services only when IDAPython is hosted by the GUI."""
-    if callable(_IDA_IS_IDAQ):
-        try:
-            if _IDA_IS_IDAQ() is True:
-                return _ida_ui_services()
-        except Exception:
-            pass
-    return _HEADLESS_UI
+    return _ida_ui_services() if _is_graphical_ida() else _HEADLESS_UI
 
 
 _DEFAULT_UI_SERVICES = _select_default_ui_services()
@@ -4489,7 +4754,7 @@ class SignatureMakerForm(idaapi.Form):
             f"""STARTITEM 0
 BUTTON YES* OK
 BUTTON CANCEL Cancel
-{PLUGIN_NAME} v{PLUGIN_VERSION} {"(SIMD ENABLED)" if SIMD_SPEEDUP_AVAILABLE else "(NO SIMD SPEEDUP)"}"""
+{PLUGIN_NAME} v{PLUGIN_VERSION} {"(SIMD ENABLED)" if _Speedups.current().available else "(NO SIMD SPEEDUP)"}"""
             + r"""
 {FormChangeCb}
 Select action:
@@ -4644,6 +4909,7 @@ class SigMakerPlugin(idaapi.plugin_t):
     ACTION_STOP_PROFILING: str = "pysigmaker:stop_profiling"
 
     def init(self) -> int:
+        _Speedups.show_remediation()
         self._register_actions()
         # Attach actions to the disassembly right-click popup via live UI
         # hooks rather than a one-shot attach_action_to_menu at init. The

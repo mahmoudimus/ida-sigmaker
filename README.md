@@ -106,6 +106,33 @@ selects the wheel for the active CPython version and architecture. SigMaker
 uses the extension automatically when it is available and shows its status in
 the top-right menu bar:
 
+### Compatibility and updates
+
+The speedup wheel is optional. SigMaker validates the required native entry
+points on the exact extension module it loaded before enabling SIMD. Newer
+wheels also declare an API range; older wheels without that declaration remain
+eligible when they provide the complete native contract. A stale, partial, or
+incompatible wheel is disabled before it can affect a search; the pure-Python
+implementation continues with the same results.
+
+In interactive IDA, SigMaker shows one update prompt per process with the
+loaded extension path and the applicable command:
+
+- HCLI install: `hcli plugin upgrade SigMaker`
+- Manual or standalone install:
+  `"<IDA Python from sys.exec_prefix>" -m pip install --upgrade "sigmaker==<plugin version>"`
+
+Restart IDA after updating. The manual command intentionally derives its
+interpreter from `sys.exec_prefix`; embedded IDA hosts can report `ida.exe` as
+`sys.executable`, which cannot run pip. If updating does not resolve the
+problem, open an [issue](https://github.com/mahmoudimus/ida-sigmaker/issues)
+and include the path from the prompt.
+
+Library and headless users need no special setup. SigMaker never opens an IDA
+dialog outside the graphical plugin. An absent extension is bypassed silently;
+a discovered stale or incompatible extension is logged, then bypassed
+automatically.
+
 ### SIMD Enabled
 
 ![](./assets/simd_enabled.png)
@@ -613,6 +640,11 @@ checked before any change to the public surface:
       - `current()` returns the services active in the current context.
       - `use(services)` scopes services to one context and restores the
         previous value on exit.
+  - Optional SIMD compatibility
+    - `SIMD_SPEEDUP_AVAILABLE` reports whether a validated native backend was
+      loaded during import.
+    - `from sigmaker._speedups import simd_scan` remains available when the
+      matching optional speedups wheel is installed.
   - Batch search
     - `BatchSignatureSearcher`
       - Stable attributes: `input_text` and `searchers`.

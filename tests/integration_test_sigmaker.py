@@ -313,7 +313,7 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
         expected = sigmaker.SignatureSearcher.find_all(pattern, buf=buf)
         self.assertGreater(len(expected), 0)
 
-        with patch.object(sigmaker, "SIMD_SPEEDUP_AVAILABLE", False):
+        with sigmaker._Speedups.use(sigmaker._Speedups()):
             actual = sigmaker.SignatureSearcher.find_all(pattern, buf=buf)
 
         self.assertEqual(actual, expected)

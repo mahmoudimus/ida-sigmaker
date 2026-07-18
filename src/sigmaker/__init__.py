@@ -15,6 +15,7 @@ import dataclasses
 import enum
 import functools
 import io
+import itertools
 import json
 import logging
 import os
@@ -2921,7 +2922,6 @@ class XrefFinder:
     """Handles finding and generating signatures for XREF addresses."""
 
     def __init__(self):
-        self.progress_dialog = ProgressDialog()
         self.signature_maker = SignatureMaker()
 
     @classmethod
@@ -2945,26 +2945,30 @@ class XrefFinder:
     def find_xrefs(self, ea: int, cfg: SigMakerConfig) -> XrefGeneratedSignature:
         """Find XREF signatures to a given address."""
         xref_signatures: list[GeneratedSignature] = []
+        ui = UIServices.current()
 
-        total = self.count_code_xrefs_to(ea)
-        if total == 0:
+        # Open a cancelable wait box before the first xref lookup. Each
+        # candidate generator owns its own wait box, so only keep this scope
+        # around the preflight lookup and stream the remaining xrefs lazily.
+        with ui.progress(
+            "Find shortest XREF signature\n\n"
+            "Enumerating code XREFs...\n\n"
+            "Press Cancel to stop"
+        ):
+            if ui.cancel_requested():
+                return XrefGeneratedSignature([])
+            xref_sources = iter(self.iter_code_xrefs_to(ea))
+            first_xref = next(xref_sources, None)
+
+        if first_xref is None:
             return XrefGeneratedSignature([])
 
         # Non-interactive during xref search
         cfg_no_prompt = dataclasses.replace(cfg, ask_longer_signature=False)
 
-        shortest_len = cfg.max_xref_signature_length + 1
-
-        for i, frm_ea in enumerate(self.iter_code_xrefs_to(ea), start=1):
-            if self.progress_dialog.user_canceled():
+        for frm_ea in itertools.chain((first_xref,), xref_sources):
+            if ui.cancel_requested():
                 break
-
-            self.progress_dialog.replace_message(
-                f"Find shortest XREF signature\n\n"
-                f"Processing xref {i} of {total} ({(i / total) * 100.0:.1f}%)...\n\n"
-                f"Suitable Signatures: {len(xref_signatures)}\n"
-                f"Shortest Signature: {shortest_len if shortest_len <= cfg.max_xref_signature_length else 0} Bytes"
-            )
 
             try:
                 # Public API: returns SignatureResult
@@ -2978,8 +2982,6 @@ class XrefFinder:
             if sig is None:
                 continue
 
-            if len(sig) < shortest_len:
-                shortest_len = len(sig)
             xref_signatures.append(GeneratedSignature(sig, Match(frm_ea)))
 
         xref_signatures.sort()
@@ -5098,10 +5100,9 @@ class SigMakerPlugin(idaapi.plugin_t):
                 f"{hex(pfn.start_ea)}; trying xref signatures...\n"
             )
 
-        with ProgressDialog(
-            "Falling back to xref signatures...\n\nPress Cancel to stop"
-        ):
-            xref_result = XrefFinder().find_xrefs(pfn.start_ea, config)
+        # XrefFinder opens its own bounded preflight wait box, then each
+        # candidate generator owns its cancelable wait box.
+        xref_result = XrefFinder().find_xrefs(pfn.start_ea, config)
 
         if xref_result.signatures:
             best = xref_result.signatures[0]

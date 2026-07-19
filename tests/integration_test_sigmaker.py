@@ -21,6 +21,8 @@ with warnings.catch_warnings():
     warnings.filterwarnings("ignore")
     import idapro
     import idaapi
+    import ida_ua
+    import idc
 
     import sigmaker
 
@@ -749,6 +751,67 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
             self.skipTest(f"Test binary not found at {self.binary_path}")
         except Exception as e:
             self.fail(f"Error in IDA simulation test: {e}")
+
+
+class TestThumbCombinedImmediateFixture(CoveredIntegrationTest):
+    """Characterize IDA's combined Thumb MOVS/LSLS representation for #86."""
+
+    _fixture_name = "hal_cm.o"
+    _combined_bytes = bytes.fromhex("01 24 24 06")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture_path = (
+            pathlib.Path(__file__).parent / "_resources" / "arm" / cls._fixture_name
+        )
+        if not cls.fixture_path.is_file():
+            raise unittest.SkipTest(f"Thumb fixture not found: {cls.fixture_path}")
+
+        cls.tempdir = pathlib.Path(tempfile.mkdtemp())
+        cls.database_path = cls.tempdir / cls.fixture_path.name
+        shutil.copy(cls.fixture_path, cls.database_path)
+        result = idapro.open_database(str(cls.database_path), True)
+        if result != 0:
+            shutil.rmtree(cls.tempdir)
+            raise unittest.SkipTest(
+                f"Unable to open Thumb fixture with IDALIB: {result}"
+            )
+
+        idaapi.auto_wait()
+        cls.database_opened = True
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        if cls.database_opened:
+            idapro.close_database()
+            cls.database_opened = False
+        shutil.rmtree(cls.tempdir)
+        super().tearDownClass()
+
+    def test_ida_combines_movs_and_lsls_as_non_offset_immediate(self):
+        matches = []
+        for ea in range(
+            idaapi.inf_get_min_ea(),
+            idaapi.inf_get_max_ea() - len(self._combined_bytes) + 1,
+        ):
+            if idaapi.get_bytes(ea, len(self._combined_bytes)) == self._combined_bytes:
+                matches.append(ea)
+
+        self.assertEqual(matches, [0x1C])
+
+        ea = matches[0]
+        instruction = ida_ua.insn_t()
+        self.assertEqual(ida_ua.decode_insn(instruction, ea), 4)
+        self.assertEqual(idaapi.get_bytes(ea, instruction.size), self._combined_bytes)
+
+        disassembly = idc.generate_disasm_line(ea, 0).upper()
+        self.assertIn("MOVS", disassembly)
+        self.assertIn("#0X1000000", disassembly)
+
+        immediate = next(op for op in instruction if op.type == idaapi.o_imm)
+        self.assertEqual(immediate.value, 0x1000000)
+        self.assertFalse(idaapi.is_off(idaapi.get_flags(ea), immediate.n))
 
 
 if __name__ == "__main__":

@@ -1339,6 +1339,8 @@ class WildcardPolicy:
     """
 
     allowed_types: frozenset[int]
+    #: ARM-only opt-in for immediate constants that IDA did not mark as offsets.
+    wildcard_literal_immediates: bool = False
     _ctx = WILDCARD_POLICY_CTX
 
     class RarelyWildcardable(enum.IntEnum):
@@ -1467,9 +1469,14 @@ class WildcardPolicy:
         return sum(1 << int(t) for t in self.allowed_types)
 
     @classmethod
-    def from_mask(cls, mask: int) -> "WildcardPolicy":
+    def from_mask(
+        cls, mask: int, *, wildcard_literal_immediates: bool = False
+    ) -> "WildcardPolicy":
         types = {t for t in range(0, 64) if (mask >> t) & 1}
-        return cls(frozenset(types))
+        return cls(
+            frozenset(types),
+            wildcard_literal_immediates=wildcard_literal_immediates,
+        )
 
     @classmethod
     def current(cls) -> "WildcardPolicy":
@@ -1742,8 +1749,10 @@ class OperandProcessor:
         # policy we apply an is_off refinement for the two ambiguous types:
         # o_imm and o_displ carry both build-varying addresses (ADRP #x@PAGE,
         # LDR #x@PAGEOFF) and stable constants (#0x40) / stack slots ([SP,#var]).
-        # We wildcard only the ones IDA resolved to an address (is_off), so
-        # selecting "Immediate"/"Displacement" never masks a stable constant.
+        # By default we wildcard only the ones IDA resolved to an address. ARM
+        # users can separately opt into literal immediates for macro-combined
+        # encodings such as Thumb MOVS+LSLS (issue #86); displacements remain
+        # address-only so stack slots stay exact.
         #
         # Byte range: little-endian ARM/Thumb keeps the opcode+condition in the
         # high byte and the immediate/offset in the low bytes, so wildcarding the
@@ -1760,16 +1769,21 @@ class OperandProcessor:
                 continue
             if op.type not in policy.allowed_types:
                 continue
-            if op.type in (idaapi.o_imm, idaapi.o_displ) and not idaapi.is_off(
-                flags, op.n
-            ):
-                continue
-            # o_imm reaching here is is_off (an address immediate, e.g. ADRP);
-            # together with branch targets its offset can span the high byte.
-            spans_high_byte = op.type in (
-                idaapi.o_near,
-                idaapi.o_far,
-                idaapi.o_imm,
+            is_offset = False
+            if op.type in (idaapi.o_imm, idaapi.o_displ):
+                is_offset = idaapi.is_off(flags, op.n)
+                if op.type == idaapi.o_displ and not is_offset:
+                    continue
+                if op.type == idaapi.o_imm and not (
+                    is_offset or policy.wildcard_literal_immediates
+                ):
+                    continue
+            # An accepted o_imm can span the high byte, whether IDA marked it
+            # as an address (e.g. ADRP) or IDA reports a zero-offset literal
+            # macro. Together with branch targets, wildcard the whole instruction.
+            spans_high_byte = (
+                op.type in (idaapi.o_near, idaapi.o_far)
+                or (op.type == idaapi.o_imm and (is_offset or op.offb == 0))
             )
             if spans_high_byte:
                 off[0] = 0
@@ -4736,7 +4750,8 @@ Select operand types that should be wildcarded:
 <Coprocessor register (for LDC/STC) :{opt11}>
 <Floating point register list :{opt12}>
 <Arbitrary text stored in the operand :{opt13}>
-<ARM condition as an operand :{opt14}>{cWildcardableOperands}>"""
+<ARM condition as an operand :{opt14}>{cWildcardableOperands}>
+<Wildcard non-address immediate values :{opt15}>{cWildcardLiteralImmediates}>"""
             registers.extend(
                 ["opt8", "opt9", "opt10", "opt11", "opt12", "opt13", "opt14"]
             )
@@ -4762,6 +4777,12 @@ Select operand types that should be wildcarded:
                 value=options,
             ),
         }
+        self._has_literal_immediate_option = proc_arch == idaapi.PLFM_ARM
+        if self._has_literal_immediate_option:
+            controls["cWildcardLiteralImmediates"] = F.ChkGroupControl(
+                ("opt15",),
+                value=int(WildcardPolicy.current().wildcard_literal_immediates),
+            )
         super().__init__(form_text, controls)
 
     def OnFormChange(self, fid: int) -> int:
@@ -4769,7 +4790,26 @@ Select operand types that should be wildcarded:
         if fid == self.cWildcardableOperands.id:  # type: ignore
             # re-shift b/c we skipped o_void
             mask = self.GetControlValue(self.cWildcardableOperands) << 1  # type: ignore
-            WildcardPolicy.set_current(WildcardPolicy.from_mask(mask))
+            current = WildcardPolicy.current()
+            WildcardPolicy.set_current(
+                WildcardPolicy.from_mask(
+                    mask,
+                    wildcard_literal_immediates=current.wildcard_literal_immediates,
+                )
+            )
+        elif (
+            self._has_literal_immediate_option
+            and fid == self.cWildcardLiteralImmediates.id  # type: ignore
+        ):
+            current = WildcardPolicy.current()
+            enabled = bool(
+                self.GetControlValue(self.cWildcardLiteralImmediates)  # type: ignore
+            )
+            WildcardPolicy.set_current(
+                dataclasses.replace(
+                    current, wildcard_literal_immediates=enabled
+                )
+            )
         return 1
 
 

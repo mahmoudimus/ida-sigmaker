@@ -7362,6 +7362,30 @@ class TestArmReferenceAwareWildcard(unittest.TestCase):
         found, _, _ = self._run(4, [self._Op(ia.o_imm, 0, 0)])
         self.assertFalse(found)
 
+    def test_opted_in_bare_immediate_wildcards_whole_instruction(self):
+        # Some ARM macros expose a literal immediate spanning the full encoding.
+        ia = sigmaker.idaapi
+        self._offset_ops = set()
+        default_policy = sigmaker.WildcardPolicy(frozenset(self._addr_types))
+        policy = sigmaker.WildcardPolicy(
+            default_policy.allowed_types, wildcard_literal_immediates=True
+        )
+        with sigmaker.WildcardPolicy.use(policy):
+            found, off, length = self._run(4, [self._Op(ia.o_imm, 0, 0)])
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 4))
+
+    def test_opted_in_regular_literal_immediate_keeps_opcode_bytes(self):
+        ia = sigmaker.idaapi
+        self._offset_ops = set()
+        policy = sigmaker.WildcardPolicy(
+            frozenset(self._addr_types), wildcard_literal_immediates=True
+        )
+        with sigmaker.WildcardPolicy.use(policy):
+            found, off, length = self._run(2, [self._Op(ia.o_imm, 1, 0)])
+        self.assertTrue(found)
+        self.assertEqual((off, length), (1, 1))
+
     def test_stack_displacement_not_wildcarded(self):
         # o_displ without is_off is a stack slot ([SP,#var]) -> stays exact.
         ia = sigmaker.idaapi

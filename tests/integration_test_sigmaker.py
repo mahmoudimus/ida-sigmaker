@@ -789,7 +789,7 @@ class TestThumbCombinedImmediateFixture(CoveredIntegrationTest):
         shutil.rmtree(cls.tempdir)
         super().tearDownClass()
 
-    def test_ida_combines_movs_and_lsls_as_non_offset_immediate(self):
+    def _combined_instruction(self):
         matches = []
         for ea in range(
             idaapi.inf_get_min_ea(),
@@ -804,6 +804,23 @@ class TestThumbCombinedImmediateFixture(CoveredIntegrationTest):
         instruction = ida_ua.insn_t()
         self.assertEqual(ida_ua.decode_insn(instruction, ea), 4)
         self.assertEqual(idaapi.get_bytes(ea, instruction.size), self._combined_bytes)
+        return ea, instruction
+
+    def _signature_for_combined_instruction(self, policy):
+        ea, instruction = self._combined_instruction()
+        signature = sigmaker.Signature()
+        with sigmaker.WildcardPolicy.use(policy):
+            sigmaker.InstructionProcessor(sigmaker.OperandProcessor()).append_instruction_to_sig(
+                signature,
+                ea,
+                instruction,
+                wildcard_operands=True,
+                wildcard_optimized=True,
+            )
+        return signature
+
+    def test_ida_combines_movs_and_lsls_as_non_offset_immediate(self):
+        ea, instruction = self._combined_instruction()
 
         disassembly = idc.generate_disasm_line(ea, 0).upper()
         self.assertIn("MOVS", disassembly)
@@ -812,6 +829,22 @@ class TestThumbCombinedImmediateFixture(CoveredIntegrationTest):
         immediate = next(op for op in instruction if op.type == idaapi.o_imm)
         self.assertEqual(immediate.value, 0x1000000)
         self.assertFalse(idaapi.is_off(idaapi.get_flags(ea), immediate.n))
+
+    def test_default_policy_keeps_combined_literal_immediate_exact(self):
+        signature = self._signature_for_combined_instruction(
+            sigmaker.WildcardPolicy.for_arm()
+        )
+        self.assertEqual(f"{signature:ida}", "01 24 24 06")
+
+    def test_literal_immediate_opt_in_masks_combined_instruction(self):
+        default_policy = sigmaker.WildcardPolicy.for_arm()
+        signature = self._signature_for_combined_instruction(
+            sigmaker.WildcardPolicy(
+                default_policy.allowed_types,
+                wildcard_literal_immediates=True,
+            )
+        )
+        self.assertEqual(f"{signature:ida}", "? ? ? ?")
 
 
 if __name__ == "__main__":

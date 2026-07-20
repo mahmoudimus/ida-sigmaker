@@ -14,7 +14,7 @@
             "9.4",
             "10.0"
         ],
-        "description": "Create and search resilient byte signatures with processor-aware operand wildcarding for x86, x64, ARMv6-M Thumb, ARMv7 A32, AArch64, MIPS, and MIPSEL binaries.",
+        "description": "Create and search resilient byte signatures for functions and addresses in IDA Pro, with processor-aware operand wildcarding for x86, x64, ARMv6-M Thumb, ARMv7 A32, AArch64, MIPS, and MIPSEL binaries.",
         "categories": [
             "collaboration-and-productivity",
             "decompilation",

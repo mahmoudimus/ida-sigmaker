@@ -154,12 +154,16 @@ SigMaker creates and searches byte signatures using IDA's decoded
 instructions. Its operand wildcarding has architecture-specific rules for:
 
 - x86 and x64
-- ARM, including Thumb
+- ARMv6-M Thumb (Cortex-M0)
+- ARMv7 A32
+- AArch64
 - MIPS and MIPSEL
 
 Other IDA processor modules use the generic operand wildcarding behavior.
 Architecture-specific rules keep stable opcode and register bytes exact while
-wildcarding address-bearing bytes according to IDA's operand metadata.
+wildcarding address-bearing bytes according to IDA's operand metadata. The ARM
+variants above are exercised through checked-in ELF objects and real IDALIB
+decoding rather than processor mocks alone.
 
 ## What is a "sigmaker"?
 

@@ -1864,29 +1864,6 @@ class _OperandWildcardEvaluator:
         return _WildcardCoverage.SKIP
 
 
-def _arm_immediate_rules() -> tuple[_OperandWildcardRule, ...]:
-    """Build most-specific-first rules for ambiguous ARM immediates."""
-    rules: list[_OperandWildcardRule] = []
-    arm_movl = getattr(ida_allins, "ARM_movl", None)
-    if isinstance(arm_movl, int):
-        rules.append(
-            _OperandWildcardRule(
-                _WildcardCoverage.WHOLE_INSTRUCTION,
-                _ArmThumbMovlImmediatePredicate(arm_movl),
-            )
-        )
-    rules.extend(
-        (
-            _OperandWildcardRule(
-                _WildcardCoverage.WHOLE_INSTRUCTION,
-                _is_offset,
-            ),
-            _OperandWildcardRule(_WildcardCoverage.SKIP, _always),
-        )
-    )
-    return tuple(rules)
-
-
 # ARM branch targets and address immediates can encode offset bits in the high
 # byte (for example Thumb-2 BL/BLX and AArch64 ADRP), so they require
 # whole-instruction coverage (issue #61 follow-up). Address displacements use
@@ -1894,7 +1871,17 @@ def _arm_immediate_rules() -> tuple[_OperandWildcardRule, ...]:
 _ARM_OPERAND_EVALUATOR = _OperandWildcardEvaluator(
     types.MappingProxyType(
         {
-            idaapi.o_imm: _arm_immediate_rules(),
+            idaapi.o_imm: (
+                _OperandWildcardRule(
+                    _WildcardCoverage.WHOLE_INSTRUCTION,
+                    _ArmThumbMovlImmediatePredicate(ida_allins.ARM_movl),
+                ),
+                _OperandWildcardRule(
+                    _WildcardCoverage.WHOLE_INSTRUCTION,
+                    _is_offset,
+                ),
+                _OperandWildcardRule(_WildcardCoverage.SKIP, _always),
+            ),
             idaapi.o_displ: (
                 _OperandWildcardRule(
                     _WildcardCoverage.OPERAND_BYTES,

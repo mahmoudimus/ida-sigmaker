@@ -2,7 +2,7 @@
 
 <img src="https://github.com/mahmoudimus/ida-sigmaker/blob/main/assets/sigmaker-logo.png?raw=true" width="104px" height="100px" alt="Magnifying glass with the word 'sigmaker' and a cross-hair over the 'A' in sigmaker" /> [![ida-sigmaker tests](https://github.com/mahmoudimus/ida-sigmaker/actions/workflows/python.yml/badge.svg)](https://github.com/mahmoudimus/ida-sigmaker/actions/workflows/python.yml)
 
-An IDA Pro 9.0+ zero-dependency cross-platform signature maker plugin with optional SIMD (e.g. AVX2/NEON/SSE2) speedups that works on MacOS/Linux/Windows. The primary goal of this plugin is to work with future versions of IDA without needing to compile against the IDA SDK as well as to allow for easier community contributions.
+An IDA Pro 9.0+ zero-dependency cross-platform signature maker plugin with optional SIMD (e.g. AVX2/NEON/SSE2) speedups that works on macOS, Linux, and Windows. SigMaker includes processor-aware operand wildcarding for x86, x64, ARM, and MIPS binaries. The primary goal of this plugin is to work with future versions of IDA without needing to compile against the IDA SDK, while allowing easier community contributions.
 
 Background reading on [mahmoudimus.com](https://mahmoudimus.com):
 
@@ -20,6 +20,7 @@ Background reading on [mahmoudimus.com](https://mahmoudimus.com):
   - [Where and what is my default user directory?](#where-and-what-is-my-default-user-directory)
 - [SIMD Speedups](#simd-speedups)
 - [Requirements](#requirements)
+  - [Processor support](#processor-support)
 - [What is a "sigmaker"?](#what-is-a-sigmaker)
 - [Usage](#usage)
   - [Finding XREFs](#finding-xrefs)
@@ -146,6 +147,19 @@ automatically.
 - IDA Pro 9.0+
 - IDA Python
 - Python 3.10+
+
+### Processor support
+
+SigMaker creates and searches byte signatures using IDA's decoded
+instructions. Its operand wildcarding has architecture-specific rules for:
+
+- x86 and x64
+- ARM, including Thumb
+- MIPS and MIPSEL
+
+Other IDA processor modules use the generic operand wildcarding behavior.
+Architecture-specific rules keep stable opcode and register bytes exact while
+wildcarding address-bearing bytes according to IDA's operand metadata.
 
 ## What is a "sigmaker"?
 

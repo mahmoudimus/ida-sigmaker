@@ -1805,8 +1805,7 @@ def _is_thumb_at(ea: int) -> bool:
     return idaapi.get_sreg(ea, idaapi.str2reg("T")) == 1
 
 
-@dataclasses.dataclass(frozen=True, slots=True)
-class _ArmThumbMovlImmediatePredicate:
+def _is_arm_thumb_movl_immediate(evaluation: _OperandEvaluation) -> bool:
     """Match IDA's non-offset combined Thumb MOVS/LSLS instruction.
 
     IDA folds the pair into ARM_movl and reports its combined immediate as a
@@ -1814,15 +1813,11 @@ class _ArmThumbMovlImmediatePredicate:
     instructions, so this precise instruction-and-mode exception requires
     whole-instruction coverage while ordinary ARM literals remain exact.
     """
-
-    instruction_type: int
-
-    def __call__(self, evaluation: _OperandEvaluation) -> bool:
-        if evaluation.instruction.itype != self.instruction_type:
-            return False
-        if evaluation.is_offset():
-            return False
-        return _is_thumb_at(evaluation.instruction.ea)
+    if evaluation.instruction.itype != ida_allins.ARM_movl:
+        return False
+    if evaluation.is_offset():
+        return False
+    return _is_thumb_at(evaluation.instruction.ea)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1874,7 +1869,7 @@ _ARM_OPERAND_EVALUATOR = _OperandWildcardEvaluator(
             idaapi.o_imm: (
                 _OperandWildcardRule(
                     _WildcardCoverage.WHOLE_INSTRUCTION,
-                    _ArmThumbMovlImmediatePredicate(ida_allins.ARM_movl),
+                    _is_arm_thumb_movl_immediate,
                 ),
                 _OperandWildcardRule(
                     _WildcardCoverage.WHOLE_INSTRUCTION,

@@ -792,7 +792,32 @@ class OpenedFixtureIntegrationTest(CoveredIntegrationTest):
             super().tearDownClass()
 
 
-class TestThumbCombinedImmediateFixture(OpenedFixtureIntegrationTest):
+class OperandFixtureIntegrationTest(OpenedFixtureIntegrationTest):
+    """Shared decoded-instruction assertions for operand fixtures."""
+
+    def _decode_instruction(self, ea, expected_bytes, mnemonic):
+        instruction = ida_ua.insn_t()
+        self.assertEqual(ida_ua.decode_insn(instruction, ea), len(expected_bytes))
+        self.assertEqual(idaapi.get_bytes(ea, instruction.size), expected_bytes)
+        self.assertEqual(idc.print_insn_mnem(ea).upper(), mnemonic)
+        return instruction
+
+    @staticmethod
+    def _signature_for_instruction(ea, instruction):
+        signature = sigmaker.Signature()
+        sigmaker.InstructionProcessor(
+            sigmaker.OperandProcessor()
+        ).append_instruction_to_sig(
+            signature,
+            ea,
+            instruction,
+            wildcard_operands=True,
+            wildcard_optimized=True,
+        )
+        return signature
+
+
+class TestThumbCombinedImmediateFixture(OperandFixtureIntegrationTest):
     """Characterize IDA's combined Thumb MOVS/LSLS representation for #86."""
 
     _fixture_parts = ("arm", "hal_cm.o")
@@ -817,18 +842,8 @@ class TestThumbCombinedImmediateFixture(OpenedFixtureIntegrationTest):
 
     def _signature_for_combined_instruction(self, policy):
         ea, instruction = self._combined_instruction()
-        signature = sigmaker.Signature()
         with sigmaker.WildcardPolicy.use(policy):
-            sigmaker.InstructionProcessor(
-                sigmaker.OperandProcessor()
-            ).append_instruction_to_sig(
-                signature,
-                ea,
-                instruction,
-                wildcard_operands=True,
-                wildcard_optimized=True,
-            )
-        return signature
+            return self._signature_for_instruction(ea, instruction)
 
     def test_ida_combines_movs_and_lsls_as_non_offset_immediate(self):
         ea, instruction = self._combined_instruction()
@@ -859,7 +874,91 @@ class TestThumbCombinedImmediateFixture(OpenedFixtureIntegrationTest):
         self.assertEqual(f"{signature:ida}", "01 24 24 06")
 
 
-class TestMipsHi16Lo16Fixture(OpenedFixtureIntegrationTest):
+class TestArmv7RelocationFixture(OperandFixtureIntegrationTest):
+    """Exercise ARMv7 A32 address relocations and stable literals."""
+
+    _fixture_parts = ("arm", "armv7", "armv7_relocations.o")
+    _instructions = (
+        (
+            0x0,
+            bytes.fromhex("18 00 00 E3 00 00 40 E3"),
+            "MOV",
+            True,
+            "? ? ? ? ? ? ? ?",
+        ),
+        (0x8, bytes.fromhex("01 00 00 EB"), "BL", None, "? ? ? ?"),
+        (0xC, bytes.fromhex("07 10 A0 E3"), "MOV", False, "07 10 A0 E3"),
+    )
+
+    def test_default_policy_wildcards_armv7_address_relocations(self):
+        self.assertEqual(idaapi.ph_get_id(), idaapi.PLFM_ARM)
+        self.assertFalse(idaapi.inf_is_be())
+
+        for (
+            ea,
+            expected_bytes,
+            mnemonic,
+            expected_offset,
+            expected_signature,
+        ) in self._instructions:
+            instruction = self._decode_instruction(ea, expected_bytes, mnemonic)
+            if expected_offset is None:
+                self.assertTrue(any(op.type == idaapi.o_near for op in instruction))
+            else:
+                immediate = next(op for op in instruction if op.type == idaapi.o_imm)
+                self.assertEqual(
+                    bool(idaapi.is_off(idaapi.get_flags(ea), immediate.n)),
+                    expected_offset,
+                )
+            self.assertEqual(
+                f"{self._signature_for_instruction(ea, instruction):ida}",
+                expected_signature,
+            )
+
+
+class TestAArch64RelocationFixture(OperandFixtureIntegrationTest):
+    """Exercise AArch64 page, low-address, and call relocations."""
+
+    _fixture_parts = ("arm", "aarch64", "aarch64_relocations.o")
+    _instructions = (
+        (
+            0x0,
+            bytes.fromhex("00 00 00 90 00 60 00 91"),
+            "ADRL",
+            True,
+            "? ? ? ? ? ? ? ?",
+        ),
+        (0x8, bytes.fromhex("03 00 00 94"), "BL", None, "? ? ? ?"),
+        (0xC, bytes.fromhex("E1 00 80 52"), "MOV", False, "E1 00 80 52"),
+    )
+
+    def test_default_policy_wildcards_aarch64_address_relocations(self):
+        self.assertEqual(idaapi.ph_get_id(), idaapi.PLFM_ARM)
+        self.assertFalse(idaapi.inf_is_be())
+
+        for (
+            ea,
+            expected_bytes,
+            mnemonic,
+            expected_offset,
+            expected_signature,
+        ) in self._instructions:
+            instruction = self._decode_instruction(ea, expected_bytes, mnemonic)
+            if expected_offset is None:
+                self.assertTrue(any(op.type == idaapi.o_near for op in instruction))
+            else:
+                immediate = next(op for op in instruction if op.type == idaapi.o_imm)
+                self.assertEqual(
+                    bool(idaapi.is_off(idaapi.get_flags(ea), immediate.n)),
+                    expected_offset,
+                )
+            self.assertEqual(
+                f"{self._signature_for_instruction(ea, instruction):ida}",
+                expected_signature,
+            )
+
+
+class TestMipsHi16Lo16Fixture(OperandFixtureIntegrationTest):
     """Exercise MIPS relocation operand metadata with a controlled ELF object."""
 
     _fixture_parts = ("mips", "hi16_lo16.o")
@@ -867,19 +966,6 @@ class TestMipsHi16Lo16Fixture(OpenedFixtureIntegrationTest):
         (0x0, bytes.fromhex("01 00 02 3C"), "LUI", "%HI", "? ? 02 3C"),
         (0x8, bytes.fromhex("24 00 42 24"), "ADDIU", "%LO", "? ? 42 24"),
     )
-
-    def _signature_for_instruction(self, ea, instruction):
-        signature = sigmaker.Signature()
-        sigmaker.InstructionProcessor(
-            sigmaker.OperandProcessor()
-        ).append_instruction_to_sig(
-            signature,
-            ea,
-            instruction,
-            wildcard_operands=True,
-            wildcard_optimized=True,
-        )
-        return signature
 
     def test_default_policy_wildcards_only_relocated_mips_halfwords(self):
         self.assertEqual(idaapi.ph_get_id(), idaapi.PLFM_MIPS)

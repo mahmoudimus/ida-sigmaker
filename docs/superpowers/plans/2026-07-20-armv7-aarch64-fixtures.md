@@ -82,10 +82,10 @@ returns the result. Reuse it from MIPS and both new ARM classes.
 - [ ] **Step 2: Add the ARMv7 integration test**
 
 Open `arm/armv7/armv7_relocations.o`; assert `PLFM_ARM`, little-endian mode,
-4-byte decoding at offsets `0x0`, `0x4`, `0x8`, and `0xC`, and mnemonics
-`MOVW`, `MOVT`, `BL`, and `MOV`. Assert IDA marks each relocation-bearing
-operand as address-derived. Expect `? ? ? ?` for the first three signatures
-and `07 10 A0 E3` for the stable literal `MOV R1,#7`.
+IDA's 8-byte combined `MOV` at `0x0`, and the 4-byte `BL` and literal `MOV` at
+`0x8` and `0xC`. Assert IDA marks the combined address operand as offset-derived
+and represents the call as `o_near`. Expect eight wildcard bytes for the
+combined `MOV`, four for `BL`, and `07 10 A0 E3` for stable `MOV R1,#7`.
 
 - [ ] **Step 3: Run ARMv7 characterization under IDALIB**
 
@@ -103,10 +103,10 @@ intended varying-address coverage.
 - [ ] **Step 4: Add the AArch64 integration test**
 
 Open `arm/aarch64/aarch64_relocations.o`; assert `PLFM_ARM`, little-endian
-mode, 4-byte decoding at offsets `0x0`, `0x4`, `0x8`, and `0xC`, and mnemonics
-`ADRP`, `ADD`, `BL`, and `MOV`. Assert the relocation-bearing operand metadata
-used by the evaluator. Expect `? ? ? ?` for the first three signatures and
-`E1 00 80 52` for the stable literal `MOV W1,#7`.
+mode, IDA's 8-byte combined `ADRL` at `0x0`, and the 4-byte `BL` and literal
+`MOV` at `0x8` and `0xC`. Assert IDA marks the combined address operand as
+offset-derived and represents the call as `o_near`. Expect eight wildcard
+bytes for `ADRL`, four for `BL`, and `E1 00 80 52` for stable `MOV W1,#7`.
 
 - [ ] **Step 5: Run AArch64 characterization under IDALIB**
 

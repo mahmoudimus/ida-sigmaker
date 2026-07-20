@@ -1787,19 +1787,23 @@ def _has_zero_offb_without_optimized_wildcarding(
     return evaluation.operand.offb == 0 and not evaluation.wildcard_optimized
 
 
-def _arm_thumb_movl_immediate_expression(
-    arm_movl: int,
-) -> _OperandRuleExpression:
-    """Build the ARM-only matcher for IDA's combined Thumb literal macro."""
+def _is_thumb_at(ea: int) -> bool:
+    """Return whether IDA decodes the address in Thumb mode."""
+    return idaapi.get_sreg(ea, idaapi.str2reg("T")) == 1
 
-    def is_thumb_movl_immediate(evaluation: _OperandEvaluation) -> bool:
-        if evaluation.instruction.itype != arm_movl:
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ArmThumbMovlImmediatePredicate:
+    """Match IDA's combined Thumb MOVS/LSLS immediate instruction."""
+
+    instruction_type: int
+
+    def __call__(self, evaluation: _OperandEvaluation) -> bool:
+        if evaluation.instruction.itype != self.instruction_type:
             return False
         if evaluation.is_offset():
             return False
-        return OperandProcessor.is_thumb(evaluation.instruction.ea)
-
-    return is_thumb_movl_immediate
+        return _is_thumb_at(evaluation.instruction.ea)
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -1843,7 +1847,7 @@ def _arm_immediate_rules() -> tuple[_OperandWildcardRule, ...]:
         rules.append(
             _OperandWildcardRule(
                 _WildcardCoverage.WHOLE_INSTRUCTION,
-                _arm_thumb_movl_immediate_expression(arm_movl),
+                _ArmThumbMovlImmediatePredicate(arm_movl),
             )
         )
     rules.extend(
@@ -1922,10 +1926,6 @@ class OperandProcessor:
             idaapi.PLFM_ARM: _ARM_OPERAND_EVALUATOR,
             idaapi.PLFM_MIPS: _MIPS_OPERAND_EVALUATOR,
         }.get(processor_id, _NON_ARM_OPERAND_EVALUATOR)
-
-    @staticmethod
-    def is_thumb(addr: int) -> bool:
-        return idaapi.get_sreg(addr, idaapi.str2reg("T")) == 1
 
     def get_operand(
         self,

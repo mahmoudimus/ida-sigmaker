@@ -25,8 +25,10 @@ import string
 import sys
 import time
 import traceback
+import types
 import typing
 
+import ida_allins
 import idaapi
 import idc
 
@@ -1339,8 +1341,6 @@ class WildcardPolicy:
     """
 
     allowed_types: frozenset[int]
-    #: ARM-only opt-in for immediate constants that IDA did not mark as offsets.
-    wildcard_literal_immediates: bool = False
     _ctx = WILDCARD_POLICY_CTX
 
     class RarelyWildcardable(enum.IntEnum):
@@ -1421,9 +1421,9 @@ class WildcardPolicy:
     def for_arm(cls) -> "WildcardPolicy":
         # Default to address-bearing operands only: direct memory references,
         # displacements, immediates, and near/far branch targets. is_off refines
-        # the ambiguous imm/displ operands to actual addresses at match time
-        # (see OperandProcessor._get_operand_offset_arm), so bare constants and
-        # stack slots are not wildcarded. Register lists, coprocessor registers,
+        # the ambiguous imm/displ operands to actual addresses at match time, so
+        # bare constants and stack slots are not wildcarded. Register lists,
+        # coprocessor registers,
         # ARM conditions, arbitrary text, and plain registers are stable across
         # builds and are left out of the default; users who need register-
         # tolerant matching enable them in the operand-wildcard dialog.
@@ -1437,7 +1437,17 @@ class WildcardPolicy:
 
     @classmethod
     def for_mips(cls) -> "WildcardPolicy":
-        return cls(frozenset({cls.BaseKind.MEM, cls.BaseKind.FAR, cls.BaseKind.NEAR}))
+        return cls(
+            frozenset(
+                {
+                    cls.BaseKind.MEM,
+                    cls.BaseKind.DISPL,
+                    cls.BaseKind.IMM,
+                    cls.BaseKind.FAR,
+                    cls.BaseKind.NEAR,
+                }
+            )
+        )
 
     @classmethod
     def for_ppc(cls) -> "WildcardPolicy":
@@ -1469,21 +1479,22 @@ class WildcardPolicy:
         return sum(1 << int(t) for t in self.allowed_types)
 
     @classmethod
-    def from_mask(
-        cls, mask: int, *, wildcard_literal_immediates: bool = False
-    ) -> "WildcardPolicy":
+    def from_mask(cls, mask: int) -> "WildcardPolicy":
         types = {t for t in range(0, 64) if (mask >> t) & 1}
-        return cls(
-            frozenset(types),
-            wildcard_literal_immediates=wildcard_literal_immediates,
-        )
+        return cls(frozenset(types))
 
     @classmethod
     def current(cls) -> "WildcardPolicy":
-        """Get current policy (falling back to arch-detected default)."""
-        policy = cls._ctx.get(cls.detect_from_processor())
-        cls._ctx.set(policy)
-        return policy
+        """Get an explicit policy override or detect one for this processor."""
+        try:
+            return cls._ctx.get()
+        except LookupError:
+            return cls.detect_from_processor()
+
+    @classmethod
+    def _current_or(cls, fallback: "WildcardPolicy") -> "WildcardPolicy":
+        """Return an explicit policy override or a caller-owned fallback."""
+        return cls._ctx.get(fallback)
 
     @classmethod
     def set_current(cls, policy: "WildcardPolicy") -> contextvars.Token:
@@ -1728,71 +1739,193 @@ class SigText:
         return " ".join(out), pattern
 
 
+class _WildcardCoverage(enum.Enum):
+    """Byte coverage selected for one policy-eligible operand."""
+
+    SKIP = enum.auto()
+    OPERAND_BYTES = enum.auto()
+    MIPS_IMMEDIATE = enum.auto()
+    WHOLE_INSTRUCTION = enum.auto()
+
+
+@dataclasses.dataclass(slots=True)
+class _OperandEvaluation:
+    """Lazily resolve generic IDA facts for one rule evaluation."""
+
+    instruction: idaapi.insn_t
+    operand: idaapi.op_t
+    wildcard_optimized: bool
+    _is_offset: bool | None = dataclasses.field(
+        init=False, default=None, repr=False
+    )
+
+    def is_offset(self) -> bool:
+        """Return and cache whether IDA marks this operand as an offset."""
+        if self._is_offset is None:
+            flags = idaapi.get_flags(self.instruction.ea)
+            self._is_offset = bool(idaapi.is_off(flags, self.operand.n))
+        return self._is_offset
+
+
+_OperandRuleExpression = typing.Callable[[_OperandEvaluation], bool]
+
+
+def _always(_evaluation: _OperandEvaluation) -> bool:
+    """Match the fallback rule for an eligible operand."""
+    return True
+
+
+def _is_offset(evaluation: _OperandEvaluation) -> bool:
+    """Match operands IDA marks as offsets."""
+    return evaluation.is_offset()
+
+
+def _has_zero_offb_without_optimized_wildcarding(
+    evaluation: _OperandEvaluation,
+) -> bool:
+    """Preserve the legacy non-ARM zero-offset exclusion."""
+    return evaluation.operand.offb == 0 and not evaluation.wildcard_optimized
+
+
+def _arm_thumb_movl_immediate_expression(
+    arm_movl: int,
+) -> _OperandRuleExpression:
+    """Build the ARM-only matcher for IDA's combined Thumb literal macro."""
+
+    def is_thumb_movl_immediate(evaluation: _OperandEvaluation) -> bool:
+        if evaluation.instruction.itype != arm_movl:
+            return False
+        if evaluation.is_offset():
+            return False
+        return OperandProcessor.is_thumb(evaluation.instruction.ea)
+
+    return is_thumb_movl_immediate
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _OperandWildcardRule:
+    """One precedence-ordered expression for operand byte coverage."""
+
+    coverage: _WildcardCoverage
+    expression: _OperandRuleExpression
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _OperandWildcardEvaluator:
+    """Apply immutable, precedence-ordered rules for one processor family."""
+
+    rules_by_operand_type: typing.Mapping[int, tuple[_OperandWildcardRule, ...]]
+    fallback_rules: tuple[_OperandWildcardRule, ...]
+
+    def evaluate(
+        self,
+        policy: WildcardPolicy,
+        instruction: idaapi.insn_t,
+        operand: idaapi.op_t,
+        *,
+        wildcard_optimized: bool,
+    ) -> _WildcardCoverage:
+        if not policy.allows_type(operand.type):
+            return _WildcardCoverage.SKIP
+
+        rules = self.rules_by_operand_type.get(operand.type, self.fallback_rules)
+        evaluation = _OperandEvaluation(instruction, operand, wildcard_optimized)
+        for rule in rules:
+            if rule.expression(evaluation):
+                return rule.coverage
+        return _WildcardCoverage.SKIP
+
+
+def _arm_immediate_rules() -> tuple[_OperandWildcardRule, ...]:
+    rules: list[_OperandWildcardRule] = []
+    arm_movl = getattr(ida_allins, "ARM_movl", None)
+    if isinstance(arm_movl, int):
+        rules.append(
+            _OperandWildcardRule(
+                _WildcardCoverage.WHOLE_INSTRUCTION,
+                _arm_thumb_movl_immediate_expression(arm_movl),
+            )
+        )
+    rules.extend(
+        (
+            _OperandWildcardRule(
+                _WildcardCoverage.WHOLE_INSTRUCTION,
+                _is_offset,
+            ),
+            _OperandWildcardRule(_WildcardCoverage.SKIP, _always),
+        )
+    )
+    return tuple(rules)
+
+
+_ARM_OPERAND_EVALUATOR = _OperandWildcardEvaluator(
+    types.MappingProxyType(
+        {
+            idaapi.o_imm: _arm_immediate_rules(),
+            idaapi.o_displ: (
+                _OperandWildcardRule(
+                    _WildcardCoverage.OPERAND_BYTES,
+                    _is_offset,
+                ),
+                _OperandWildcardRule(_WildcardCoverage.SKIP, _always),
+            ),
+            idaapi.o_near: (
+                _OperandWildcardRule(_WildcardCoverage.WHOLE_INSTRUCTION, _always),
+            ),
+            idaapi.o_far: (
+                _OperandWildcardRule(_WildcardCoverage.WHOLE_INSTRUCTION, _always),
+            ),
+        }
+    ),
+    (_OperandWildcardRule(_WildcardCoverage.OPERAND_BYTES, _always),),
+)
+_NON_ARM_FALLBACK_RULES = (
+    _OperandWildcardRule(
+        _WildcardCoverage.SKIP,
+        _has_zero_offb_without_optimized_wildcarding,
+    ),
+    _OperandWildcardRule(_WildcardCoverage.OPERAND_BYTES, _always),
+)
+_MIPS_OPERAND_EVALUATOR = _OperandWildcardEvaluator(
+    types.MappingProxyType(
+        {
+            idaapi.o_imm: (
+                _OperandWildcardRule(_WildcardCoverage.MIPS_IMMEDIATE, _is_offset),
+                _OperandWildcardRule(_WildcardCoverage.SKIP, _always),
+            ),
+            idaapi.o_displ: (
+                _OperandWildcardRule(_WildcardCoverage.MIPS_IMMEDIATE, _is_offset),
+                _OperandWildcardRule(_WildcardCoverage.SKIP, _always),
+            ),
+        }
+    ),
+    _NON_ARM_FALLBACK_RULES,
+)
+_NON_ARM_OPERAND_EVALUATOR = _OperandWildcardEvaluator(
+    types.MappingProxyType({}),
+    _NON_ARM_FALLBACK_RULES,
+)
+
+
 class OperandProcessor:
-    """Handles operand processing for signature generation (policy-driven).
-    # TODO: refactor this to support more architectures, not just ARM/X64.
-    """
+    """Select byte ranges according to the current operand wildcard policy."""
 
     def __init__(self):
-        self._is_arm = self._check_is_arm()
+        processor_id = idaapi.ph_get_id()
+        self._default_policy = WildcardPolicy.detect_from_processor()
+        self._uses_arm_ranges = processor_id == idaapi.PLFM_ARM
+        self._uses_mips_ranges = processor_id == idaapi.PLFM_MIPS
+        self._mips_immediate_offset = (
+            2 if self._uses_mips_ranges and idaapi.inf_is_be() else 0
+        )
+        self._evaluator = {
+            idaapi.PLFM_ARM: _ARM_OPERAND_EVALUATOR,
+            idaapi.PLFM_MIPS: _MIPS_OPERAND_EVALUATOR,
+        }.get(processor_id, _NON_ARM_OPERAND_EVALUATOR)
 
     @staticmethod
-    def _check_is_arm() -> bool:
-        return idaapi.ph_get_id() == idaapi.PLFM_ARM
-
-    def _get_operand_offset_arm(
-        self, ins: idaapi.insn_t, off: typing.List[int], length: typing.List[int]
-    ) -> bool:
-        # Which operands to wildcard is driven by the user's operand-wildcard
-        # policy (the "Configure operand wildcarding" dialog); the default is
-        # address-bearing types only (see WildcardPolicy.for_arm). On top of the
-        # policy we apply an is_off refinement for the two ambiguous types:
-        # o_imm and o_displ carry both build-varying addresses (ADRP #x@PAGE,
-        # LDR #x@PAGEOFF) and stable constants (#0x40) / stack slots ([SP,#var]).
-        # By default we wildcard only the ones IDA resolved to an address. ARM
-        # users can separately opt into literal immediates for macro-combined
-        # encodings such as Thumb MOVS+LSLS (issue #86); displacements remain
-        # address-only so stack slots stay exact.
-        #
-        # Byte range: little-endian ARM/Thumb keeps the opcode+condition in the
-        # high byte and the immediate/offset in the low bytes, so wildcarding the
-        # low ins.size-1 bytes usually suffices (Thumb-1 = 2 bytes -> length 1;
-        # ARM/Thumb-2 = 4 -> 3; 8 -> 7). But some offsets reach into the high
-        # byte: branch targets (Thumb-2 BL/BLX and long B span all bytes) and
-        # AArch64 ADRP (immlo sits in the high byte). For those we must wildcard
-        # the whole instruction, or the offset bits left in the high byte make
-        # the signature miss other builds (issue #61 follow-up).
-        policy = WildcardPolicy.current()
-        flags = idaapi.get_flags(ins.ea)
-        for op in ins:
-            if op.type == idaapi.o_void:
-                continue
-            if op.type not in policy.allowed_types:
-                continue
-            is_offset = False
-            if op.type in (idaapi.o_imm, idaapi.o_displ):
-                is_offset = idaapi.is_off(flags, op.n)
-                if op.type == idaapi.o_displ and not is_offset:
-                    continue
-                if op.type == idaapi.o_imm and not (
-                    is_offset or policy.wildcard_literal_immediates
-                ):
-                    continue
-            # An accepted o_imm can span the high byte, whether IDA marked it
-            # as an address (e.g. ADRP) or IDA reports a zero-offset literal
-            # macro. Together with branch targets, wildcard the whole instruction.
-            spans_high_byte = (
-                op.type in (idaapi.o_near, idaapi.o_far)
-                or (op.type == idaapi.o_imm and (is_offset or op.offb == 0))
-            )
-            if spans_high_byte:
-                off[0] = 0
-                length[0] = ins.size
-            else:
-                off[0] = op.offb
-                length[0] = ins.size - 1 if ins.size in (2, 4, 8) else 0
-            return True
-        return False
+    def is_thumb(addr: int) -> bool:
+        return idaapi.get_sreg(addr, idaapi.str2reg("T")) == 1
 
     def get_operand(
         self,
@@ -1801,18 +1934,30 @@ class OperandProcessor:
         length: typing.List[int],
         wildcard_optimized: bool,
     ) -> bool:
-        if self._is_arm:
-            return self._get_operand_offset_arm(ins, off, length)
-        policy = WildcardPolicy.current()
+        policy = WildcardPolicy._current_or(self._default_policy)
         for op in ins:
             if op.type == idaapi.o_void:
                 continue
-            if not policy.allows_type(op.type):
+            coverage = self._evaluator.evaluate(
+                policy,
+                ins,
+                op,
+                wildcard_optimized=wildcard_optimized,
+            )
+            if coverage is _WildcardCoverage.SKIP:
                 continue
-            if op.offb == 0 and not wildcard_optimized:
-                continue
-            off[0] = op.offb
-            length[0] = ins.size - op.offb
+            if coverage is _WildcardCoverage.WHOLE_INSTRUCTION:
+                off[0] = 0
+                length[0] = ins.size
+            elif coverage is _WildcardCoverage.MIPS_IMMEDIATE:
+                off[0] = self._mips_immediate_offset
+                length[0] = 2
+            else:
+                off[0] = op.offb
+                if self._uses_arm_ranges:
+                    length[0] = ins.size - 1 if ins.size in (2, 4, 8) else 0
+                else:
+                    length[0] = ins.size - op.offb
             return True
         return False
 
@@ -4750,8 +4895,7 @@ Select operand types that should be wildcarded:
 <Coprocessor register (for LDC/STC) :{opt11}>
 <Floating point register list :{opt12}>
 <Arbitrary text stored in the operand :{opt13}>
-<ARM condition as an operand :{opt14}>{cWildcardableOperands}>
-<Wildcard non-address immediate values :{opt15}>{cWildcardLiteralImmediates}>"""
+<ARM condition as an operand :{opt14}>{cWildcardableOperands}>"""
             registers.extend(
                 ["opt8", "opt9", "opt10", "opt11", "opt12", "opt13", "opt14"]
             )
@@ -4777,12 +4921,6 @@ Select operand types that should be wildcarded:
                 value=options,
             ),
         }
-        self._has_literal_immediate_option = proc_arch == idaapi.PLFM_ARM
-        if self._has_literal_immediate_option:
-            controls["cWildcardLiteralImmediates"] = F.ChkGroupControl(
-                ("opt15",),
-                value=int(WildcardPolicy.current().wildcard_literal_immediates),
-            )
         super().__init__(form_text, controls)
 
     def OnFormChange(self, fid: int) -> int:
@@ -4790,26 +4928,7 @@ Select operand types that should be wildcarded:
         if fid == self.cWildcardableOperands.id:  # type: ignore
             # re-shift b/c we skipped o_void
             mask = self.GetControlValue(self.cWildcardableOperands) << 1  # type: ignore
-            current = WildcardPolicy.current()
-            WildcardPolicy.set_current(
-                WildcardPolicy.from_mask(
-                    mask,
-                    wildcard_literal_immediates=current.wildcard_literal_immediates,
-                )
-            )
-        elif (
-            self._has_literal_immediate_option
-            and fid == self.cWildcardLiteralImmediates.id  # type: ignore
-        ):
-            current = WildcardPolicy.current()
-            enabled = bool(
-                self.GetControlValue(self.cWildcardLiteralImmediates)  # type: ignore
-            )
-            WildcardPolicy.set_current(
-                dataclasses.replace(
-                    current, wildcard_literal_immediates=enabled
-                )
-            )
+            WildcardPolicy.set_current(WildcardPolicy.from_mask(mask))
         return 1
 
 

@@ -36,7 +36,12 @@ sys.path.insert(0, TEST_DIR.as_posix())
 from coveredtestcase import CoverageTestCase
 
 # Use a context manager to patch sys.modules before importing sigmaker
-with patch.dict("sys.modules", {"idaapi": MagicMock(), "idc": MagicMock()}):
+_ida_allins = types.ModuleType("ida_allins")
+_ida_allins.ARM_movl = 80
+with patch.dict(
+    "sys.modules",
+    {"idaapi": MagicMock(), "idc": MagicMock(), "ida_allins": _ida_allins},
+):
     import sigmaker
 
 
@@ -4523,6 +4528,15 @@ class _RecordingXrefProgressScope:
 class TestXrefFinderCancellation(CoveredUnitTest):
     """Cancel during one XREF candidate stops and keeps prior results."""
 
+    def setUp(self):
+        # Most tests mock signature generation, not the real SIMD buffer load.
+        # Keep that fixture on the fallback path; buffer reuse is covered below
+        # with an explicit mocked speedups module.
+        self._speedups_token = sigmaker._SPEEDUPS_CTX.set(sigmaker._Speedups())
+
+    def tearDown(self):
+        sigmaker._SPEEDUPS_CTX.reset(self._speedups_token)
+
     def _cfg(self) -> sigmaker.SigMakerConfig:
         return sigmaker.SigMakerConfig(
             output_format=sigmaker.SignatureType.IDA,
@@ -7249,12 +7263,50 @@ class TestPluginManifestVersion(unittest.TestCase):
         )
 
 
-class TestArmReferenceAwareWildcard(unittest.TestCase):
-    """ARM/Thumb wildcarding respects the operand-wildcard policy, refines the
-    ambiguous imm/displ types to real addresses via is_off, and wildcards the
-    whole instruction where the offset reaches the high byte (branch targets,
-    ADRP). Register-bearing operands stay exact unless the user selects them.
-    """
+class TestWildcardPolicyDefaults(unittest.TestCase):
+    """Architecture-derived policy defaults do not become persistent overrides."""
+
+    def test_current_redetects_after_processor_change_without_override(self):
+        first = sigmaker.WildcardPolicy(frozenset({1}))
+        second = sigmaker.WildcardPolicy(frozenset({2}))
+
+        class LocalPolicy(sigmaker.WildcardPolicy):
+            _ctx = sigmaker.contextvars.ContextVar("test_wildcard_policy")
+
+        with patch.object(
+            LocalPolicy,
+            "detect_from_processor",
+            side_effect=(first, second),
+        ):
+            self.assertIs(LocalPolicy.current(), first)
+            self.assertIs(LocalPolicy.current(), second)
+
+    def test_operand_processor_detects_its_default_policy_once(self):
+        policy = sigmaker.WildcardPolicy(frozenset())
+
+        class NoOperandInstruction:
+            size = 4
+            ea = 0x1000
+
+            def __iter__(self):
+                return iter(())
+
+        def exercise():
+            processor = sigmaker.OperandProcessor()
+            processor.get_operand(NoOperandInstruction(), [0], [0], True)
+            processor.get_operand(NoOperandInstruction(), [0], [0], True)
+
+        with patch.object(
+            sigmaker.WildcardPolicy,
+            "detect_from_processor",
+            return_value=policy,
+        ) as detect:
+            sigmaker.contextvars.Context().run(exercise)
+        detect.assert_called_once_with()
+
+
+class TestOperandWildcardSelection(unittest.TestCase):
+    """Characterize policy-gated architecture-specific operand coverage."""
 
     class _Op:
         def __init__(self, type_, offb, n):
@@ -7263,10 +7315,11 @@ class TestArmReferenceAwareWildcard(unittest.TestCase):
             self.n = n
 
     class _Ins:
-        def __init__(self, size, ops, ea=0x1000):
+        def __init__(self, size, ops, ea=0x1000, itype=0):
             self.size = size
             self._ops = ops
             self.ea = ea
+            self.itype = itype
 
         def __iter__(self):
             return iter(self._ops)
@@ -7274,11 +7327,31 @@ class TestArmReferenceAwareWildcard(unittest.TestCase):
     def setUp(self):
         ia = sigmaker.idaapi
         self._saved = {
-            k: getattr(ia, k, None) for k in ("get_flags", "is_off", "get_bytes")
+            k: getattr(ia, k, None)
+            for k in (
+                "get_flags",
+                "is_off",
+                "get_bytes",
+                "get_sreg",
+                "str2reg",
+                "ph_get_id",
+                "inf_is_be",
+                "PLFM_386",
+                "PLFM_ARM",
+                "PLFM_MIPS",
+            )
         }
+        ia.PLFM_386 = 1
+        ia.PLFM_ARM = 2
+        ia.PLFM_MIPS = 3
         ia.get_flags = MagicMock(return_value=0)
         self._offset_ops = set()  # operand indices IDA marks as offsets
-        ia.is_off = lambda flags, n: n in self._offset_ops
+        ia.is_off = MagicMock(side_effect=lambda flags, n: n in self._offset_ops)
+        self._thumb = True
+        ia.get_sreg = MagicMock(side_effect=lambda *_args: int(self._thumb))
+        ia.str2reg = MagicMock(return_value=20)
+        ia.ph_get_id = MagicMock(return_value=ia.PLFM_ARM)
+        ia.inf_is_be = MagicMock(return_value=False)
         # Default test policy: addresses only, matching WildcardPolicy.for_arm.
         self._addr_types = {ia.o_mem, ia.o_displ, ia.o_imm, ia.o_near, ia.o_far}
         self._tok = sigmaker.WildcardPolicy.set_current(
@@ -7290,14 +7363,29 @@ class TestArmReferenceAwareWildcard(unittest.TestCase):
         for k, v in self._saved.items():
             setattr(sigmaker.idaapi, k, v)
 
-    def _proc(self):
-        proc = sigmaker.OperandProcessor()
-        proc._is_arm = True  # bypass idaapi.ph_get_id() under the mock
-        return proc
+    def _proc(self, processor_id=None):
+        ia = sigmaker.idaapi
+        ia.ph_get_id.return_value = (
+            ia.PLFM_ARM if processor_id is None else processor_id
+        )
+        return sigmaker.OperandProcessor()
 
-    def _run(self, size, ops):
+    def _run(
+        self,
+        size,
+        ops,
+        *,
+        itype=0,
+        wildcard_optimized=True,
+        processor_id=None,
+    ):
         off, length = [0], [0]
-        found = self._proc().get_operand(self._Ins(size, ops), off, length, True)
+        found = self._proc(processor_id).get_operand(
+            self._Ins(size, ops, itype=itype),
+            off,
+            length,
+            wildcard_optimized,
+        )
         return found, off[0], length[0]
 
     def test_address_immediate_adrp_wildcards_whole_instruction(self):
@@ -7355,36 +7443,195 @@ class TestArmReferenceAwareWildcard(unittest.TestCase):
             ],
         )
 
-    def test_bare_immediate_not_wildcarded(self):
-        # o_imm without is_off is a stable constant (#0x40) -> stays exact.
+    def test_thumb_non_movl_literal_immediate_is_not_wildcarded(self):
+        # A normal Thumb literal stays an anchor even though its mode is Thumb.
         ia = sigmaker.idaapi
         self._offset_ops = set()
+        self._thumb = True
         found, _, _ = self._run(4, [self._Op(ia.o_imm, 0, 0)])
         self.assertFalse(found)
+        ia.get_sreg.assert_not_called()
 
-    def test_opted_in_bare_immediate_wildcards_whole_instruction(self):
-        # Some ARM macros expose a literal immediate spanning the full encoding.
+    def test_offset_movl_does_not_query_thumb_state(self):
+        ia = sigmaker.idaapi
+        self._offset_ops = {0}
+        found, off, length = self._run(
+            4,
+            [self._Op(ia.o_imm, 0, 0)],
+            itype=_ida_allins.ARM_movl,
+        )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 4))
+        ia.get_sreg.assert_not_called()
+
+    def test_thumb_movl_literal_immediate_wildcards_whole_instruction(self):
+        # Issue #86: IDA combines MOVS/LSLS into one Thumb ARM_movl macro.
         ia = sigmaker.idaapi
         self._offset_ops = set()
-        default_policy = sigmaker.WildcardPolicy(frozenset(self._addr_types))
-        policy = sigmaker.WildcardPolicy(
-            default_policy.allowed_types, wildcard_literal_immediates=True
+        self._thumb = True
+        found, off, length = self._run(
+            4,
+            [self._Op(ia.o_imm, 0, 0)],
+            itype=_ida_allins.ARM_movl,
         )
-        with sigmaker.WildcardPolicy.use(policy):
-            found, off, length = self._run(4, [self._Op(ia.o_imm, 0, 0)])
         self.assertTrue(found)
         self.assertEqual((off, length), (0, 4))
 
-    def test_opted_in_regular_literal_immediate_keeps_opcode_bytes(self):
+    def test_thumb_movl_reuses_the_offset_lookup_before_checking_thumb(self):
         ia = sigmaker.idaapi
         self._offset_ops = set()
+        self._thumb = True
+        found, _, _ = self._run(
+            4,
+            [self._Op(ia.o_imm, 0, 0)],
+            itype=_ida_allins.ARM_movl,
+        )
+        self.assertTrue(found)
+        ia.get_flags.assert_called_once_with(0x1000)
+        ia.is_off.assert_called_once_with(0, 0)
+        ia.str2reg.assert_called_once_with("T")
+        ia.get_sreg.assert_called_once_with(0x1000, 20)
+
+    def test_arm_movl_without_thumb_state_is_not_wildcarded(self):
+        ia = sigmaker.idaapi
+        self._offset_ops = set()
+        self._thumb = False
+        found, _, _ = self._run(
+            4,
+            [self._Op(ia.o_imm, 0, 0)],
+            itype=_ida_allins.ARM_movl,
+        )
+        self.assertFalse(found)
+
+    def test_policy_rejected_immediate_skips_mode_and_offset_queries(self):
+        ia = sigmaker.idaapi
         policy = sigmaker.WildcardPolicy(
-            frozenset(self._addr_types), wildcard_literal_immediates=True
+            frozenset(self._addr_types - {ia.o_imm})
         )
         with sigmaker.WildcardPolicy.use(policy):
-            found, off, length = self._run(2, [self._Op(ia.o_imm, 1, 0)])
+            found, _, _ = self._run(
+                4,
+                [self._Op(ia.o_imm, 0, 0)],
+                itype=_ida_allins.ARM_movl,
+            )
+        self.assertFalse(found)
+        ia.get_sreg.assert_not_called()
+        ia.is_off.assert_not_called()
+
+    def test_x86_zero_offset_is_exact_without_optimized_wildcarding(self):
+        ia = sigmaker.idaapi
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_mem}))
+        ):
+            found, _, _ = self._run(
+                5,
+                [self._Op(ia.o_mem, 0, 0)],
+                wildcard_optimized=False,
+                processor_id=ia.PLFM_386,
+            )
+        self.assertFalse(found)
+
+    def test_x86_zero_offset_wildcards_full_instruction_when_optimized(self):
+        ia = sigmaker.idaapi
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_mem}))
+        ):
+            found, off, length = self._run(
+                5,
+                [self._Op(ia.o_mem, 0, 0)],
+                wildcard_optimized=True,
+                processor_id=ia.PLFM_386,
+            )
         self.assertTrue(found)
-        self.assertEqual((off, length), (1, 1))
+        self.assertEqual((off, length), (0, 5))
+
+    def test_x86_nonzero_offset_wildcards_operand_bytes(self):
+        ia = sigmaker.idaapi
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_mem}))
+        ):
+            found, off, length = self._run(
+                5,
+                [self._Op(ia.o_mem, 2, 0)],
+                wildcard_optimized=False,
+                processor_id=ia.PLFM_386,
+            )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (2, 3))
+
+    def test_generic_zero_offset_is_exact_without_optimized_wildcarding(self):
+        ia = sigmaker.idaapi
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_mem}))
+        ):
+            found, _, _ = self._run(
+                5,
+                [self._Op(ia.o_mem, 0, 0)],
+                wildcard_optimized=False,
+                processor_id=ia.PLFM_MIPS,
+            )
+        self.assertFalse(found)
+
+    def test_mips_offset_immediate_wildcards_little_endian_halfword(self):
+        """A MIPSEL HI16/LO16 relocation changes only instruction bytes 0..1."""
+        ia = sigmaker.idaapi
+        self._offset_ops = {1}
+        ia.inf_is_be.return_value = False
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_imm}))
+        ):
+            found, off, length = self._run(
+                4,
+                [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_imm, 0, 1)],
+                processor_id=ia.PLFM_MIPS,
+            )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 2))
+
+    def test_mips_offset_immediate_wildcards_big_endian_halfword(self):
+        """A MIPS HI16/LO16 relocation changes only instruction bytes 2..3."""
+        ia = sigmaker.idaapi
+        self._offset_ops = {1}
+        ia.inf_is_be.return_value = True
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_imm}))
+        ):
+            found, off, length = self._run(
+                4,
+                [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_imm, 0, 1)],
+                processor_id=ia.PLFM_MIPS,
+            )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (2, 2))
+
+    def test_mips_offset_displacement_wildcards_encoded_halfword(self):
+        """A MIPS relocated load/store displacement changes only two bytes."""
+        ia = sigmaker.idaapi
+        self._offset_ops = {1}
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_displ}))
+        ):
+            found, off, length = self._run(
+                4,
+                [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_displ, 0, 1)],
+                processor_id=ia.PLFM_MIPS,
+            )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 2))
+
+    def test_mips_unmarked_immediate_remains_exact(self):
+        """A MIPS literal immediate is not a relocation just because it is an imm."""
+        ia = sigmaker.idaapi
+        self._offset_ops = set()
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_imm}))
+        ):
+            found, _, _ = self._run(
+                4,
+                [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_imm, 0, 1)],
+                processor_id=ia.PLFM_MIPS,
+            )
+        self.assertFalse(found)
 
     def test_stack_displacement_not_wildcarded(self):
         # o_displ without is_off is a stack slot ([SP,#var]) -> stays exact.

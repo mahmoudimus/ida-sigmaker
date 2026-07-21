@@ -134,3 +134,50 @@ class TestHCLIPackaging(unittest.TestCase):
         self.assertEqual(
             updated["plugin"]["pythonDependencies"], ["sigmaker==2.0.0"]
         )
+
+
+class TestCoverageConfiguration(unittest.TestCase):
+    def test_unit_tests_use_one_process_level_collector(self):
+        unit_tests = (ROOT / "tests" / "unit_test_sigmaker.py").read_text()
+
+        self.assertIn("class CoveredUnitTest(unittest.TestCase):", unit_tests)
+        self.assertNotIn("class CoveredUnitTest(CoverageTestCase):", unit_tests)
+
+    def test_integration_collectors_write_unique_data_files(self):
+        coverage_base = (ROOT / "tests" / "coveredtestcase.py").read_text()
+
+        self.assertIn("data_suffix=True", coverage_base)
+
+    def test_ci_combines_unit_and_integration_coverage(self):
+        workflow = (ROOT / ".github" / "workflows" / "python.yml").read_text()
+
+        self.assertIn(
+            "coverage run --branch --source=src --data-file=.coverage.unit",
+            workflow,
+        )
+        self.assertIn(
+            "-m unittest tests.unit_test_sigmaker tests.unit_test_packaging -v",
+            workflow,
+        )
+        self.assertIn(
+            "python -m unittest tests.integration_test_sigmaker -v",
+            workflow,
+        )
+        self.assertIn(
+            "coverage combine .coverage.unit .coverage.integration.*",
+            workflow,
+        )
+        self.assertIn("coverage report -m --fail-under=80", workflow)
+
+    def test_ci_collects_pure_python_coverage_without_building_speedups(self):
+        workflow = (ROOT / ".github" / "workflows" / "python.yml").read_text()
+        coverage_config = (ROOT / ".coveragerc").read_text()
+        compose = (ROOT / "docker-compose.yml").read_text()
+
+        self.assertIn("pip install coverage tomli", workflow)
+        self.assertNotIn("pip install -e .[ci]", workflow)
+        self.assertNotIn("plugins = Cython.Coverage", coverage_config)
+        self.assertIn(
+            "PYTHONPATH=/work/src:/app/ida/python:/work",
+            compose,
+        )

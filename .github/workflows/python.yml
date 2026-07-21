@@ -98,10 +98,11 @@ jobs:
                   set -e
                   docker compose run --rm --entrypoint bash ${{ matrix.service }} -c "
                       set -e
-                      pip install -e .[ci]
-                      python -m unittest discover . -p '*_test_*.py' -v
-                      coverage combine .coverage.unit .coverage.integration
-                      coverage report -m
+                      pip install coverage tomli
+                      coverage run --branch --source=src --data-file=.coverage.unit -m unittest tests.unit_test_sigmaker tests.unit_test_packaging -v
+                      python -m unittest tests.integration_test_sigmaker -v
+                      coverage combine .coverage.unit .coverage.integration.*
+                      coverage report -m --fail-under=80
                       coverage html
                   "
                   docker compose logs

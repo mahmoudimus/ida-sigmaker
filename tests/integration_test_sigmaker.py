@@ -608,6 +608,7 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
             else:
                 self.assertFalse(sig_byte.is_wildcard)
 
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
     def test_real_binary_pattern_search(self):
         """Test searching for the actual pattern that exists in the test binary."""
         # Read the actual test binary
@@ -674,6 +675,7 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
         except Exception as e:
             self.fail(f"Error reading test binary: {e}")
 
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
     def test_ida_environment_simulation(self):
         """Test SIMD search under conditions that simulate the IDA environment."""
         # Read the actual test binary

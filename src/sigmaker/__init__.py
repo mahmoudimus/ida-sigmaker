@@ -409,9 +409,9 @@ def configure_logging(
         for _filter in handler_filters:
             handler.addFilter(_filter)
 
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-        handler.close()
+    for existing_handler in logger.handlers[:]:
+        logger.removeHandler(existing_handler)
+        existing_handler.close()
 
     if not logger.handlers:
         logger.addHandler(handler)
@@ -1625,7 +1625,7 @@ class XrefGeneratedSignature:
                 f"XREF Signature #{i} @ {address}"
                 f"{_func_name_suffix(int(address))}: {fmted}\n"
             )
-            if i == 0:
+            if i == 1:
                 Clipboard.set_text(fmted)
 
 

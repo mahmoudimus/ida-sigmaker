@@ -69,19 +69,21 @@ class TestHCLIPackaging(unittest.TestCase):
         project = tomllib.loads((ROOT / "pyproject.toml").read_text())["project"]
         self.assertEqual(project["dependencies"], [])
 
-    def test_release_calls_the_pypi_workflow_directly(self):
+    def test_release_dispatches_pypi_publish_after_successful_tagged_release(self):
         release_workflow = (ROOT / ".github/workflows/release.yml").read_text()
         deploy_workflow = (ROOT / ".github/workflows/deploy.yml").read_text()
 
-        self.assertNotIn("workflow_run:", release_workflow)
-        self.assertNotIn("workflow_run:", deploy_workflow)
-        self.assertIn("workflow_call:", deploy_workflow)
-        self.assertRegex(deploy_workflow, r"release:\s+types:\s+- published")
-        self.assertRegex(
-            release_workflow,
-            r"publish-to-pypi:\s+needs: release\s+uses: "
-            r"\./\.github/workflows/deploy\.yml\s+with:\s+publish: true",
+        self.assertNotIn("publish-to-pypi:", release_workflow)
+        self.assertIn("workflow_run:", deploy_workflow)
+        self.assertIn("workflows:\n            - Release", deploy_workflow)
+        self.assertIn("types:\n            - completed", deploy_workflow)
+        self.assertIn(
+            "github.event.workflow_run.id || github.ref || github.run_id",
+            deploy_workflow,
         )
+        self.assertIn("github.event.workflow_run.head_sha || github.ref", deploy_workflow)
+        self.assertIn("github.event.workflow_run.conclusion == 'success'", deploy_workflow)
+        self.assertIn("startsWith(github.event.workflow_run.head_branch, 'v')", deploy_workflow)
 
     def test_manual_pypi_publish_requires_explicit_confirmation(self):
         deploy_workflow = (ROOT / ".github/workflows/deploy.yml").read_text()

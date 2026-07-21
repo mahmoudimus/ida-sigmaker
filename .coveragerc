@@ -1,6 +1,5 @@
 [run]
 branch = True
-plugins = Cython.Coverage
 
 source =
     src

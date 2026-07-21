@@ -33,7 +33,6 @@ TEST_DIR = pathlib.Path(__file__).parent
 # sys.path.insert(0, SRC_DIR.as_posix())
 # Add the src directory to the path so we can import sigmaker
 sys.path.insert(0, TEST_DIR.as_posix())
-from coveredtestcase import CoverageTestCase
 
 # Use a context manager to patch sys.modules before importing sigmaker
 _ida_allins = types.ModuleType("ida_allins")
@@ -174,8 +173,8 @@ def _mask_bytes(sig):
     return None if m is None else bytes(m)
 
 
-class CoveredUnitTest(CoverageTestCase):
-    coverage_data_file = ".coverage.unit"
+class CoveredUnitTest(unittest.TestCase):
+    """Base class for unit tests collected by the process-level CI runner."""
 
 
 class TestSigTextNormalize(CoveredUnitTest):
@@ -831,6 +830,7 @@ class TestMacOSARMIntegration(CoveredUnitTest):
     ),
     "Requires Linux x86",
 )
+@unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
 class TestLinux86Integration(CoveredUnitTest):
     """Integration tests specific to Linux x86."""
 
@@ -1095,6 +1095,10 @@ class TestSimdScanPerformance(CoveredUnitTest):
         self.assertLess(end_time - start_time, 0.1)  # Should be reasonably fast
 
 
+@unittest.skipUnless(
+    sigmaker._Speedups.current().available,
+    "SIMD speedup not available or _simd_scan module not compiled",
+)
 class TestStandaloneSimdScanning(CoveredUnitTest):
     """Test SIMD scanning directly without IDA Pro dependencies."""
 
@@ -1518,6 +1522,7 @@ class TestSigTextAndSignatureParsing(CoveredUnitTest):
         self.assertEqual([b for b, _ in patt], [0xE0, 0x80, 0x40, 0x00, 0xC0])
         self.assertEqual([w for _, w in patt], [True, True, True, True, True])
 
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_signature_mask_full_and_nibble(self):
         # Full-byte wildcards
         sig = _speedups_module().Signature("11 ?? 22 ?? 33")
@@ -1536,6 +1541,7 @@ class TestSigTextAndSignatureParsing(CoveredUnitTest):
         self.assertEqual(bytes(sig3.data_ptr()), b"\x40\x0f\x00\x7a\xa7")
         self.assertEqual(_mask_bytes(sig3), b"\xf0\x0f\x00\xff\xff")
 
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_signature_rejects_bad_formats(self):
         bad = [
             "",
@@ -1552,6 +1558,7 @@ class TestSigTextAndSignatureParsing(CoveredUnitTest):
             with self.assertRaises((ValueError, AssertionError), msg=f"input={s!r}"):
                 _speedups_module().Signature(s)
 
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_signature_bytes_and_mask_roundtrip(self):
         # Generate all hex bytes 00..FF and make sure each parses correctly alone.
         for hi, lo in itertools.product("0123456789ABCDEF", repeat=2):
@@ -2851,6 +2858,7 @@ class TestBatchSearchFormatters(CoveredUnitTest):
             )
 
 
+@unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
 class TestSIMDScannerEquivalence(CoveredUnitTest):
     def _assert_match_all_kinds(self, hay: bytes, pat: str, expect: int):
         # Portable
@@ -7933,5 +7941,5 @@ class TestSearchScope(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    # Run the tests (coverage is handled by the base class)
+    # Run the tests (coverage is handled by the CI runner).
     unittest.main(verbosity=2)

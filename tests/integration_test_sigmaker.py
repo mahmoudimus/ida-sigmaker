@@ -819,6 +819,71 @@ class OperandFixtureIntegrationTest(OpenedFixtureIntegrationTest):
         return signature
 
 
+class TestX86MinimalSignatureFixture(OperandFixtureIntegrationTest):
+    """Exercise minimal-function growth against controlled x86-64 functions."""
+
+    _fixture_parts = ("x86_64", "minimal_signature.o")
+    _function_names = (
+        "sigmaker_minimal_target",
+        "sigmaker_minimal_decoy_a",
+        "sigmaker_minimal_decoy_b",
+    )
+
+    @classmethod
+    def setUpClass(cls):
+        fixture_path = pathlib.Path(__file__).parent / "_resources"
+        fixture_path = fixture_path.joinpath(*cls._fixture_parts)
+        if not fixture_path.is_file():
+            raise AssertionError(f"Required fixture not found: {fixture_path}")
+        super().setUpClass()
+
+    def _function_eas(self):
+        eas = [idc.get_name_ea_simple(name) for name in self._function_names]
+        self.assertNotIn(idaapi.BADADDR, eas)
+        return eas
+
+    def _shared_prefix_signature(self):
+        target_ea = self._function_eas()[0]
+        instruction = self._decode_instruction(
+            target_ea,
+            idaapi.get_bytes(target_ea, 7),
+            "LEA",
+        )
+        return self._signature_for_instruction(target_ea, instruction)
+
+    def test_wildcarded_rip_relative_prefix_is_shared(self):
+        function_eas = self._function_eas()
+        self.assertTrue(all(idaapi.get_func(ea) is not None for ea in function_eas))
+        signature = self._shared_prefix_signature()
+
+        self.assertEqual(f"{signature:ida}", "48 8D 05 ? ? ? ?")
+        matches = sigmaker.SignatureSearcher.find_all(f"{signature:ida}")
+        self.assertEqual([int(match) for match in matches], function_eas)
+
+    def test_minimal_generator_grows_through_exact_discriminator(self):
+        target_ea = self._function_eas()[0]
+        function = idaapi.get_func(target_ea)
+        self.assertIsNotNone(function)
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=True,
+            continue_outside_of_function=False,
+            wildcard_optimized=True,
+            ask_longer_signature=False,
+            max_single_signature_length=16,
+        )
+
+        result = sigmaker.MinimalFunctionSignatureGenerator(
+            sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        ).generate(function, cfg)
+
+        self.assertEqual(f"{result.signature:ida}", "48 8D 05 ? ? ? ? B0 31")
+        self.assertEqual(result.address, sigmaker.Match(target_ea))
+        self.assertFalse(result.signature[-1].is_wildcard)
+        matches = sigmaker.SignatureSearcher.find_all(f"{result.signature:ida}")
+        self.assertEqual([int(match) for match in matches], [target_ea])
+
+
 class TestThumbCombinedImmediateFixture(OperandFixtureIntegrationTest):
     """Characterize IDA's combined Thumb MOVS/LSLS representation for #86."""
 

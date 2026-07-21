@@ -4,6 +4,12 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+## [1.14.2] - 2026-07-21
+
+### Fixed
+
+- **PyPI metadata now uses a standards-compliant short summary.** The detailed project description remains in the README while the package summary stays within PyPI's 512-character limit, allowing the source distribution and the full CPython 3.10-3.14 wheel matrix to publish.
+
 ## [1.14.1] - 2026-07-21
 
 ### Fixed
@@ -38,7 +44,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 - **PyPI builds now run only for published releases.** Ordinary successful tests on `main` no longer launch an untagged wheel build, and the HCLI manifest version and exact PyPI dependency pin are synchronized from `sigmaker.__version__` during release preparation.
 
-[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.1...HEAD
+[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.2...HEAD
+[1.14.2]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.1...v1.14.2
 [1.14.1]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.0...v1.14.1
 [1.14.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.12.0...v1.13.0

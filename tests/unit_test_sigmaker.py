@@ -583,6 +583,16 @@ class TestSignatureManipulation(CoveredUnitTest):
 class TestOutputFormats(CoveredUnitTest):
     """Test signature output formatting"""
 
+    def test_empty_format_spec_uses_ida_format(self):
+        signature = sigmaker.Signature(
+            [
+                sigmaker.SignatureByte(0x48, False),
+                sigmaker.SignatureByte(0x00, True),
+            ]
+        )
+        self.assertEqual(format(signature, ""), "48 ?")
+        self.assertEqual(str(signature), "48 ?")
+
     def test_all_signature_types(self):
         signature = sigmaker.Signature(
             [
@@ -3497,6 +3507,22 @@ class TestLoggingConfiguration(CoveredUnitTest):
             for handler in logger.handlers[:]:
                 logger.removeHandler(handler)
                 handler.close()
+
+    def test_simd_search_debug_log_uses_format_arguments(self):
+        logger = logging.Logger("sigmaker-debug-test", level=logging.DEBUG)
+        stream = io.StringIO()
+        logger.addHandler(logging.StreamHandler(stream))
+        with _with_test_speedups(), patch.object(
+            sigmaker, "LOGGER", logger
+        ), patch.object(sigmaker.idaapi, "inf_get_min_ea", return_value=0x1000):
+            buf = MagicMock()
+            buf.data.return_value = memoryview(b"\x90")
+            buf.imagebase = 0x1000
+            buf.file_size = 1
+            buf.offset_mapper.return_value = lambda offset: 0x1000 + offset
+            sigmaker.SignatureSearcher._find_all_simd("90", buf=buf)
+
+        self.assertIn("searching for 90", stream.getvalue())
 
 
 class TestSearchCancellation(CoveredUnitTest):

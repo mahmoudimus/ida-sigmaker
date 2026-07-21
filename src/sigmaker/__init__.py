@@ -1212,14 +1212,15 @@ class Signature(list[SignatureByte]):
             - 'mask': "\\x55\\x8B\\x00\\xEC xx?x"
             - 'bitmask': "0x55, 0x8B, 0x00, 0xEC 0b1101"
         """
-        # Use .lower() to make specifiers case-insensitive
-        spec = format_spec.lower()
+        # Use .lower() to make specifiers case-insensitive. An empty spec is
+        # the documented default IDA representation used by str(signature).
+        spec = format_spec.lower() or SignatureType.IDA.value
         try:
             formatter = FORMATTER_MAP[SignatureType(spec)]
-        except KeyError:
+        except (KeyError, ValueError):
             raise ValueError(
                 f"Unknown format code '{format_spec}' for object of type 'Signature'"
-            )
+            ) from None
         return formatter.format(self)
 
 
@@ -4139,13 +4140,10 @@ class SignatureSearcher:
             buf = _load_search_buffer()
         data_mv = buf.data()
         LOGGER.debug(
-            "searching for",
+            "searching for %s starting from %s with size %s buf length: %s",
             simd_signature,
-            "starting from",
             hex(buf.imagebase),
-            "with size",
             hex(buf.file_size),
-            "buf length:",
             len(data_mv),
         )
 

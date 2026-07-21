@@ -167,7 +167,7 @@ class TestCoverageConfiguration(unittest.TestCase):
             "coverage combine .coverage.unit .coverage.integration.*",
             workflow,
         )
-        self.assertIn("coverage report -m --fail-under=80", workflow)
+        self.assertIn("coverage report -m --fail-under=90", workflow)
 
     def test_ci_collects_pure_python_coverage_without_building_speedups(self):
         workflow = (ROOT / ".github" / "workflows" / "python.yml").read_text()

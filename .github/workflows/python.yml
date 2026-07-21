@@ -102,7 +102,7 @@ jobs:
                       coverage run --branch --source=src --data-file=.coverage.unit -m unittest tests.unit_test_sigmaker tests.unit_test_packaging -v
                       python -m unittest tests.integration_test_sigmaker -v
                       coverage combine .coverage.unit .coverage.integration.*
-                      coverage report -m --fail-under=80
+                      coverage report -m --fail-under=90
                       coverage html
                   "
                   docker compose logs

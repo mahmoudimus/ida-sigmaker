@@ -103,9 +103,21 @@ jobs:
                       python -m unittest tests.integration_test_sigmaker -v
                       coverage combine .coverage.unit .coverage.integration.*
                       coverage report -m --fail-under=90
+                      coverage xml -o coverage.xml
                       coverage html
                   "
                   docker compose logs
+
+            - name: Upload primary coverage report
+              if: matrix.service == 'idapro-tests'
+              uses: codecov/codecov-action@v7
+              with:
+                  files: coverage.xml
+                  disable_search: true
+                  flags: idapro-9.3
+                  name: idapro-9.3
+                  token: ${{ secrets.CODECOV_TOKEN }}
+                  fail_ci_if_error: false
 
             - name: Save Docker image to cache
               if: steps.docker-cache.outputs.cache-hit != 'true'

@@ -36,7 +36,7 @@ _IDA_IS_IDAQ = idaapi.is_idaq
 _IDA_WARNING = idaapi.warning
 
 __author__ = "mahmoudimus"
-__version__ = "1.14.0"
+__version__ = "1.14.1"
 
 PLUGIN_NAME: str = "Signature Maker (py)"
 PLUGIN_VERSION: str = __version__

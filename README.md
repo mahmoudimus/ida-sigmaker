@@ -728,9 +728,10 @@ The coverage badge reports the latest combined pure-Python unit and IDA
 integration report from the primary IDA 9.3 test job. Both IDA 9.3 and IDA 9.2
 jobs enforce a 90% line-and-branch coverage floor with `coverage.py`; the
 badge is a convenient summary, while the CI gate is authoritative. The
-workflow uploads to Codecov with `CODECOV_TOKEN` when that GitHub Actions
-secret is configured and otherwise uses Codecov's tokenless path for public
-GitHub Actions builds.
+workflow authenticates its Codecov upload with GitHub OIDC, so maintainers do
+not need to copy a Codecov token into repository secrets. Forked pull requests
+use Codecov's public tokenless path when available; coverage upload is
+non-blocking, while the local 90% CI gate remains authoritative.
 
 ### Contributing
 

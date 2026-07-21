@@ -96,7 +96,8 @@ jobs:
             - name: Run tests
               run: |
                   set -e
-                  docker compose run --rm --entrypoint bash ${{ matrix.service }} -c "
+                  timeout 300s docker compose run --rm --entrypoint bash ${{ matrix.service }} -c "
+                      ulimit -v 2097152
                       set -e
                       pip install coverage tomli
                       coverage run --branch --source=src --data-file=.coverage.unit -m unittest tests.unit_test_sigmaker tests.unit_test_packaging -v

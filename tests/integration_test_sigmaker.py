@@ -828,6 +828,7 @@ class TestX86MinimalSignatureFixture(OperandFixtureIntegrationTest):
         "sigmaker_minimal_decoy_a",
         "sigmaker_minimal_decoy_b",
     )
+    _short_unique_name = "sigmaker_minimal_short_unique"
 
     @classmethod
     def setUpClass(cls):
@@ -882,6 +883,25 @@ class TestX86MinimalSignatureFixture(OperandFixtureIntegrationTest):
         self.assertFalse(result.signature[-1].is_wildcard)
         matches = sigmaker.SignatureSearcher.find_all(f"{result.signature:ida}")
         self.assertEqual([int(match) for match in matches], [target_ea])
+
+    def test_minimal_generator_rejects_unique_signatures_shorter_than_minimum(self):
+        short_ea = idc.get_name_ea_simple(self._short_unique_name)
+        self.assertNotEqual(short_ea, idaapi.BADADDR)
+        function = idaapi.get_func(short_ea)
+        self.assertIsNotNone(function)
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+            ask_longer_signature=False,
+            max_single_signature_length=16,
+        )
+
+        with self.assertRaises(sigmaker.Unexpected):
+            sigmaker.MinimalFunctionSignatureGenerator(
+                sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+            ).generate(function, cfg)
 
 
 class TestThumbCombinedImmediateFixture(OperandFixtureIntegrationTest):

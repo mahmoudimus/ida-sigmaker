@@ -27,6 +27,14 @@ sigmaker_minimal_decoy_b:
     ret
 .size sigmaker_minimal_decoy_b, .-sigmaker_minimal_decoy_b
 
+.p2align 4
+.globl sigmaker_minimal_short_unique
+.type sigmaker_minimal_short_unique, @function
+sigmaker_minimal_short_unique:
+    syscall
+    ret
+.size sigmaker_minimal_short_unique, .-sigmaker_minimal_short_unique
+
 .data
 .p2align 3
 sigmaker_minimal_data:

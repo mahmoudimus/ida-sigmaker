@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import pathlib
 import shutil
 import sys
@@ -21,6 +22,9 @@ with warnings.catch_warnings():
     warnings.filterwarnings("ignore")
     import idapro
     import idaapi
+    import ida_allins
+    import ida_ua
+    import idc
 
     import sigmaker
 
@@ -604,6 +608,7 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
             else:
                 self.assertFalse(sig_byte.is_wildcard)
 
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
     def test_real_binary_pattern_search(self):
         """Test searching for the actual pattern that exists in the test binary."""
         # Read the actual test binary
@@ -670,6 +675,7 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
         except Exception as e:
             self.fail(f"Error reading test binary: {e}")
 
+    @unittest.skipUnless(sigmaker.SIMD_SPEEDUP_AVAILABLE, "SIMD not built")
     def test_ida_environment_simulation(self):
         """Test SIMD search under conditions that simulate the IDA environment."""
         # Read the actual test binary
@@ -749,6 +755,395 @@ class TestIntegrationWithRealBinary(CoveredIntegrationTest):
             self.skipTest(f"Test binary not found at {self.binary_path}")
         except Exception as e:
             self.fail(f"Error in IDA simulation test: {e}")
+
+
+class OpenedFixtureIntegrationTest(CoveredIntegrationTest):
+    """Open a checked-in fixture in an isolated temporary IDALIB database."""
+
+    _fixture_parts: tuple[str, ...]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.fixture_path = pathlib.Path(__file__).parent / "_resources"
+        cls.fixture_path = cls.fixture_path.joinpath(*cls._fixture_parts)
+        if not cls.fixture_path.is_file():
+            raise unittest.SkipTest(f"Fixture not found: {cls.fixture_path}")
+
+        cls.tempdir = pathlib.Path(tempfile.mkdtemp())
+        cls.database_path = cls.tempdir / cls.fixture_path.name
+        shutil.copy(cls.fixture_path, cls.database_path)
+        result = idapro.open_database(str(cls.database_path), True)
+        if result != 0:
+            shutil.rmtree(cls.tempdir)
+            raise unittest.SkipTest(
+                f"Unable to open fixture with IDALIB: {result}"
+            )
+
+        idaapi.auto_wait()
+        cls.database_opened = True
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            if cls.database_opened:
+                idapro.close_database()
+                cls.database_opened = False
+        finally:
+            shutil.rmtree(cls.tempdir)
+            super().tearDownClass()
+
+
+class OperandFixtureIntegrationTest(OpenedFixtureIntegrationTest):
+    """Shared decoded-instruction assertions for operand fixtures."""
+
+    def _decode_instruction(self, ea, expected_bytes, mnemonic):
+        instruction = ida_ua.insn_t()
+        self.assertEqual(ida_ua.decode_insn(instruction, ea), len(expected_bytes))
+        self.assertEqual(idaapi.get_bytes(ea, instruction.size), expected_bytes)
+        self.assertEqual(idc.print_insn_mnem(ea).upper(), mnemonic)
+        return instruction
+
+    @staticmethod
+    def _signature_for_instruction(ea, instruction):
+        signature = sigmaker.Signature()
+        sigmaker.InstructionProcessor(
+            sigmaker.OperandProcessor()
+        ).append_instruction_to_sig(
+            signature,
+            ea,
+            instruction,
+            wildcard_operands=True,
+            wildcard_optimized=True,
+        )
+        return signature
+
+
+class TestX86MinimalSignatureFixture(OperandFixtureIntegrationTest):
+    """Exercise minimal-function growth against controlled x86-64 functions."""
+
+    _fixture_parts = ("x86_64", "minimal_signature.o")
+    _function_names = (
+        "sigmaker_minimal_target",
+        "sigmaker_minimal_decoy_a",
+        "sigmaker_minimal_decoy_b",
+    )
+    _short_unique_name = "sigmaker_minimal_short_unique"
+
+    @classmethod
+    def setUpClass(cls):
+        fixture_path = pathlib.Path(__file__).parent / "_resources"
+        fixture_path = fixture_path.joinpath(*cls._fixture_parts)
+        if not fixture_path.is_file():
+            raise AssertionError(f"Required fixture not found: {fixture_path}")
+        super().setUpClass()
+
+    def _function_eas(self):
+        eas = [idc.get_name_ea_simple(name) for name in self._function_names]
+        self.assertNotIn(idaapi.BADADDR, eas)
+        return eas
+
+    def _shared_prefix_signature(self):
+        target_ea = self._function_eas()[0]
+        instruction = self._decode_instruction(
+            target_ea,
+            idaapi.get_bytes(target_ea, 7),
+            "LEA",
+        )
+        return self._signature_for_instruction(target_ea, instruction)
+
+    def test_wildcarded_rip_relative_prefix_is_shared(self):
+        function_eas = self._function_eas()
+        self.assertTrue(all(idaapi.get_func(ea) is not None for ea in function_eas))
+        signature = self._shared_prefix_signature()
+
+        self.assertEqual(f"{signature:ida}", "48 8D 05 ? ? ? ?")
+        matches = sigmaker.SignatureSearcher.find_all(f"{signature:ida}")
+        self.assertEqual([int(match) for match in matches], function_eas)
+
+    def test_minimal_generator_grows_through_exact_discriminator(self):
+        target_ea = self._function_eas()[0]
+        function = idaapi.get_func(target_ea)
+        self.assertIsNotNone(function)
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=True,
+            continue_outside_of_function=False,
+            wildcard_optimized=True,
+            ask_longer_signature=False,
+            max_single_signature_length=16,
+        )
+
+        result = sigmaker.MinimalFunctionSignatureGenerator(
+            sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+        ).generate(function, cfg)
+
+        self.assertEqual(f"{result.signature:ida}", "48 8D 05 ? ? ? ? B0 31")
+        self.assertEqual(result.address, sigmaker.Match(target_ea))
+        self.assertFalse(result.signature[-1].is_wildcard)
+        matches = sigmaker.SignatureSearcher.find_all(f"{result.signature:ida}")
+        self.assertEqual([int(match) for match in matches], [target_ea])
+
+    def test_minimal_generator_rejects_unique_signatures_shorter_than_minimum(self):
+        short_ea = idc.get_name_ea_simple(self._short_unique_name)
+        self.assertNotEqual(short_ea, idaapi.BADADDR)
+        function = idaapi.get_func(short_ea)
+        self.assertIsNotNone(function)
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+            ask_longer_signature=False,
+            max_single_signature_length=16,
+        )
+
+        with self.assertRaises(sigmaker.Unexpected):
+            sigmaker.MinimalFunctionSignatureGenerator(
+                sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
+            ).generate(function, cfg)
+
+
+class TestThumbCombinedImmediateFixture(OperandFixtureIntegrationTest):
+    """Characterize IDA's combined Thumb MOVS/LSLS representation for #86."""
+
+    _fixture_parts = ("arm", "hal_cm.o")
+    _combined_bytes = bytes.fromhex("01 24 24 06")
+
+    def _combined_instruction(self):
+        matches = []
+        for ea in range(
+            idaapi.inf_get_min_ea(),
+            idaapi.inf_get_max_ea() - len(self._combined_bytes) + 1,
+        ):
+            if idaapi.get_bytes(ea, len(self._combined_bytes)) == self._combined_bytes:
+                matches.append(ea)
+
+        self.assertEqual(matches, [0x1C])
+
+        ea = matches[0]
+        instruction = ida_ua.insn_t()
+        self.assertEqual(ida_ua.decode_insn(instruction, ea), 4)
+        self.assertEqual(idaapi.get_bytes(ea, instruction.size), self._combined_bytes)
+        return ea, instruction
+
+    def _signature_for_combined_instruction(self, policy):
+        ea, instruction = self._combined_instruction()
+        with sigmaker.WildcardPolicy.use(policy):
+            return self._signature_for_instruction(ea, instruction)
+
+    def test_ida_combines_movs_and_lsls_as_non_offset_immediate(self):
+        ea, instruction = self._combined_instruction()
+
+        disassembly = idc.generate_disasm_line(ea, 0).upper()
+        self.assertIn("MOVS", disassembly)
+        self.assertIn("#0X1000000", disassembly)
+
+        immediate = next(op for op in instruction if op.type == idaapi.o_imm)
+        self.assertEqual(instruction.itype, ida_allins.ARM_movl)
+        self.assertEqual(idaapi.get_sreg(ea, idaapi.str2reg("T")), 1)
+        self.assertEqual(immediate.value, 0x1000000)
+        self.assertFalse(idaapi.is_off(idaapi.get_flags(ea), immediate.n))
+
+    def test_default_policy_wildcards_combined_literal_immediate(self):
+        signature = self._signature_for_combined_instruction(
+            sigmaker.WildcardPolicy.for_arm()
+        )
+        self.assertEqual(f"{signature:ida}", "? ? ? ?")
+
+    def test_disabling_immediate_value_keeps_combined_instruction_exact(self):
+        default_policy = sigmaker.WildcardPolicy.for_arm()
+        signature = self._signature_for_combined_instruction(
+            sigmaker.WildcardPolicy(
+                default_policy.allowed_types - {sigmaker.WildcardPolicy.BaseKind.IMM},
+            )
+        )
+        self.assertEqual(f"{signature:ida}", "01 24 24 06")
+
+
+class TestArmv7RelocationFixture(OperandFixtureIntegrationTest):
+    """Exercise ARMv7 A32 address relocations and stable literals."""
+
+    _fixture_parts = ("arm", "armv7", "armv7_relocations.o")
+    _instructions = (
+        (
+            0x0,
+            bytes.fromhex("18 00 00 E3 00 00 40 E3"),
+            "MOV",
+            True,
+            "? ? ? ? ? ? ? ?",
+        ),
+        (0x8, bytes.fromhex("01 00 00 EB"), "BL", None, "? ? ? ?"),
+        (0xC, bytes.fromhex("07 10 A0 E3"), "MOV", False, "07 10 A0 E3"),
+    )
+
+    def test_default_policy_wildcards_armv7_address_relocations(self):
+        self.assertEqual(idaapi.ph_get_id(), idaapi.PLFM_ARM)
+        self.assertFalse(idaapi.inf_is_be())
+
+        for (
+            ea,
+            expected_bytes,
+            mnemonic,
+            expected_offset,
+            expected_signature,
+        ) in self._instructions:
+            instruction = self._decode_instruction(ea, expected_bytes, mnemonic)
+            if expected_offset is None:
+                self.assertTrue(any(op.type == idaapi.o_near for op in instruction))
+            else:
+                immediate = next(op for op in instruction if op.type == idaapi.o_imm)
+                self.assertEqual(
+                    bool(idaapi.is_off(idaapi.get_flags(ea), immediate.n)),
+                    expected_offset,
+                )
+            self.assertEqual(
+                f"{self._signature_for_instruction(ea, instruction):ida}",
+                expected_signature,
+            )
+
+
+class TestAArch64RelocationFixture(OperandFixtureIntegrationTest):
+    """Exercise AArch64 page, low-address, and call relocations."""
+
+    _fixture_parts = ("arm", "aarch64", "aarch64_relocations.o")
+    _instructions = (
+        (
+            0x0,
+            bytes.fromhex("00 00 00 90 00 60 00 91"),
+            "ADRL",
+            True,
+            "? ? ? ? ? ? ? ?",
+        ),
+        (0x8, bytes.fromhex("03 00 00 94"), "BL", None, "? ? ? ?"),
+        (0xC, bytes.fromhex("E1 00 80 52"), "MOV", False, "E1 00 80 52"),
+    )
+
+    def test_default_policy_wildcards_aarch64_address_relocations(self):
+        self.assertEqual(idaapi.ph_get_id(), idaapi.PLFM_ARM)
+        self.assertFalse(idaapi.inf_is_be())
+
+        for (
+            ea,
+            expected_bytes,
+            mnemonic,
+            expected_offset,
+            expected_signature,
+        ) in self._instructions:
+            instruction = self._decode_instruction(ea, expected_bytes, mnemonic)
+            if expected_offset is None:
+                self.assertTrue(any(op.type == idaapi.o_near for op in instruction))
+            else:
+                immediate = next(op for op in instruction if op.type == idaapi.o_imm)
+                self.assertEqual(
+                    bool(idaapi.is_off(idaapi.get_flags(ea), immediate.n)),
+                    expected_offset,
+                )
+            self.assertEqual(
+                f"{self._signature_for_instruction(ea, instruction):ida}",
+                expected_signature,
+            )
+
+
+class TestMipsHi16Lo16Fixture(OperandFixtureIntegrationTest):
+    """Exercise MIPS relocation operand metadata with a controlled ELF object."""
+
+    _fixture_parts = ("mips", "hi16_lo16.o")
+    _instructions = (
+        (0x0, bytes.fromhex("01 00 02 3C"), "LUI", "%HI", "? ? 02 3C"),
+        (0x8, bytes.fromhex("24 00 42 24"), "ADDIU", "%LO", "? ? 42 24"),
+    )
+
+    def test_default_policy_wildcards_only_relocated_mips_halfwords(self):
+        self.assertEqual(idaapi.ph_get_id(), idaapi.PLFM_MIPS)
+        self.assertFalse(idaapi.inf_is_be())
+
+        for ea, expected_bytes, mnemonic, relocation, expected_signature in self._instructions:
+            instruction = ida_ua.insn_t()
+            self.assertEqual(ida_ua.decode_insn(instruction, ea), 4)
+            self.assertEqual(idaapi.get_bytes(ea, instruction.size), expected_bytes)
+
+            disassembly = idc.generate_disasm_line(ea, 0).upper()
+            self.assertIn(mnemonic, disassembly)
+            self.assertIn(relocation, disassembly)
+
+            immediate = next(op for op in instruction if op.type == idaapi.o_imm)
+            self.assertTrue(idaapi.is_off(idaapi.get_flags(ea), immediate.n))
+            self.assertEqual(
+                f"{self._signature_for_instruction(ea, instruction):ida}",
+                expected_signature,
+            )
+
+
+class TestMipsExternalExecutableAcceptance(CoveredIntegrationTest):
+    """Exercise the optional, pinned MIPS executable pair from misc-binaries."""
+
+    _fixture_env = "SIGMAKER_MIPS_ACCEPTANCE_DIR"
+    _fixtures = (
+        ("netcat-mipsel32-dynamic-debian-squeeze", False),
+        ("netcat-mips32-dynamic-debian-squeeze", True),
+    )
+
+    def _fixture_dir(self):
+        path = os.environ.get(self._fixture_env)
+        if not path:
+            self.skipTest(f"Set {self._fixture_env} to run external MIPS acceptance")
+        fixture_dir = pathlib.Path(path)
+        missing = [name for name, _ in self._fixtures if not (fixture_dir / name).is_file()]
+        if missing:
+            self.skipTest(f"Missing external MIPS fixtures: {', '.join(missing)}")
+        return fixture_dir
+
+    def _first_relocated_instruction(self):
+        ea = idaapi.inf_get_min_ea()
+        end_ea = idaapi.inf_get_max_ea()
+        while ea < end_ea:
+            instruction = ida_ua.insn_t()
+            size = ida_ua.decode_insn(instruction, ea)
+            if size <= 0:
+                ea += 1
+                continue
+            flags = idaapi.get_flags(ea)
+            has_relocated_halfword = any(
+                op.type in (idaapi.o_imm, idaapi.o_displ)
+                and idaapi.is_off(flags, op.n)
+                for op in instruction
+            )
+            if idaapi.is_code(flags) and has_relocated_halfword:
+                return ea, instruction
+            ea += size
+        self.fail("No relocated MIPS immediate/displacement instruction found")
+
+    def test_external_executables_keep_non_relocated_instruction_bytes(self):
+        fixture_dir = self._fixture_dir()
+        for name, expected_big_endian in self._fixtures:
+            with tempfile.TemporaryDirectory() as tempdir:
+                database_path = pathlib.Path(tempdir) / name
+                shutil.copy(fixture_dir / name, database_path)
+                self.assertEqual(idapro.open_database(str(database_path), True), 0)
+                try:
+                    idaapi.auto_wait()
+                    self.assertEqual(idaapi.ph_get_id(), idaapi.PLFM_MIPS)
+                    self.assertEqual(idaapi.inf_is_be(), expected_big_endian)
+
+                    ea, instruction = self._first_relocated_instruction()
+                    signature = sigmaker.Signature()
+                    sigmaker.InstructionProcessor(
+                        sigmaker.OperandProcessor()
+                    ).append_instruction_to_sig(
+                        signature,
+                        ea,
+                        instruction,
+                        wildcard_operands=True,
+                        wildcard_optimized=True,
+                    )
+                    wildcard_indices = [
+                        index for index, byte in enumerate(signature) if byte.is_wildcard
+                    ]
+                    expected_indices = [2, 3] if expected_big_endian else [0, 1]
+                    self.assertEqual(wildcard_indices, expected_indices)
+                finally:
+                    idapro.close_database()
 
 
 if __name__ == "__main__":

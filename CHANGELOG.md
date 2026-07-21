@@ -4,6 +4,18 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+## [1.14.1] - 2026-07-21
+
+### Fixed
+
+- **Architecture-aware operand wildcarding now covers ARMv7, AArch64, MIPS, and MIPSEL in addition to ARMv6-M Thumb.** Address-bearing operands are masked according to each processor's encoding rules, while stable immediates remain exact. Deterministic object fixtures and IDA integration tests cover the supported instruction families.
+- **XREF display and logging remain stable under the expanded coverage tests.** XREF output copies the ranked signature it displays, and logging setup installs the active handler instead of reusing a closed handler.
+- **Empty signature defaults and SIMD debug logging are correct.** Default format selection now produces the expected signature representation, and debug logging uses the intended formatting arguments.
+
+### Changed
+
+- **The pure-Python CI coverage floor is now 90%.** Unit and real-binary integration coverage are combined in both supported IDA test images, with a Codecov badge exposing the primary report.
+
 ## [1.14.0] - 2026-07-18
 
 ### Changed
@@ -26,7 +38,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 - **PyPI builds now run only for published releases.** Ordinary successful tests on `main` no longer launch an untagged wheel build, and the HCLI manifest version and exact PyPI dependency pin are synchronized from `sigmaker.__version__` during release preparation.
 
-[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.0...HEAD
+[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.1...HEAD
+[1.14.1]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.0...v1.14.1
 [1.14.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.13.0...v1.14.0
 [1.13.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.12.0...v1.13.0
 

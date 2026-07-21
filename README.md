@@ -1,8 +1,8 @@
 # Signature Maker Plugin for IDA Pro 9.0+
 
-<img src="https://github.com/mahmoudimus/ida-sigmaker/blob/main/assets/sigmaker-logo.png?raw=true" width="104px" height="100px" alt="Magnifying glass with the word 'sigmaker' and a cross-hair over the 'A' in sigmaker" /> [![ida-sigmaker tests](https://github.com/mahmoudimus/ida-sigmaker/actions/workflows/python.yml/badge.svg)](https://github.com/mahmoudimus/ida-sigmaker/actions/workflows/python.yml)
+<img src="https://github.com/mahmoudimus/ida-sigmaker/blob/main/assets/sigmaker-logo.png?raw=true" width="104px" height="100px" alt="Magnifying glass with the word 'sigmaker' and a cross-hair over the 'A' in sigmaker" /> [![ida-sigmaker tests](https://github.com/mahmoudimus/ida-sigmaker/actions/workflows/python.yml/badge.svg)](https://github.com/mahmoudimus/ida-sigmaker/actions/workflows/python.yml) [![coverage](https://codecov.io/gh/mahmoudimus/ida-sigmaker/branch/main/graph/badge.svg)](https://codecov.io/gh/mahmoudimus/ida-sigmaker)
 
-An IDA Pro 9.0+ zero-dependency cross-platform signature maker plugin with optional SIMD (e.g. AVX2/NEON/SSE2) speedups that works on MacOS/Linux/Windows. The primary goal of this plugin is to work with future versions of IDA without needing to compile against the IDA SDK as well as to allow for easier community contributions.
+An IDA Pro 9.0+ zero-dependency cross-platform signature maker plugin with optional SIMD (e.g. AVX2/NEON/SSE2) speedups that works on macOS, Linux, and Windows. SigMaker includes processor-aware operand wildcarding for x86, x64, ARM, and MIPS binaries. The primary goal of this plugin is to work with future versions of IDA without needing to compile against the IDA SDK, while allowing easier community contributions.
 
 Background reading on [mahmoudimus.com](https://mahmoudimus.com):
 
@@ -20,6 +20,7 @@ Background reading on [mahmoudimus.com](https://mahmoudimus.com):
   - [Where and what is my default user directory?](#where-and-what-is-my-default-user-directory)
 - [SIMD Speedups](#simd-speedups)
 - [Requirements](#requirements)
+  - [Processor support](#processor-support)
 - [What is a "sigmaker"?](#what-is-a-sigmaker)
 - [Usage](#usage)
   - [Finding XREFs](#finding-xrefs)
@@ -35,6 +36,7 @@ Background reading on [mahmoudimus.com](https://mahmoudimus.com):
   - [Used by](#used-by)
 - [Acknowledgements](#acknowledgements)
 - [Development & Releases](#development--releases)
+  - [Coverage](#coverage)
   - [Contributing](#contributing)
 - [Contact](#contact)
 
@@ -146,6 +148,23 @@ automatically.
 - IDA Pro 9.0+
 - IDA Python
 - Python 3.10+
+
+### Processor support
+
+SigMaker creates and searches byte signatures using IDA's decoded
+instructions. Its operand wildcarding has architecture-specific rules for:
+
+- x86 and x64
+- ARMv6-M Thumb (Cortex-M0)
+- ARMv7 A32
+- AArch64
+- MIPS and MIPSEL
+
+Other IDA processor modules use the generic operand wildcarding behavior.
+Architecture-specific rules keep stable opcode and register bytes exact while
+wildcarding address-bearing bytes according to IDA's operand metadata. The ARM
+variants above are exercised through checked-in ELF objects and real IDALIB
+decoding rather than processor mocks alone.
 
 ## What is a "sigmaker"?
 
@@ -702,6 +721,17 @@ Thank you to [@A200K](https://github.com/A200K)'s [IDA-Pro-SigMaker](https://git
 > Thanks to Wojciech Mula for his SIMD programming resources.
 
 ## Development & Releases
+
+### Coverage
+
+The coverage badge reports the latest combined pure-Python unit and IDA
+integration report from the primary IDA 9.3 test job. Both IDA 9.3 and IDA 9.2
+jobs enforce a 90% line-and-branch coverage floor with `coverage.py`; the
+badge is a convenient summary, while the CI gate is authoritative. The
+workflow authenticates its Codecov upload with GitHub OIDC, so maintainers do
+not need to copy a Codecov token into repository secrets. Forked pull requests
+use Codecov's public tokenless path when available; coverage upload is
+non-blocking, while the local 90% CI gate remains authoritative.
 
 ### Contributing
 

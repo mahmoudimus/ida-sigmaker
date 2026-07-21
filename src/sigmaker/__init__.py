@@ -25,8 +25,10 @@ import string
 import sys
 import time
 import traceback
+import types
 import typing
 
+import ida_allins
 import idaapi
 import idc
 
@@ -34,7 +36,7 @@ _IDA_IS_IDAQ = idaapi.is_idaq
 _IDA_WARNING = idaapi.warning
 
 __author__ = "mahmoudimus"
-__version__ = "1.14.0"
+__version__ = "1.14.1"
 
 PLUGIN_NAME: str = "Signature Maker (py)"
 PLUGIN_VERSION: str = __version__
@@ -407,9 +409,9 @@ def configure_logging(
         for _filter in handler_filters:
             handler.addFilter(_filter)
 
-    for handler in logger.handlers[:]:
-        logger.removeHandler(handler)
-        handler.close()
+    for existing_handler in logger.handlers[:]:
+        logger.removeHandler(existing_handler)
+        existing_handler.close()
 
     if not logger.handlers:
         logger.addHandler(handler)
@@ -1210,14 +1212,15 @@ class Signature(list[SignatureByte]):
             - 'mask': "\\x55\\x8B\\x00\\xEC xx?x"
             - 'bitmask': "0x55, 0x8B, 0x00, 0xEC 0b1101"
         """
-        # Use .lower() to make specifiers case-insensitive
-        spec = format_spec.lower()
+        # Use .lower() to make specifiers case-insensitive. An empty spec is
+        # the documented default IDA representation used by str(signature).
+        spec = format_spec.lower() or SignatureType.IDA.value
         try:
             formatter = FORMATTER_MAP[SignatureType(spec)]
-        except KeyError:
+        except (KeyError, ValueError):
             raise ValueError(
                 f"Unknown format code '{format_spec}' for object of type 'Signature'"
-            )
+            ) from None
         return formatter.format(self)
 
 
@@ -1418,13 +1421,13 @@ class WildcardPolicy:
     @classmethod
     def for_arm(cls) -> "WildcardPolicy":
         # Default to address-bearing operands only: direct memory references,
-        # displacements, immediates, and near/far branch targets. is_off refines
-        # the ambiguous imm/displ operands to actual addresses at match time
-        # (see OperandProcessor._get_operand_offset_arm), so bare constants and
-        # stack slots are not wildcarded. Register lists, coprocessor registers,
-        # ARM conditions, arbitrary text, and plain registers are stable across
-        # builds and are left out of the default; users who need register-
-        # tolerant matching enable them in the operand-wildcard dialog.
+        # displacements, immediates, and near/far branch targets. IDA also uses
+        # o_imm and o_displ for stable constants (#0x40) and stack slots
+        # ([SP,#var]), so the ARM evaluator normally requires is_off() for those
+        # ambiguous types. The combined Thumb MOVS/LSLS form is the narrow
+        # exception. Register lists, coprocessor registers, ARM conditions,
+        # arbitrary text, and plain registers stay exact unless explicitly
+        # selected in the operand-wildcard dialog.
         return cls(frozenset({
             cls.BaseKind.MEM,
             cls.BaseKind.DISPL,
@@ -1435,7 +1438,21 @@ class WildcardPolicy:
 
     @classmethod
     def for_mips(cls) -> "WildcardPolicy":
-        return cls(frozenset({cls.BaseKind.MEM, cls.BaseKind.FAR, cls.BaseKind.NEAR}))
+        # Immediate and displacement operands are eligible because MIPS
+        # relocations encode their varying value in a 16-bit instruction field.
+        # The MIPS evaluator still requires is_off(), keeping literal constants
+        # exact and preserving their value as a useful signature anchor.
+        return cls(
+            frozenset(
+                {
+                    cls.BaseKind.MEM,
+                    cls.BaseKind.DISPL,
+                    cls.BaseKind.IMM,
+                    cls.BaseKind.FAR,
+                    cls.BaseKind.NEAR,
+                }
+            )
+        )
 
     @classmethod
     def for_ppc(cls) -> "WildcardPolicy":
@@ -1473,10 +1490,16 @@ class WildcardPolicy:
 
     @classmethod
     def current(cls) -> "WildcardPolicy":
-        """Get current policy (falling back to arch-detected default)."""
-        policy = cls._ctx.get(cls.detect_from_processor())
-        cls._ctx.set(policy)
-        return policy
+        """Get an explicit policy override or detect one for this processor."""
+        try:
+            return cls._ctx.get()
+        except LookupError:
+            return cls.detect_from_processor()
+
+    @classmethod
+    def _current_or(cls, fallback: "WildcardPolicy") -> "WildcardPolicy":
+        """Return an explicit policy override or a caller-owned fallback."""
+        return cls._ctx.get(fallback)
 
     @classmethod
     def set_current(cls, policy: "WildcardPolicy") -> contextvars.Token:
@@ -1603,7 +1626,7 @@ class XrefGeneratedSignature:
                 f"XREF Signature #{i} @ {address}"
                 f"{_func_name_suffix(int(address))}: {fmted}\n"
             )
-            if i == 0:
+            if i == 1:
                 Clipboard.set_text(fmted)
 
 
@@ -1721,64 +1744,204 @@ class SigText:
         return " ".join(out), pattern
 
 
-class OperandProcessor:
-    """Handles operand processing for signature generation (policy-driven).
-    # TODO: refactor this to support more architectures, not just ARM/X64.
+class _WildcardCoverage(enum.Enum):
+    """Semantic coverage selected for one policy-eligible operand.
+
+    OperandProcessor converts the selected coverage into the concrete byte
+    range written to the generated signature.
     """
 
-    def __init__(self):
-        self._is_arm = self._check_is_arm()
+    SKIP = enum.auto()
+    OPERAND_BYTES = enum.auto()
+    MIPS_IMMEDIATE = enum.auto()
+    WHOLE_INSTRUCTION = enum.auto()
 
-    @staticmethod
-    def _check_is_arm() -> bool:
-        return idaapi.ph_get_id() == idaapi.PLFM_ARM
 
-    def _get_operand_offset_arm(
-        self, ins: idaapi.insn_t, off: typing.List[int], length: typing.List[int]
-    ) -> bool:
-        # Which operands to wildcard is driven by the user's operand-wildcard
-        # policy (the "Configure operand wildcarding" dialog); the default is
-        # address-bearing types only (see WildcardPolicy.for_arm). On top of the
-        # policy we apply an is_off refinement for the two ambiguous types:
-        # o_imm and o_displ carry both build-varying addresses (ADRP #x@PAGE,
-        # LDR #x@PAGEOFF) and stable constants (#0x40) / stack slots ([SP,#var]).
-        # We wildcard only the ones IDA resolved to an address (is_off), so
-        # selecting "Immediate"/"Displacement" never masks a stable constant.
-        #
-        # Byte range: little-endian ARM/Thumb keeps the opcode+condition in the
-        # high byte and the immediate/offset in the low bytes, so wildcarding the
-        # low ins.size-1 bytes usually suffices (Thumb-1 = 2 bytes -> length 1;
-        # ARM/Thumb-2 = 4 -> 3; 8 -> 7). But some offsets reach into the high
-        # byte: branch targets (Thumb-2 BL/BLX and long B span all bytes) and
-        # AArch64 ADRP (immlo sits in the high byte). For those we must wildcard
-        # the whole instruction, or the offset bits left in the high byte make
-        # the signature miss other builds (issue #61 follow-up).
-        policy = WildcardPolicy.current()
-        flags = idaapi.get_flags(ins.ea)
-        for op in ins:
-            if op.type == idaapi.o_void:
-                continue
-            if op.type not in policy.allowed_types:
-                continue
-            if op.type in (idaapi.o_imm, idaapi.o_displ) and not idaapi.is_off(
-                flags, op.n
-            ):
-                continue
-            # o_imm reaching here is is_off (an address immediate, e.g. ADRP);
-            # together with branch targets its offset can span the high byte.
-            spans_high_byte = op.type in (
-                idaapi.o_near,
-                idaapi.o_far,
-                idaapi.o_imm,
-            )
-            if spans_high_byte:
-                off[0] = 0
-                length[0] = ins.size
-            else:
-                off[0] = op.offb
-                length[0] = ins.size - 1 if ins.size in (2, 4, 8) else 0
-            return True
+@dataclasses.dataclass(slots=True)
+class _OperandEvaluation:
+    """Lazily resolve generic IDA facts for one rule evaluation."""
+
+    instruction: idaapi.insn_t
+    operand: idaapi.op_t
+    wildcard_optimized: bool
+    _is_offset: bool | None = dataclasses.field(
+        init=False, default=None, repr=False
+    )
+
+    def is_offset(self) -> bool:
+        """Return and cache whether IDA resolved the operand as an address.
+
+        IDA uses immediate and displacement operand types for both
+        relocation-bearing references and stable constants. is_off() is the
+        metadata boundary that lets architecture rules distinguish them.
+        """
+        if self._is_offset is None:
+            flags = idaapi.get_flags(self.instruction.ea)
+            self._is_offset = bool(idaapi.is_off(flags, self.operand.n))
+        return self._is_offset
+
+
+_OperandRuleExpression = typing.Callable[[_OperandEvaluation], bool]
+
+
+def _always(_evaluation: _OperandEvaluation) -> bool:
+    """Match the fallback rule for an eligible operand."""
+    return True
+
+
+def _is_offset(evaluation: _OperandEvaluation) -> bool:
+    """Match operands IDA marks as offsets."""
+    return evaluation.is_offset()
+
+
+def _has_zero_offb_without_optimized_wildcarding(
+    evaluation: _OperandEvaluation,
+) -> bool:
+    """Preserve the legacy non-ARM zero-offset exclusion."""
+    return evaluation.operand.offb == 0 and not evaluation.wildcard_optimized
+
+
+def _is_thumb_at(ea: int) -> bool:
+    """Return whether IDA decodes the address in Thumb mode."""
+    return idaapi.get_sreg(ea, idaapi.str2reg("T")) == 1
+
+
+def _is_arm_thumb_movl_immediate(evaluation: _OperandEvaluation) -> bool:
+    """Match IDA's non-offset combined Thumb MOVS/LSLS instruction.
+
+    IDA folds the pair into ARM_movl and reports its combined immediate as a
+    literal rather than an offset. The encoded value spans both original
+    instructions, so this precise instruction-and-mode exception requires
+    whole-instruction coverage while ordinary ARM literals remain exact.
+    """
+    if evaluation.instruction.itype != ida_allins.ARM_movl:
         return False
+    if evaluation.is_offset():
+        return False
+    return _is_thumb_at(evaluation.instruction.ea)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _OperandWildcardRule:
+    """One precedence-ordered expression for operand byte coverage."""
+
+    coverage: _WildcardCoverage
+    expression: _OperandRuleExpression
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _OperandWildcardEvaluator:
+    """Apply the first matching coverage rule for one processor family.
+
+    Rules are immutable and ordered from architecture-specific exceptions to
+    general fallbacks. Expensive IDA metadata is resolved lazily through the
+    shared _OperandEvaluation.
+    """
+
+    rules_by_operand_type: typing.Mapping[int, tuple[_OperandWildcardRule, ...]]
+    fallback_rules: tuple[_OperandWildcardRule, ...]
+
+    def evaluate(
+        self,
+        policy: WildcardPolicy,
+        instruction: idaapi.insn_t,
+        operand: idaapi.op_t,
+        *,
+        wildcard_optimized: bool,
+    ) -> _WildcardCoverage:
+        if not policy.allows_type(operand.type):
+            return _WildcardCoverage.SKIP
+
+        rules = self.rules_by_operand_type.get(operand.type, self.fallback_rules)
+        evaluation = _OperandEvaluation(instruction, operand, wildcard_optimized)
+        for rule in rules:
+            if rule.expression(evaluation):
+                return rule.coverage
+        return _WildcardCoverage.SKIP
+
+
+# ARM branch targets and address immediates can encode offset bits in the high
+# byte (for example Thumb-2 BL/BLX and AArch64 ADRP), so they require
+# whole-instruction coverage (issue #61 follow-up). Address displacements use
+# the ordinary ARM byte range and preserve the high opcode/condition byte.
+_ARM_OPERAND_EVALUATOR = _OperandWildcardEvaluator(
+    types.MappingProxyType(
+        {
+            idaapi.o_imm: (
+                _OperandWildcardRule(
+                    _WildcardCoverage.WHOLE_INSTRUCTION,
+                    _is_arm_thumb_movl_immediate,
+                ),
+                _OperandWildcardRule(
+                    _WildcardCoverage.WHOLE_INSTRUCTION,
+                    _is_offset,
+                ),
+                _OperandWildcardRule(_WildcardCoverage.SKIP, _always),
+            ),
+            idaapi.o_displ: (
+                _OperandWildcardRule(
+                    _WildcardCoverage.OPERAND_BYTES,
+                    _is_offset,
+                ),
+                _OperandWildcardRule(_WildcardCoverage.SKIP, _always),
+            ),
+            idaapi.o_near: (
+                _OperandWildcardRule(_WildcardCoverage.WHOLE_INSTRUCTION, _always),
+            ),
+            idaapi.o_far: (
+                _OperandWildcardRule(_WildcardCoverage.WHOLE_INSTRUCTION, _always),
+            ),
+        }
+    ),
+    (_OperandWildcardRule(_WildcardCoverage.OPERAND_BYTES, _always),),
+)
+_NON_ARM_FALLBACK_RULES = (
+    _OperandWildcardRule(
+        _WildcardCoverage.SKIP,
+        _has_zero_offb_without_optimized_wildcarding,
+    ),
+    _OperandWildcardRule(_WildcardCoverage.OPERAND_BYTES, _always),
+)
+# A standard MIPS instruction stores its relocation-bearing immediate or
+# displacement in one 16-bit field. OperandProcessor selects bytes 0..1 for a
+# little-endian word and bytes 2..3 for a big-endian word, leaving opcode and
+# register bits exact.
+_MIPS_OPERAND_EVALUATOR = _OperandWildcardEvaluator(
+    types.MappingProxyType(
+        {
+            idaapi.o_imm: (
+                _OperandWildcardRule(_WildcardCoverage.MIPS_IMMEDIATE, _is_offset),
+                _OperandWildcardRule(_WildcardCoverage.SKIP, _always),
+            ),
+            idaapi.o_displ: (
+                _OperandWildcardRule(_WildcardCoverage.MIPS_IMMEDIATE, _is_offset),
+                _OperandWildcardRule(_WildcardCoverage.SKIP, _always),
+            ),
+        }
+    ),
+    _NON_ARM_FALLBACK_RULES,
+)
+_NON_ARM_OPERAND_EVALUATOR = _OperandWildcardEvaluator(
+    types.MappingProxyType({}),
+    _NON_ARM_FALLBACK_RULES,
+)
+
+
+class OperandProcessor:
+    """Select byte ranges according to the current operand wildcard policy."""
+
+    def __init__(self):
+        processor_id = idaapi.ph_get_id()
+        self._default_policy = WildcardPolicy.detect_from_processor()
+        self._uses_arm_ranges = processor_id == idaapi.PLFM_ARM
+        self._uses_mips_ranges = processor_id == idaapi.PLFM_MIPS
+        self._mips_immediate_offset = (
+            2 if self._uses_mips_ranges and idaapi.inf_is_be() else 0
+        )
+        self._evaluator = {
+            idaapi.PLFM_ARM: _ARM_OPERAND_EVALUATOR,
+            idaapi.PLFM_MIPS: _MIPS_OPERAND_EVALUATOR,
+        }.get(processor_id, _NON_ARM_OPERAND_EVALUATOR)
 
     def get_operand(
         self,
@@ -1787,18 +1950,38 @@ class OperandProcessor:
         length: typing.List[int],
         wildcard_optimized: bool,
     ) -> bool:
-        if self._is_arm:
-            return self._get_operand_offset_arm(ins, off, length)
-        policy = WildcardPolicy.current()
+        """Write the first selected operand's concrete wildcard byte range.
+
+        The evaluator decides semantic coverage. Whole-instruction rules mask
+        every byte; MIPS immediate rules mask the endian-correct 16-bit field;
+        ordinary ARM operand coverage preserves the high opcode/condition byte
+        by masking the low ins.size - 1 bytes. Generic coverage starts at the
+        operand's IDA-reported offb and extends to the instruction end.
+        """
+        policy = WildcardPolicy._current_or(self._default_policy)
         for op in ins:
             if op.type == idaapi.o_void:
                 continue
-            if not policy.allows_type(op.type):
+            coverage = self._evaluator.evaluate(
+                policy,
+                ins,
+                op,
+                wildcard_optimized=wildcard_optimized,
+            )
+            if coverage is _WildcardCoverage.SKIP:
                 continue
-            if op.offb == 0 and not wildcard_optimized:
-                continue
-            off[0] = op.offb
-            length[0] = ins.size - op.offb
+            if coverage is _WildcardCoverage.WHOLE_INSTRUCTION:
+                off[0] = 0
+                length[0] = ins.size
+            elif coverage is _WildcardCoverage.MIPS_IMMEDIATE:
+                off[0] = self._mips_immediate_offset
+                length[0] = 2
+            else:
+                off[0] = op.offb
+                if self._uses_arm_ranges:
+                    length[0] = ins.size - 1 if ins.size in (2, 4, 8) else 0
+                else:
+                    length[0] = ins.size - op.offb
             return True
         return False
 
@@ -3957,13 +4140,10 @@ class SignatureSearcher:
             buf = _load_search_buffer()
         data_mv = buf.data()
         LOGGER.debug(
-            "searching for",
+            "searching for %s starting from %s with size %s buf length: %s",
             simd_signature,
-            "starting from",
             hex(buf.imagebase),
-            "with size",
             hex(buf.file_size),
-            "buf length:",
             len(data_mv),
         )
 

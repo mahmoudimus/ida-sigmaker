@@ -55,7 +55,7 @@ services:
             - QT_X11_NO_MITSHM=1
             - LIBGL_ALWAYS_INDIRECT=1
             - IDAUSR=/root/.idapro
-            - PYTHONPATH=/app/ida/python:/work
+            - PYTHONPATH=/work/src:/app/ida/python:/work
             - PYTHONWARNINGS=ignore
         volumes:
             - ./src/:/root/.idapro/plugins:ro # the plugin
@@ -70,7 +70,7 @@ services:
             - QT_X11_NO_MITSHM=1
             - LIBGL_ALWAYS_INDIRECT=1
             - IDAUSR=/root/.idapro
-            - PYTHONPATH=/app/ida/python:/work
+            - PYTHONPATH=/work/src:/app/ida/python:/work
             - PYTHONWARNINGS=ignore
         volumes:
             - ./src/:/root/.idapro/plugins:ro # the plugin

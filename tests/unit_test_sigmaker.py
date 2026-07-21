@@ -33,10 +33,14 @@ TEST_DIR = pathlib.Path(__file__).parent
 # sys.path.insert(0, SRC_DIR.as_posix())
 # Add the src directory to the path so we can import sigmaker
 sys.path.insert(0, TEST_DIR.as_posix())
-from coveredtestcase import CoverageTestCase
 
 # Use a context manager to patch sys.modules before importing sigmaker
-with patch.dict("sys.modules", {"idaapi": MagicMock(), "idc": MagicMock()}):
+_ida_allins = types.ModuleType("ida_allins")
+_ida_allins.ARM_movl = 80
+with patch.dict(
+    "sys.modules",
+    {"idaapi": MagicMock(), "idc": MagicMock(), "ida_allins": _ida_allins},
+):
     import sigmaker
 
 
@@ -78,6 +82,19 @@ def _test_speedups_module(**changes):
     }
     values.update(changes)
     return types.SimpleNamespace(**values)
+
+
+def _test_filter_offsets(candidates, count, pattern_size, starts, ends):
+    """Compact candidates whose complete pattern fits one contiguous range."""
+    write_index = 0
+    for candidate in candidates[:count]:
+        if any(
+            start <= candidate and candidate + pattern_size <= end
+            for start, end in zip(starts, ends)
+        ):
+            candidates[write_index] = candidate
+            write_index += 1
+    return write_index
 
 
 @contextlib.contextmanager
@@ -169,8 +186,8 @@ def _mask_bytes(sig):
     return None if m is None else bytes(m)
 
 
-class CoveredUnitTest(CoverageTestCase):
-    coverage_data_file = ".coverage.unit"
+class CoveredUnitTest(unittest.TestCase):
+    """Base class for unit tests collected by the process-level CI runner."""
 
 
 class TestSigTextNormalize(CoveredUnitTest):
@@ -566,6 +583,16 @@ class TestSignatureManipulation(CoveredUnitTest):
 class TestOutputFormats(CoveredUnitTest):
     """Test signature output formatting"""
 
+    def test_empty_format_spec_uses_ida_format(self):
+        signature = sigmaker.Signature(
+            [
+                sigmaker.SignatureByte(0x48, False),
+                sigmaker.SignatureByte(0x00, True),
+            ]
+        )
+        self.assertEqual(format(signature, ""), "48 ?")
+        self.assertEqual(str(signature), "48 ?")
+
     def test_all_signature_types(self):
         signature = sigmaker.Signature(
             [
@@ -826,6 +853,7 @@ class TestMacOSARMIntegration(CoveredUnitTest):
     ),
     "Requires Linux x86",
 )
+@unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
 class TestLinux86Integration(CoveredUnitTest):
     """Integration tests specific to Linux x86."""
 
@@ -1090,6 +1118,10 @@ class TestSimdScanPerformance(CoveredUnitTest):
         self.assertLess(end_time - start_time, 0.1)  # Should be reasonably fast
 
 
+@unittest.skipUnless(
+    sigmaker._Speedups.current().available,
+    "SIMD speedup not available or _simd_scan module not compiled",
+)
 class TestStandaloneSimdScanning(CoveredUnitTest):
     """Test SIMD scanning directly without IDA Pro dependencies."""
 
@@ -1513,6 +1545,7 @@ class TestSigTextAndSignatureParsing(CoveredUnitTest):
         self.assertEqual([b for b, _ in patt], [0xE0, 0x80, 0x40, 0x00, 0xC0])
         self.assertEqual([w for _, w in patt], [True, True, True, True, True])
 
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_signature_mask_full_and_nibble(self):
         # Full-byte wildcards
         sig = _speedups_module().Signature("11 ?? 22 ?? 33")
@@ -1531,6 +1564,7 @@ class TestSigTextAndSignatureParsing(CoveredUnitTest):
         self.assertEqual(bytes(sig3.data_ptr()), b"\x40\x0f\x00\x7a\xa7")
         self.assertEqual(_mask_bytes(sig3), b"\xf0\x0f\x00\xff\xff")
 
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_signature_rejects_bad_formats(self):
         bad = [
             "",
@@ -1547,6 +1581,7 @@ class TestSigTextAndSignatureParsing(CoveredUnitTest):
             with self.assertRaises((ValueError, AssertionError), msg=f"input={s!r}"):
                 _speedups_module().Signature(s)
 
+    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_signature_bytes_and_mask_roundtrip(self):
         # Generate all hex bytes 00..FF and make sure each parses correctly alone.
         for hi, lo in itertools.product("0123456789ABCDEF", repeat=2):
@@ -2846,6 +2881,7 @@ class TestBatchSearchFormatters(CoveredUnitTest):
             )
 
 
+@unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
 class TestSIMDScannerEquivalence(CoveredUnitTest):
     def _assert_match_all_kinds(self, hay: bytes, pat: str, expect: int):
         # Portable
@@ -3322,6 +3358,171 @@ class TestProgressReporter(CoveredUnitTest):
     # with progress reporters are complex due to mocking requirements. The core functionality
     # is tested in the CheckContinuePrompt tests above, and the signature generators
     # accept and use progress reporters correctly as shown in the implementation.
+
+
+class TestCheckContinuePromptBehavior(CoveredUnitTest):
+    def setUp(self):
+        self.original_user_canceled = sigmaker.idaapi_user_canceled
+        sigmaker.idaapi_user_canceled = MagicMock(return_value=False)
+
+    def tearDown(self):
+        sigmaker.idaapi_user_canceled = self.original_user_canceled
+
+    def _due_prompt(self, **kwargs):
+        prompt = sigmaker.CheckContinuePrompt(prompt_interval=10, **kwargs)
+        prompt.start_time = 0.0
+        return prompt
+
+    def test_continue_acknowledges_timer_and_logs(self):
+        logger = MagicMock()
+        prompt = self._due_prompt(logger=logger)
+        with patch.object(sigmaker.time, "time", return_value=75.0), patch.object(
+            prompt, "_ask_to_continue", return_value=True
+        ):
+            self.assertFalse(prompt.should_cancel())
+        self.assertEqual(prompt._timer.current_interval, 20.0)
+        self.assertEqual(prompt._timer.next_prompt_at, 95.0)
+        self.assertGreaterEqual(logger.info.call_count, 2)
+
+    def test_declining_prompt_without_cancel_callback_raises(self):
+        prompt = self._due_prompt()
+        with patch.object(sigmaker.time, "time", return_value=10.0), patch.object(
+            prompt, "_ask_to_continue", return_value=False
+        ), self.assertRaises(sigmaker.UserCanceledError):
+            prompt.should_cancel()
+        self.assertTrue(prompt._user_canceled)
+
+    def test_declining_prompt_with_cancel_callback_returns_true(self):
+        prompt = self._due_prompt(cancel_func=MagicMock())
+        with patch.object(sigmaker.time, "time", return_value=10.0), patch.object(
+            prompt, "_ask_to_continue", return_value=False
+        ):
+            self.assertTrue(prompt.should_cancel())
+
+    def test_format_message_includes_minutes_and_metadata(self):
+        prompt = self._due_prompt(metadata={"address": "0x401000"})
+        with patch.object(sigmaker.time, "time", return_value=125.0):
+            message = prompt._format_message("Search")
+        self.assertIn("Search has been running for 2m 5s.", message)
+        self.assertIn("address: 0x401000", message)
+
+    def test_ask_to_continue_supports_qt_and_ida_fallback(self):
+        qmessagebox = MagicMock()
+        qmessagebox.Yes = 1
+        qmessagebox.No = 2
+        qmessagebox.question.return_value = qmessagebox.Yes
+        prompt = self._due_prompt()
+        with patch.object(
+            sigmaker, "_load_qmessage_box_cls", return_value=qmessagebox
+        ):
+            self.assertTrue(prompt._ask_to_continue("continue?"))
+        with patch.object(
+            sigmaker, "_load_qmessage_box_cls", return_value=None
+        ), patch.object(
+            sigmaker.idaapi,
+            "ask_yn",
+            return_value=sigmaker.idaapi.ASKBTN_YES,
+        ):
+            self.assertTrue(prompt._ask_to_continue("continue?"))
+
+    def test_qmessage_box_loader_selects_binding_for_ida_version(self):
+        pyqt_message_box = object()
+        pyside_message_box = object()
+        pyqt_widgets = types.ModuleType("PyQt5.QtWidgets")
+        pyqt_widgets.QMessageBox = pyqt_message_box
+        pyside_widgets = types.ModuleType("PySide6.QtWidgets")
+        pyside_widgets.QMessageBox = pyside_message_box
+        modules = {
+            "PyQt5": types.ModuleType("PyQt5"),
+            "PyQt5.QtWidgets": pyqt_widgets,
+            "PySide6": types.ModuleType("PySide6"),
+            "PySide6.QtWidgets": pyside_widgets,
+        }
+        with patch.dict(sys.modules, modules), patch.object(
+            sigmaker, "ida_version", return_value=(9, 1)
+        ):
+            self.assertIs(sigmaker._load_qmessage_box_cls(), pyqt_message_box)
+        with patch.dict(sys.modules, modules), patch.object(
+            sigmaker, "ida_version", return_value=(9, 2)
+        ):
+            self.assertIs(sigmaker._load_qmessage_box_cls(), pyside_message_box)
+
+    def test_qmessage_box_loader_returns_none_without_binding(self):
+        with patch.object(sigmaker, "ida_version", return_value=(9, 2)), patch.dict(
+            sys.modules, {"PySide6": None, "PySide6.QtWidgets": None}
+        ):
+            self.assertIsNone(sigmaker._load_qmessage_box_cls())
+
+
+class TestIDAVersionInfo(CoveredUnitTest):
+    def test_comparison_supports_versions_tuples_and_unknown_types(self):
+        version = sigmaker.IDAVersionInfo(9, 2, 920)
+        self.assertEqual(version, sigmaker.IDAVersionInfo(9, 2, 999))
+        self.assertEqual(version, (9, 2, 1))
+        self.assertLess(version, sigmaker.IDAVersionInfo(9, 3, 900))
+        self.assertLess(version, (10, 0))
+        self.assertIs(version.__eq__(object()), NotImplemented)
+        self.assertIs(version.__lt__(object()), NotImplemented)
+
+    def test_ida_version_reads_kernel_and_sdk_versions(self):
+        sigmaker.IDAVersionInfo.ida_version.cache_clear()
+        with patch.object(
+            sigmaker.idaapi, "get_kernel_version", return_value="9.3"
+        ), patch.object(sigmaker.idaapi, "IDA_SDK_VERSION", 930):
+            version = sigmaker.IDAVersionInfo.ida_version()
+        self.assertEqual(version, sigmaker.IDAVersionInfo(9, 3, 930))
+        sigmaker.IDAVersionInfo.ida_version.cache_clear()
+
+
+class TestLoggingConfiguration(CoveredUnitTest):
+    def test_replaces_handlers_and_applies_filters(self):
+        logger = logging.Logger("sigmaker-test")
+        old_handler = MagicMock(spec=logging.Handler)
+        logger.addHandler(old_handler)
+        record_filter = logging.Filter("sigmaker")
+
+        configured = sigmaker.configure_logging(
+            logger=logger,
+            level=logging.DEBUG,
+            handler_filters=[record_filter],
+            fmt_str="%(message)s",
+        )
+
+        self.assertIs(configured, logger)
+        self.assertFalse(logger.propagate)
+        self.assertEqual(logger.level, logging.DEBUG)
+        old_handler.close.assert_called_once()
+        self.assertEqual(len(logger.handlers), 1)
+        self.assertIn(record_filter, logger.handlers[0].filters)
+
+    def test_creates_named_logger_when_not_supplied(self):
+        name = "sigmaker-test-created"
+        logger = logging.getLogger(name)
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+        try:
+            self.assertIs(sigmaker.configure_logging(logging_name=name), logger)
+            self.assertEqual(len(logger.handlers), 1)
+        finally:
+            for handler in logger.handlers[:]:
+                logger.removeHandler(handler)
+                handler.close()
+
+    def test_simd_search_debug_log_uses_format_arguments(self):
+        logger = logging.Logger("sigmaker-debug-test", level=logging.DEBUG)
+        stream = io.StringIO()
+        logger.addHandler(logging.StreamHandler(stream))
+        with _with_test_speedups(), patch.object(
+            sigmaker, "LOGGER", logger
+        ), patch.object(sigmaker.idaapi, "inf_get_min_ea", return_value=0x1000):
+            buf = MagicMock()
+            buf.data.return_value = memoryview(b"\x90")
+            buf.imagebase = 0x1000
+            buf.file_size = 1
+            buf.offset_mapper.return_value = lambda offset: 0x1000 + offset
+            sigmaker.SignatureSearcher._find_all_simd("90", buf=buf)
+
+        self.assertIn("searching for 90", stream.getvalue())
 
 
 class TestSearchCancellation(CoveredUnitTest):
@@ -3956,6 +4157,51 @@ class TestSigMakerConfigDefaults(CoveredUnitTest):
         self.assertFalse(cfg.output_partial_on_cancel)
 
 
+class TestInMemoryBufferFileMode(CoveredUnitTest):
+    def test_loads_file_and_translates_addresses(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "input.bin"
+            path.write_bytes(b"\x90\xCC")
+            with patch.object(sigmaker.idaapi, "get_imagebase", return_value=0x400000):
+                buf = sigmaker.InMemoryBuffer.load(
+                    path, mode=sigmaker.InMemoryBuffer.LoadMode.FILE
+                )
+                self.assertEqual(bytes(buf.data()), b"\x90\xCC")
+                self.assertEqual(buf.file_offset_to_ida_addr(0x20), 0x400020)
+                self.assertEqual(buf.ida_addr_to_file_offset(0x400020), 0x20)
+                self.assertEqual(buf.offset_mapper()(1), 0x400001)
+                buf.clear()
+                self.assertEqual(bytes(buf.data()), b"")
+
+    def test_missing_file_and_wrong_mode_raise(self):
+        with tempfile.TemporaryDirectory() as directory:
+            missing = pathlib.Path(directory) / "missing.bin"
+            with self.assertRaises(RuntimeError):
+                sigmaker.InMemoryBuffer.load(
+                    missing, mode=sigmaker.InMemoryBuffer.LoadMode.FILE
+                )
+
+        segments = sigmaker.InMemoryBuffer(pathlib.Path("/unused"))
+        with self.assertRaises(RuntimeError):
+            segments.file_offset_to_ida_addr(0)
+        with self.assertRaises(RuntimeError):
+            segments.ida_addr_to_file_offset(0)
+
+        file_buf = sigmaker.InMemoryBuffer(
+            pathlib.Path("/unused"), mode=sigmaker.InMemoryBuffer.LoadMode.FILE
+        )
+        with self.assertRaises(RuntimeError):
+            file_buf.segment_offset_to_ida_addr(0)
+        with self.assertRaises(RuntimeError):
+            file_buf.ida_addr_to_segment_offset(0)
+
+    def test_segment_mode_translates_offsets(self):
+        with patch.object(sigmaker.idaapi, "get_imagebase", return_value=0x1000):
+            buf = sigmaker.InMemoryBuffer(pathlib.Path("/unused"))
+            self.assertEqual(buf.segment_offset_to_ida_addr(0x20), 0x1020)
+            self.assertEqual(buf.ida_addr_to_segment_offset(0x1020), 0x20)
+
+
 class TestInstructionWalkerCancellation(CoveredUnitTest):
     """User-cancellation inside InstructionWalker must raise UserCanceledError, not StopIteration."""
 
@@ -4257,6 +4503,10 @@ class TestUniqueSignatureGeneratorSeedThenRefine(CoveredUnitTest):
     """
 
     def setUp(self):
+        self._speedups = _with_test_speedups(
+            filter_offsets_by_search_ranges=_test_filter_offsets
+        )
+        self._speedups.__enter__()
         self.original_user_canceled = getattr(
             sigmaker, "idaapi_user_canceled", MagicMock(return_value=False)
         )
@@ -4277,6 +4527,7 @@ class TestUniqueSignatureGeneratorSeedThenRefine(CoveredUnitTest):
         self._dialog_patcher.stop()
         self._is_code_patcher.stop()
         sigmaker.idaapi_user_canceled = self.original_user_canceled
+        self._speedups.__exit__(None, None, None)
 
     def _make_cfg(self) -> sigmaker.SigMakerConfig:
         return sigmaker.SigMakerConfig(
@@ -4310,7 +4561,6 @@ class TestUniqueSignatureGeneratorSeedThenRefine(CoveredUnitTest):
         self.assertEqual(result.status, sigmaker.GenerationStatus.UNIQUE)
         self.assertEqual(observed_buffers, [supplied_buffer])
 
-    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_seed_once_then_refine_to_unique(self):
         processor = sigmaker.InstructionProcessor(sigmaker.OperandProcessor())
         gen = sigmaker.UniqueSignatureGenerator(processor)
@@ -4348,7 +4598,6 @@ class TestUniqueSignatureGeneratorSeedThenRefine(CoveredUnitTest):
         # Two 0x90 bytes survive to uniqueness (offset 0: 0x90 0x90).
         self.assertEqual(len(result.signature), 2)
 
-    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_wildcard_growth_drops_candidate_across_address_gap(self):
         append_count = 0
         processor = MagicMock()
@@ -4391,7 +4640,6 @@ class TestUniqueSignatureGeneratorSeedThenRefine(CoveredUnitTest):
         self.assertEqual(append_count, 3)
         self.assertEqual(len(result.signature), 3)
 
-    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_trailing_wildcard_gap_only_uniqueness_is_rejected(self):
         append_count = 0
         processor = MagicMock()
@@ -4503,6 +4751,91 @@ class TestGeneratedSignatureDisplay(CoveredUnitTest):
         fa.assert_not_called()
 
 
+class TestResultDisplay(CoveredUnitTest):
+    def setUp(self):
+        self.messages: list[str] = []
+        self.msg_patcher = patch.object(
+            sigmaker.idaapi, "msg", side_effect=self.messages.append
+        )
+        self.msg_patcher.start()
+
+    def tearDown(self):
+        self.msg_patcher.stop()
+
+    @staticmethod
+    def _signature(value: int = 0x90) -> sigmaker.Signature:
+        return sigmaker.Signature([sigmaker.SignatureByte(value, False)])
+
+    def test_generated_signature_handles_empty_addressless_and_clipboard_failure(self):
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+        sigmaker.GeneratedSignature(sigmaker.Signature()).display(cfg)
+        with patch.object(sigmaker.Clipboard, "set_text", return_value=False):
+            sigmaker.GeneratedSignature(self._signature()).display(cfg)
+        self.assertIn("Error: Empty signature\n", self.messages)
+        self.assertIn("Signature: 90\n", self.messages)
+        self.assertIn("Failed to copy to clipboard!", self.messages)
+
+    def test_partial_addressless_result_reports_unavailable_count(self):
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+        sigmaker.GeneratedSignature(
+            self._signature(),
+            status=sigmaker.GenerationStatus.PARTIAL_ON_CANCEL,
+        ).display(cfg)
+        self.assertIn("match count unavailable", "".join(self.messages))
+
+    def test_xref_display_handles_empty_and_copies_first_signature(self):
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+            print_top_x=1,
+        )
+        sigmaker.XrefGeneratedSignature([]).display(cfg)
+        result = sigmaker.XrefGeneratedSignature(
+            [
+                sigmaker.GeneratedSignature(
+                    self._signature(), sigmaker.Match(0x401000)
+                ),
+                sigmaker.GeneratedSignature(
+                    self._signature(0xCC), sigmaker.Match(0x402000)
+                ),
+            ]
+        )
+        with patch.object(sigmaker.Clipboard, "set_text") as set_text:
+            result.display(cfg)
+        self.assertIn("No XREFs", "".join(self.messages))
+        self.assertIn("Top 1 Signatures out of 2 xrefs", "".join(self.messages))
+        set_text.assert_called_once_with("90")
+
+    def test_search_results_display_error_empty_named_and_unnamed_hits(self):
+        with patch.object(
+            sigmaker.idaapi,
+            "get_func_name",
+            side_effect=["named_function", ""],
+        ):
+            sigmaker.SearchResults([], "90", error="invalid").display()
+            sigmaker.SearchResults([], "CC").display()
+            sigmaker.SearchResults(
+                [sigmaker.Match(0x401000), sigmaker.Match(0x402000)], "48"
+            ).display()
+        output = "".join(self.messages)
+        self.assertIn("Error: invalid", output)
+        self.assertIn("Signature does not match!", output)
+        self.assertIn("Match @ 0x401000 in named_function", output)
+        self.assertIn("Match @ 0x402000\n", output)
+
+
 class _RecordingXrefProgressScope:
     """Records the XREF collection scope selected through UIServices."""
 
@@ -4522,6 +4855,15 @@ class _RecordingXrefProgressScope:
 
 class TestXrefFinderCancellation(CoveredUnitTest):
     """Cancel during one XREF candidate stops and keeps prior results."""
+
+    def setUp(self):
+        # Most tests mock signature generation, not the real SIMD buffer load.
+        # Keep that fixture on the fallback path; buffer reuse is covered below
+        # with an explicit mocked speedups module.
+        self._speedups_token = sigmaker._SPEEDUPS_CTX.set(sigmaker._Speedups())
+
+    def tearDown(self):
+        sigmaker._SPEEDUPS_CTX.reset(self._speedups_token)
 
     def _cfg(self) -> sigmaker.SigMakerConfig:
         return sigmaker.SigMakerConfig(
@@ -4808,6 +5150,142 @@ class TestXrefFinderCancellation(CoveredUnitTest):
             [generated.address for generated in result.signatures],
             [sigmaker.Match(0x1010), sigmaker.Match(0x1030)],
         )
+
+
+class TestXrefIteration(CoveredUnitTest):
+    def test_iter_code_xrefs_filters_data_sources(self):
+        xref = MagicMock()
+        xref.frm = 0x1000
+        xref.first_to.return_value = True
+
+        def next_to():
+            if xref.frm == 0x1000:
+                xref.frm = 0x2000
+                return True
+            return False
+
+        xref.next_to.side_effect = next_to
+        with patch.object(sigmaker.idaapi, "xrefblk_t", return_value=xref), patch.object(
+            sigmaker,
+            "is_address_marked_as_code",
+            side_effect=lambda ea: ea == 0x2000,
+        ):
+            self.assertEqual(
+                list(sigmaker.XrefFinder.iter_code_xrefs_to(0x3000)),
+                [0x2000],
+            )
+            self.assertEqual(sigmaker.XrefFinder.count_code_xrefs_to(0x3000), 1)
+
+    def test_iter_code_xrefs_handles_no_xrefs(self):
+        xref = MagicMock()
+        xref.first_to.return_value = False
+        with patch.object(sigmaker.idaapi, "xrefblk_t", return_value=xref):
+            self.assertEqual(
+                list(sigmaker.XrefFinder.iter_code_xrefs_to(0x3000)), []
+            )
+
+
+class TestRangeSignatureGenerator(CoveredUnitTest):
+    def setUp(self):
+        self.cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+
+    def test_data_range_copies_exact_bytes(self):
+        generator = sigmaker.RangeSignatureGenerator(MagicMock())
+        with patch.object(
+            sigmaker, "is_address_marked_as_code", return_value=False
+        ), patch.object(
+            sigmaker.idaapi, "get_bytes", return_value=b"\x90\xCC"
+        ):
+            signature = generator.generate(0x1000, 0x1002, self.cfg)
+        self.assertEqual(format(signature, "ida"), "90 CC")
+
+    def test_code_range_appends_instructions_and_trailing_data(self):
+        processor = MagicMock()
+
+        def append(signature, cur_ea, *_args):
+            signature.append(sigmaker.SignatureByte(cur_ea & 0xFF, False))
+
+        processor.append_instruction_to_sig.side_effect = append
+
+        class Walker:
+            cursor = 0x1002
+
+            def __iter__(self):
+                return iter([(0x1000, MagicMock(), 2)])
+
+        with patch.object(
+            sigmaker, "is_address_marked_as_code", return_value=True
+        ), patch.object(sigmaker, "InstructionWalker", return_value=Walker()), patch.object(
+            sigmaker.idaapi, "get_bytes", return_value=b"\xAA"
+        ):
+            signature = sigmaker.RangeSignatureGenerator(processor).generate(
+                0x1000, 0x1003, self.cfg
+            )
+        self.assertEqual(format(signature, "ida"), "00 AA")
+
+    def test_code_range_honors_progress_cancellation(self):
+        reporter = MagicMock()
+        reporter.should_cancel.return_value = True
+
+        class Walker:
+            cursor = 0x1001
+
+            def __iter__(self):
+                return iter([(0x1000, MagicMock(), 1)])
+
+        with patch.object(
+            sigmaker, "is_address_marked_as_code", return_value=True
+        ), patch.object(sigmaker, "InstructionWalker", return_value=Walker()), self.assertRaises(
+            sigmaker.UserCanceledError
+        ):
+            sigmaker.RangeSignatureGenerator(MagicMock(), reporter).generate(
+                0x1000, 0x1001, self.cfg
+            )
+
+
+class TestSignatureMakerRouting(CoveredUnitTest):
+    def setUp(self):
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        self.cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+
+    def test_rejects_invalid_start_and_range(self):
+        maker = sigmaker.SignatureMaker()
+        with self.assertRaises(sigmaker.Unexpected):
+            maker.make_signature(sigmaker.idaapi.BADADDR, self.cfg)
+        with self.assertRaises(sigmaker.Unexpected):
+            maker.make_signature(0x1000, self.cfg, end=0x1000)
+
+    def test_routes_unique_and_range_generation(self):
+        maker = sigmaker.SignatureMaker()
+        unique = MagicMock()
+        unique.generate.return_value = sigmaker.GeneratedSignature(
+            sigmaker.Signature([sigmaker.SignatureByte(0x90, False)])
+        )
+        ranged = MagicMock()
+        ranged.generate.return_value = sigmaker.Signature(
+            [sigmaker.SignatureByte(0xCC, False)]
+        )
+        with patch.object(
+            sigmaker.SignatureMaker,
+            "_create_generator",
+            side_effect=[unique, ranged],
+        ) as create:
+            unique_result = maker.make_signature(0x1000, self.cfg)
+            range_result = maker.make_signature(0x1000, self.cfg, end=0x1001)
+        self.assertEqual(format(unique_result.signature, "ida"), "90")
+        self.assertEqual(format(range_result.signature, "ida"), "CC")
+        self.assertFalse(create.call_args_list[0].kwargs["for_range"])
+        self.assertTrue(create.call_args_list[1].kwargs["for_range"])
 
 
 class TestGenerationStatusAndPolicy(CoveredUnitTest):
@@ -5813,7 +6291,6 @@ class TestSignatureSearcherBufferCache(CoveredUnitTest):
         fake_buf.file_size = size
         return fake_buf
 
-    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_find_all_simd_skips_load_when_buf_provided(self):
         """When _find_all_simd is given a buf=..., it must NOT call InMemoryBuffer.load."""
         with _with_test_speedups(scan_bytes=MagicMock(return_value=-1)), patch.object(
@@ -5822,7 +6299,6 @@ class TestSignatureSearcherBufferCache(CoveredUnitTest):
             sigmaker.SignatureSearcher._find_all_simd("48 8B C4", buf=self._fake_buf())
         mp_load.assert_not_called()
 
-    @unittest.skipUnless(sigmaker._Speedups.current().available, "SIMD not built")
     def test_find_all_simd_loads_when_buf_is_none(self):
         """When _find_all_simd is given buf=None (default), it loads fresh (today's behavior)."""
         with _with_test_speedups(scan_bytes=MagicMock(return_value=-1)), patch.object(
@@ -7249,12 +7725,548 @@ class TestPluginManifestVersion(unittest.TestCase):
         )
 
 
-class TestArmReferenceAwareWildcard(unittest.TestCase):
-    """ARM/Thumb wildcarding respects the operand-wildcard policy, refines the
-    ambiguous imm/displ types to real addresses via is_off, and wildcards the
-    whole instruction where the offset reaches the high byte (branch targets,
-    ADRP). Register-bearing operands stay exact unless the user selects them.
-    """
+class TestWildcardPolicyDefaults(unittest.TestCase):
+    """Architecture-derived policy defaults do not become persistent overrides."""
+
+    def test_current_redetects_after_processor_change_without_override(self):
+        first = sigmaker.WildcardPolicy(frozenset({1}))
+        second = sigmaker.WildcardPolicy(frozenset({2}))
+
+        class LocalPolicy(sigmaker.WildcardPolicy):
+            _ctx = sigmaker.contextvars.ContextVar("test_wildcard_policy")
+
+        with patch.object(
+            LocalPolicy,
+            "detect_from_processor",
+            side_effect=(first, second),
+        ):
+            self.assertIs(LocalPolicy.current(), first)
+            self.assertIs(LocalPolicy.current(), second)
+
+    def test_operand_processor_detects_its_default_policy_once(self):
+        policy = sigmaker.WildcardPolicy(frozenset())
+
+        class NoOperandInstruction:
+            size = 4
+            ea = 0x1000
+
+            def __iter__(self):
+                return iter(())
+
+        def exercise():
+            processor = sigmaker.OperandProcessor()
+            processor.get_operand(NoOperandInstruction(), [0], [0], True)
+            processor.get_operand(NoOperandInstruction(), [0], [0], True)
+
+        with patch.object(
+            sigmaker.WildcardPolicy,
+            "detect_from_processor",
+            return_value=policy,
+        ) as detect:
+            sigmaker.contextvars.Context().run(exercise)
+        detect.assert_called_once_with()
+
+
+class TestCoverageReviewPaths(CoveredUnitTest):
+    """Exercise deterministic compatibility and fallback branches."""
+
+    def test_speedups_reject_reversed_api_range(self):
+        state = sigmaker._Speedups.from_module(
+            _test_speedups_module(SPEEDUPS_API_MIN=2, SPEEDUPS_API_MAX=1)
+        )
+        self.assertFalse(state.available)
+        self.assertIn("invalid speedups API range", state.diagnostic)
+
+    def test_speedups_interpreter_returns_none_without_candidate(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            sigmaker.sys, "exec_prefix", tmp
+        ):
+            self.assertIsNone(sigmaker._Speedups.ida_python_interpreter())
+
+    def test_speedups_show_remediation_handles_warning_failure(self):
+        warning = MagicMock(side_effect=RuntimeError("warning failed"))
+        state = sigmaker._Speedups(diagnostic="stale extension")
+        with sigmaker._Speedups.use(state), patch.object(
+            sigmaker, "_IDA_IS_IDAQ", return_value=True
+        ), patch.object(sigmaker, "_IDA_WARNING", warning), patch.object(
+            sigmaker.LOGGER, "warning"
+        ) as log_warning:
+            self.assertFalse(sigmaker._Speedups.show_remediation())
+        warning.assert_called_once()
+        log_warning.assert_called_once_with(
+            "Unable to display the SIMD speedups update prompt"
+        )
+
+    def test_speedups_show_remediation_without_warning_callable(self):
+        state = sigmaker._Speedups(diagnostic="stale extension")
+        with sigmaker._Speedups.use(state), patch.object(
+            sigmaker, "_IDA_IS_IDAQ", return_value=True
+        ), patch.object(sigmaker, "_IDA_WARNING", None):
+            self.assertFalse(sigmaker._Speedups.show_remediation())
+
+    def test_speedups_sibling_loader_returns_false_without_sibling_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = pathlib.Path(tmp) / "__init__.py"
+            source.touch()
+            with patch.object(sigmaker, "__file__", str(source)):
+                self.assertFalse(sigmaker._load_speedups_sibling())
+
+    def test_check_continue_prompt_debug_logging(self):
+        logger = MagicMock()
+        with patch.object(sigmaker, "DEBUGGING_MODE", True):
+            sigmaker.CheckContinuePrompt(logger=logger)
+        logger.info.assert_called_once()
+
+    def test_check_continue_prompt_logs_wait_box_cancel(self):
+        logger = MagicMock()
+        prompt = sigmaker.CheckContinuePrompt(logger=logger)
+        with patch.object(sigmaker, "idaapi_user_canceled", return_value=True):
+            self.assertTrue(prompt.should_cancel())
+        logger.info.assert_called_once()
+
+    def test_check_continue_prompt_enabled_reflects_configuration(self):
+        self.assertTrue(sigmaker.CheckContinuePrompt(enable_prompt=True).enabled())
+        self.assertFalse(sigmaker.CheckContinuePrompt(enable_prompt=False).enabled())
+
+    def test_check_continue_prompt_logs_continue_and_cancel(self):
+        logger = MagicMock()
+        prompt = sigmaker.CheckContinuePrompt(
+            logger=logger,
+            prompt_interval=1,
+            cancel_func=lambda: None,
+        )
+        with patch.object(sigmaker, "idaapi_user_canceled", return_value=False), patch.object(
+            prompt._timer, "should_prompt", return_value=True
+        ), patch.object(prompt, "_ask_to_continue", side_effect=[True, False]):
+            self.assertFalse(prompt.should_cancel())
+            self.assertTrue(prompt.should_cancel())
+        self.assertGreaterEqual(logger.info.call_count, 3)
+
+    def test_signature_type_at_uses_definition_order(self):
+        self.assertIs(sigmaker.SignatureType.at(0), sigmaker.SignatureType.IDA)
+
+    def test_generated_signature_ordering_returns_not_implemented(self):
+        generated = sigmaker.GeneratedSignature(sigmaker.Signature())
+        self.assertIs(generated.__lt__(object()), NotImplemented)
+
+    def test_wildcard_policy_ppc_round_trips_through_mask(self):
+        with patch.object(sigmaker.idaapi, "ph_get_id", return_value=sigmaker.idaapi.PLFM_PPC):
+            policy = sigmaker.WildcardPolicy.detect_from_processor()
+        self.assertEqual(
+            sigmaker.WildcardPolicy.from_mask(policy.to_mask()).allowed_types,
+            policy.allowed_types,
+        )
+
+    def test_wildcard_policy_use_without_token_is_a_noop_on_exit(self):
+        use = sigmaker.WildcardPolicy._Use(
+            sigmaker.WildcardPolicy.default_generic(), sigmaker.WildcardPolicy
+        )
+        use.__exit__(None, None, None)
+
+    def test_is_address_marked_as_code_delegates_to_ida(self):
+        with patch.object(sigmaker.idaapi, "get_flags", return_value=7) as get_flags, patch.object(
+            sigmaker.idaapi, "is_code", return_value=True
+        ) as is_code:
+            self.assertTrue(sigmaker.is_address_marked_as_code(0x1234))
+        get_flags.assert_called_once_with(0x1234)
+        is_code.assert_called_once_with(7)
+
+    def test_instruction_walker_rejects_bad_start_and_stops_on_decode_failure(self):
+        with patch.object(sigmaker.idaapi, "BADADDR", 0xFFFFFFFFFFFFFFFF):
+            with self.assertRaises(ValueError):
+                sigmaker.InstructionWalker(0xFFFFFFFFFFFFFFFF)
+
+            sigmaker.idaapi.decode_insn = MagicMock(return_value=0)
+            walker = sigmaker.InstructionWalker(0x1000)
+            with patch.object(sigmaker, "idaapi_user_canceled", return_value=False):
+                with self.assertRaises(StopIteration):
+                    next(walker)
+
+    def test_search_results_display_name_fallbacks(self):
+        self.assertEqual(
+            sigmaker.SearchResults([], "90", source_line=4).display_name,
+            "Pattern line 4",
+        )
+        self.assertEqual(
+            sigmaker.SearchResults([], "90", source_line=0).display_name,
+            "Pattern",
+        )
+
+    def test_search_results_file_offset_rejects_bad_address(self):
+        result = sigmaker.SearchResults([], "90")
+        with patch.object(sigmaker.idaapi, "BADADDR", 0xFFFFFFFFFFFFFFFF), patch.object(
+            sigmaker.idaapi, "get_fileregion_offset", return_value=0xFFFFFFFFFFFFFFFF
+        ):
+            self.assertIsNone(result.file_offset_for_match(sigmaker.Match(0x1000)))
+
+    def test_signature_helpers_handle_empty_reads(self):
+        signature = sigmaker.Signature()
+        with patch.object(sigmaker.idaapi, "get_byte", return_value=0x90), patch.object(
+            sigmaker.idaapi, "get_bytes", return_value=None
+        ):
+            signature.add_byte_to_signature(0x1000, False)
+            signature.add_bytes_to_signature(0x1000, 2, False)
+        self.assertEqual(signature, [sigmaker.SignatureByte(0x90, False)])
+
+    def test_instruction_processor_handles_no_operand_and_split_operand(self):
+        operand_processor = MagicMock()
+        processor = sigmaker.InstructionProcessor(operand_processor)
+        instruction = MagicMock(size=3)
+        signature = sigmaker.Signature()
+
+        operand_processor.get_operand.return_value = False
+        with patch.object(signature, "add_bytes_to_signature") as add_bytes:
+            processor.append_instruction_to_sig(
+                signature, 0x1000, instruction, True, False
+            )
+        add_bytes.assert_called_once_with(0x1000, 3, is_wildcard=False)
+
+        def split_operand(_ins, off, length, _optimized):
+            off[0] = 1
+            length[0] = 1
+            return True
+
+        operand_processor.get_operand.side_effect = split_operand
+        with patch.object(signature, "add_bytes_to_signature") as add_bytes:
+            processor.append_instruction_to_sig(
+                signature, 0x1000, instruction, True, False
+            )
+        self.assertEqual(
+            add_bytes.call_args_list,
+            [
+                unittest.mock.call(0x1000, 1, is_wildcard=False),
+                unittest.mock.call(0x1001, 1, is_wildcard=True),
+                unittest.mock.call(0x1002, 1, is_wildcard=False),
+            ],
+        )
+
+    def test_formatter_lookup_rejects_unknown_name(self):
+        with self.assertRaisesRegex(ValueError, "Unknown batch search format"):
+            sigmaker._batch_search_formatter("not-a-format")
+
+    def test_parser_normalizes_escaped_run(self):
+        self.assertEqual(
+            sigmaker.SignatureParser.parse(r"\x48\x8B"),
+            "48 8B",
+        )
+
+    def test_parser_reports_mask_length_mismatch(self):
+        with patch.object(sigmaker.idaapi, "msg") as msg:
+            self.assertEqual(
+                sigmaker.SignatureParser.parse(r"\x48\x8B" " xx?"),
+                "",
+            )
+        msg.assert_called_once()
+
+    def test_parser_rejects_masked_pattern_with_trailing_text(self):
+        self.assertEqual(
+            sigmaker.SignatureParser.parse(r"\x48\x8B xx? trailing"),
+            "",
+        )
+
+    def test_parser_skips_empty_explicit_tokens(self):
+        self.assertEqual(
+            sigmaker.SignatureParser._normalize_explicit_pattern("90,,48"),
+            "90 48",
+        )
+
+    def test_sigtext_handles_empty_prefix_and_odd_hex(self):
+        self.assertEqual(sigmaker.SigText.normalize("0x 90")[0], "90")
+        self.assertEqual(sigmaker.SigText.normalize("ABC")[0], "AB ?C")
+
+    def test_buffer_load_records_nonempty_segments_and_merges_contiguous_ranges(self):
+        first = types.SimpleNamespace(start_ea=0x1000, end_ea=0x1002)
+        second = types.SimpleNamespace(start_ea=0x1002, end_ea=0x1004)
+        buffer = sigmaker.InMemoryBuffer(file_path=pathlib.Path("/tmp/input"))
+        with patch.object(sigmaker.idaapi, "get_first_seg", return_value=first), patch.object(
+            sigmaker.idaapi, "get_next_seg", side_effect=[second, None]
+        ), patch.object(
+            sigmaker.idaapi, "get_bytes", side_effect=[b"AB", b"CD"]
+        ):
+            buffer._load_segments()
+        self.assertEqual(buffer._buffer, bytearray(b"ABCD"))
+        self.assertEqual(list(buffer._search_ranges()), [(0, 4)])
+
+    def test_filter_dispatches_to_native_backend_and_python_path_can_break(self):
+        candidates = array.array("I", [0, 10])
+        native_filter = MagicMock(return_value=1)
+        with _with_test_speedups(
+            filter_offsets_by_search_ranges=native_filter
+        ):
+            count = sigmaker._filter_offsets_into_search_ranges(
+                candidates,
+                2,
+                2,
+                array.array("Q", [0]),
+                array.array("Q", [4]),
+            )
+        self.assertEqual(count, 1)
+        native_filter.assert_called_once()
+
+        with _without_speedups():
+            count = sigmaker._filter_offsets_into_search_ranges(
+                candidates,
+                2,
+                2,
+                array.array("Q", [0]),
+                array.array("Q", [4]),
+            )
+        self.assertEqual(count, 1)
+
+    def test_byte_index_accessors_use_bucket_ranges(self):
+        heads = array.array("I", [0]) * 65537
+        heads[1] = 2
+        heads[256] = 2
+        positions = array.array("I", [7, 8])
+        index = sigmaker._ByteIndex(heads, positions)
+        self.assertEqual(index.bucket_size(0), 2)
+        self.assertEqual(list(index.candidates(0)), [7, 8])
+        self.assertEqual(index.bucket_size1(0), 2)
+        self.assertEqual(list(index.candidates1(0)), [7, 8])
+
+    def test_seed_via_index_handles_last_byte_with_native_capacity(self):
+        class Index:
+            def bucket_size(self, _key):
+                return 100
+
+            def bucket_size1(self, _byte):
+                return 1
+
+            def candidates(self, _key):
+                return array.array("I")
+
+            def candidates1(self, _byte):
+                return array.array("I", [0])
+
+        signature = sigmaker.Signature(
+            [
+                sigmaker.SignatureByte(0, True),
+                sigmaker.SignatureByte(0x90, False),
+            ]
+        )
+        buffer = MagicMock()
+        buffer.data.return_value = memoryview(bytearray(b"\x00\x90"))
+        with _with_test_speedups(
+            seed_offsets=lambda *_args: (array.array("I", [0, 99]), 1),
+            filter_offsets_by_search_ranges=lambda _cands, count, *_args: count,
+        ):
+            candidates, count = sigmaker._seed_via_index(signature, Index(), buffer)
+        self.assertEqual(count, 2)
+        self.assertEqual(list(candidates[:count]), [0, 0])
+
+        with _with_test_speedups(
+            seed_offsets=lambda *_args: (array.array("I"), 0),
+            filter_offsets_by_search_ranges=lambda _cands, count, *_args: count,
+        ):
+            candidates, count = sigmaker._seed_via_index(signature, Index(), buffer)
+        self.assertEqual(count, 1)
+        self.assertEqual(list(candidates[:count]), [0])
+
+    def test_trimmed_signature_rejects_all_wildcards(self):
+        signature = sigmaker.Signature([sigmaker.SignatureByte(0, True)])
+        self.assertIsNone(sigmaker._validated_trimmed_signature(signature, None))
+
+    def test_text_formatter_renders_address_details_and_plain_hits(self):
+        entry = sigmaker.SearchResults(
+            [
+                sigmaker.Match(0x1000, rva=0x10, file_offset=0x20),
+                sigmaker.Match(0x1001),
+                sigmaker.Match(0x1002, rva=0x30, file_offset=0x40),
+            ],
+            "90",
+            source_line=7,
+        )
+        results = sigmaker.BatchSearchResults([entry], imagebase=0x1000)
+        with patch.object(
+            sigmaker.SearchResults,
+            "_file_offset_for_ea",
+            return_value=None,
+        ), patch.object(
+            sigmaker.idaapi,
+            "get_func_name",
+            side_effect=["named_function", ""],
+        ):
+            output = results.format(
+                sigmaker.BatchSearchTextFormatter(
+                    include_function_names=True,
+                    max_preview_matches=2,
+                )
+            )
+        self.assertIn("rva 0x10", output)
+        self.assertIn("file 0x20", output)
+        self.assertIn("named_function", output)
+        self.assertIn("0x1001", output)
+        self.assertIn("(+1 more)", output)
+
+    def test_formatter_registration_normalizes_and_skips_empty_suffixes(self):
+        formatter = MagicMock()
+        try:
+            sigmaker._register_batch_search_formatter(
+                "coverage-only", formatter, suffixes=("", "log")
+            )
+            self.assertIs(sigmaker._BATCH_SEARCH_FORMATTERS["coverage-only"], formatter)
+            self.assertEqual(
+                sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES[".log"], "coverage-only"
+            )
+        finally:
+            sigmaker._BATCH_SEARCH_FORMATTERS.pop("coverage-only", None)
+            sigmaker._BATCH_SEARCH_FORMAT_SUFFIXES.pop(".log", None)
+
+    def test_xref_finder_handles_no_sources_and_cancel_inside_loop(self):
+        cfg = sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=False,
+            continue_outside_of_function=False,
+            wildcard_optimized=False,
+        )
+        finder = sigmaker.XrefFinder()
+        ui = sigmaker.UIServices(
+            progress=_RecordingXrefProgressScope,
+            cancel_requested=lambda: False,
+        )
+        with sigmaker.UIServices.use(ui), patch.object(
+            sigmaker.XrefFinder, "iter_code_xrefs_to", return_value=iter(())
+        ):
+            self.assertEqual(finder.find_xrefs(0x2000, cfg).signatures, [])
+
+        cancel = MagicMock(side_effect=[False, True])
+        ui = sigmaker.UIServices(
+            progress=_RecordingXrefProgressScope,
+            cancel_requested=cancel,
+        )
+        with sigmaker.UIServices.use(ui), patch.object(
+            sigmaker.XrefFinder,
+            "iter_code_xrefs_to",
+            return_value=iter((0x1010,)),
+        ), patch.object(sigmaker.SignatureMaker, "make_signature") as make_signature:
+            self.assertEqual(finder.find_xrefs(0x2000, cfg).signatures, [])
+        make_signature.assert_not_called()
+
+    def test_nibble_fallback_returns_empty_when_already_canceled(self):
+        buffer = MagicMock()
+        buffer.data.return_value = memoryview(bytearray(b"\x4A"))
+        with sigmaker.UIServices.use(
+            sigmaker.UIServices(cancel_requested=lambda: True)
+        ):
+            self.assertEqual(
+                sigmaker.SignatureSearcher._find_all_nibble_fallback(
+                    "4? 90", buf=buffer
+                ),
+                [],
+            )
+
+    def test_simd_dispatch_handles_empty_signature_and_missing_backend(self):
+        buffer = MagicMock()
+        buffer.data.return_value = memoryview(bytearray(b"\x90"))
+        buffer.imagebase = 0x1000
+        buffer.file_size = 1
+        buffer.offset_mapper.return_value = lambda offset: 0x1000 + offset
+        with _with_test_speedups(), patch.object(
+            sigmaker.idaapi, "inf_get_min_ea", return_value=0x1000
+        ):
+            self.assertEqual(
+                [int(hit) for hit in sigmaker.SignatureSearcher._find_all_simd("", buf=buffer)],
+                [0x1000],
+            )
+        with _without_speedups():
+            with self.assertRaisesRegex(RuntimeError, "active speedups"):
+                sigmaker.SignatureSearcher._find_all_simd("90", buf=buffer)
+
+    def test_simd_ranges_return_offsets_and_stop_after_second_match(self):
+        buffer = MagicMock()
+        buffer.data.return_value = memoryview(bytearray(b"\x90\x90"))
+        buffer.offset_mapper.return_value = lambda offset: 0x1000 + offset
+        scan = MagicMock(return_value=0)
+        with _with_test_speedups(scan_bytes=scan):
+            signature = _TestSpeedupSignature("90")
+            self.assertEqual(
+                sigmaker.SignatureSearcher._scan_simd_ranges(
+                    signature, buffer, offsets_only=True
+                ),
+                [0, 1],
+            )
+            matches = sigmaker.SignatureSearcher._scan_simd_ranges(
+                signature,
+                buffer,
+                offsets_only=False,
+                skip_more_than_one=True,
+            )
+        self.assertEqual([int(hit) for hit in matches], [0x1000, 0x1001])
+
+    def test_find_all_offsets_loads_buffer_and_handles_empty_signature(self):
+        buffer = MagicMock()
+        buffer.data.return_value = memoryview(bytearray(b"\x90"))
+        with _with_test_speedups(scan_bytes=MagicMock(return_value=-1)), patch.object(
+            sigmaker, "_load_search_buffer", return_value=buffer
+        ) as load:
+            offsets, returned = sigmaker.SignatureSearcher.find_all_offsets("90")
+            empty_offsets, empty_returned = sigmaker.SignatureSearcher.find_all_offsets("")
+        self.assertEqual(offsets, [])
+        self.assertIs(returned, buffer)
+        self.assertEqual(empty_offsets, [0])
+        self.assertIs(empty_returned, buffer)
+        self.assertEqual(load.call_count, 2)
+        self.assertEqual(load.call_args_list, [unittest.mock.call(), unittest.mock.call()])
+
+    def test_profiler_default_path_and_reset_disable_active_profile(self):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            sigmaker.idaapi, "get_user_idadir", return_value=tmp
+        ), patch.object(sigmaker.idaapi, "msg"):
+            sigmaker._PROFILER.start()
+            output_path = sigmaker._PROFILER.stop()
+        self.assertEqual(output_path, str(pathlib.Path(tmp) / "sigmaker_profile.prof"))
+
+        profile = MagicMock()
+        sigmaker._PROFILER._profile = profile
+        sigmaker._PROFILER.reset()
+        profile.disable.assert_called_once()
+
+    def test_progress_dialog_configures_and_reports_cancel(self):
+        dialog = sigmaker.ProgressDialog()
+        with patch.object(sigmaker.idaapi, "show_wait_box") as show, patch.object(
+            sigmaker.idaapi, "hide_wait_box"
+        ) as hide, patch.object(sigmaker.idaapi, "replace_wait_box") as replace, patch.object(
+            sigmaker, "idaapi_user_canceled", return_value=True
+        ):
+            self.assertIs(dialog.configure("working", hide_cancel=True), dialog)
+            with dialog:
+                dialog.replace_message("still working")
+                self.assertTrue(dialog.user_canceled())
+        show.assert_called_once_with("HIDECANCEL\nworking")
+        replace.assert_called_once_with("still working")
+        hide.assert_called_once_with()
+
+    def test_progress_box_normalizes_infinite_total_and_formats_unknown_total(self):
+        dialog = _FakeDialog("working")
+        box = sigmaker.ProgressBox(
+            iter((1,)),
+            total=float("inf"),
+            dialog_factory=lambda _message: dialog,
+            clock=self._clock([0.0, 2.0]),
+            throttle_seconds=0.0,
+        )
+        self.assertIsNone(box.total)
+        with patch.object(sigmaker, "idaapi_user_canceled", return_value=False):
+            self.assertEqual(list(box), [1])
+        self.assertEqual(dialog.messages, ["Processing (1) | Elapsed: 2s"])
+
+    @staticmethod
+    def _clock(values):
+        iterator = iter(values)
+        last = [values[-1]]
+
+        def tick():
+            try:
+                last[0] = next(iterator)
+            except StopIteration:
+                pass
+            return last[0]
+
+        return tick
+
+
+class TestOperandWildcardSelection(unittest.TestCase):
+    """Characterize policy-gated architecture-specific operand coverage."""
 
     class _Op:
         def __init__(self, type_, offb, n):
@@ -7263,10 +8275,11 @@ class TestArmReferenceAwareWildcard(unittest.TestCase):
             self.n = n
 
     class _Ins:
-        def __init__(self, size, ops, ea=0x1000):
+        def __init__(self, size, ops, ea=0x1000, itype=0):
             self.size = size
             self._ops = ops
             self.ea = ea
+            self.itype = itype
 
         def __iter__(self):
             return iter(self._ops)
@@ -7274,11 +8287,31 @@ class TestArmReferenceAwareWildcard(unittest.TestCase):
     def setUp(self):
         ia = sigmaker.idaapi
         self._saved = {
-            k: getattr(ia, k, None) for k in ("get_flags", "is_off", "get_bytes")
+            k: getattr(ia, k, None)
+            for k in (
+                "get_flags",
+                "is_off",
+                "get_bytes",
+                "get_sreg",
+                "str2reg",
+                "ph_get_id",
+                "inf_is_be",
+                "PLFM_386",
+                "PLFM_ARM",
+                "PLFM_MIPS",
+            )
         }
+        ia.PLFM_386 = 1
+        ia.PLFM_ARM = 2
+        ia.PLFM_MIPS = 3
         ia.get_flags = MagicMock(return_value=0)
         self._offset_ops = set()  # operand indices IDA marks as offsets
-        ia.is_off = lambda flags, n: n in self._offset_ops
+        ia.is_off = MagicMock(side_effect=lambda flags, n: n in self._offset_ops)
+        self._thumb = True
+        ia.get_sreg = MagicMock(side_effect=lambda *_args: int(self._thumb))
+        ia.str2reg = MagicMock(return_value=20)
+        ia.ph_get_id = MagicMock(return_value=ia.PLFM_ARM)
+        ia.inf_is_be = MagicMock(return_value=False)
         # Default test policy: addresses only, matching WildcardPolicy.for_arm.
         self._addr_types = {ia.o_mem, ia.o_displ, ia.o_imm, ia.o_near, ia.o_far}
         self._tok = sigmaker.WildcardPolicy.set_current(
@@ -7290,14 +8323,29 @@ class TestArmReferenceAwareWildcard(unittest.TestCase):
         for k, v in self._saved.items():
             setattr(sigmaker.idaapi, k, v)
 
-    def _proc(self):
-        proc = sigmaker.OperandProcessor()
-        proc._is_arm = True  # bypass idaapi.ph_get_id() under the mock
-        return proc
+    def _proc(self, processor_id=None):
+        ia = sigmaker.idaapi
+        ia.ph_get_id.return_value = (
+            ia.PLFM_ARM if processor_id is None else processor_id
+        )
+        return sigmaker.OperandProcessor()
 
-    def _run(self, size, ops):
+    def _run(
+        self,
+        size,
+        ops,
+        *,
+        itype=0,
+        wildcard_optimized=True,
+        processor_id=None,
+    ):
         off, length = [0], [0]
-        found = self._proc().get_operand(self._Ins(size, ops), off, length, True)
+        found = self._proc(processor_id).get_operand(
+            self._Ins(size, ops, itype=itype),
+            off,
+            length,
+            wildcard_optimized,
+        )
         return found, off[0], length[0]
 
     def test_address_immediate_adrp_wildcards_whole_instruction(self):
@@ -7355,11 +8403,194 @@ class TestArmReferenceAwareWildcard(unittest.TestCase):
             ],
         )
 
-    def test_bare_immediate_not_wildcarded(self):
-        # o_imm without is_off is a stable constant (#0x40) -> stays exact.
+    def test_thumb_non_movl_literal_immediate_is_not_wildcarded(self):
+        # A normal Thumb literal stays an anchor even though its mode is Thumb.
         ia = sigmaker.idaapi
         self._offset_ops = set()
+        self._thumb = True
         found, _, _ = self._run(4, [self._Op(ia.o_imm, 0, 0)])
+        self.assertFalse(found)
+        ia.get_sreg.assert_not_called()
+
+    def test_offset_movl_does_not_query_thumb_state(self):
+        ia = sigmaker.idaapi
+        self._offset_ops = {0}
+        found, off, length = self._run(
+            4,
+            [self._Op(ia.o_imm, 0, 0)],
+            itype=_ida_allins.ARM_movl,
+        )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 4))
+        ia.get_sreg.assert_not_called()
+
+    def test_thumb_movl_literal_immediate_wildcards_whole_instruction(self):
+        # Issue #86: IDA combines MOVS/LSLS into one Thumb ARM_movl macro.
+        ia = sigmaker.idaapi
+        self._offset_ops = set()
+        self._thumb = True
+        found, off, length = self._run(
+            4,
+            [self._Op(ia.o_imm, 0, 0)],
+            itype=_ida_allins.ARM_movl,
+        )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 4))
+
+    def test_thumb_movl_reuses_the_offset_lookup_before_checking_thumb(self):
+        ia = sigmaker.idaapi
+        self._offset_ops = set()
+        self._thumb = True
+        found, _, _ = self._run(
+            4,
+            [self._Op(ia.o_imm, 0, 0)],
+            itype=_ida_allins.ARM_movl,
+        )
+        self.assertTrue(found)
+        ia.get_flags.assert_called_once_with(0x1000)
+        ia.is_off.assert_called_once_with(0, 0)
+        ia.str2reg.assert_called_once_with("T")
+        ia.get_sreg.assert_called_once_with(0x1000, 20)
+
+    def test_arm_movl_without_thumb_state_is_not_wildcarded(self):
+        ia = sigmaker.idaapi
+        self._offset_ops = set()
+        self._thumb = False
+        found, _, _ = self._run(
+            4,
+            [self._Op(ia.o_imm, 0, 0)],
+            itype=_ida_allins.ARM_movl,
+        )
+        self.assertFalse(found)
+
+    def test_policy_rejected_immediate_skips_mode_and_offset_queries(self):
+        ia = sigmaker.idaapi
+        policy = sigmaker.WildcardPolicy(
+            frozenset(self._addr_types - {ia.o_imm})
+        )
+        with sigmaker.WildcardPolicy.use(policy):
+            found, _, _ = self._run(
+                4,
+                [self._Op(ia.o_imm, 0, 0)],
+                itype=_ida_allins.ARM_movl,
+            )
+        self.assertFalse(found)
+        ia.get_sreg.assert_not_called()
+        ia.is_off.assert_not_called()
+
+    def test_x86_zero_offset_is_exact_without_optimized_wildcarding(self):
+        ia = sigmaker.idaapi
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_mem}))
+        ):
+            found, _, _ = self._run(
+                5,
+                [self._Op(ia.o_mem, 0, 0)],
+                wildcard_optimized=False,
+                processor_id=ia.PLFM_386,
+            )
+        self.assertFalse(found)
+
+    def test_x86_zero_offset_wildcards_full_instruction_when_optimized(self):
+        ia = sigmaker.idaapi
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_mem}))
+        ):
+            found, off, length = self._run(
+                5,
+                [self._Op(ia.o_mem, 0, 0)],
+                wildcard_optimized=True,
+                processor_id=ia.PLFM_386,
+            )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 5))
+
+    def test_x86_nonzero_offset_wildcards_operand_bytes(self):
+        ia = sigmaker.idaapi
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_mem}))
+        ):
+            found, off, length = self._run(
+                5,
+                [self._Op(ia.o_mem, 2, 0)],
+                wildcard_optimized=False,
+                processor_id=ia.PLFM_386,
+            )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (2, 3))
+
+    def test_generic_zero_offset_is_exact_without_optimized_wildcarding(self):
+        ia = sigmaker.idaapi
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_mem}))
+        ):
+            found, _, _ = self._run(
+                5,
+                [self._Op(ia.o_mem, 0, 0)],
+                wildcard_optimized=False,
+                processor_id=ia.PLFM_MIPS,
+            )
+        self.assertFalse(found)
+
+    def test_mips_offset_immediate_wildcards_little_endian_halfword(self):
+        """A MIPSEL HI16/LO16 relocation changes only instruction bytes 0..1."""
+        ia = sigmaker.idaapi
+        self._offset_ops = {1}
+        ia.inf_is_be.return_value = False
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_imm}))
+        ):
+            found, off, length = self._run(
+                4,
+                [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_imm, 0, 1)],
+                processor_id=ia.PLFM_MIPS,
+            )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 2))
+
+    def test_mips_offset_immediate_wildcards_big_endian_halfword(self):
+        """A MIPS HI16/LO16 relocation changes only instruction bytes 2..3."""
+        ia = sigmaker.idaapi
+        self._offset_ops = {1}
+        ia.inf_is_be.return_value = True
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_imm}))
+        ):
+            found, off, length = self._run(
+                4,
+                [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_imm, 0, 1)],
+                processor_id=ia.PLFM_MIPS,
+            )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (2, 2))
+
+    def test_mips_offset_displacement_wildcards_encoded_halfword(self):
+        """A MIPS relocated load/store displacement changes only two bytes."""
+        ia = sigmaker.idaapi
+        self._offset_ops = {1}
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_displ}))
+        ):
+            found, off, length = self._run(
+                4,
+                [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_displ, 0, 1)],
+                processor_id=ia.PLFM_MIPS,
+            )
+        self.assertTrue(found)
+        self.assertEqual((off, length), (0, 2))
+
+    def test_mips_unmarked_immediate_remains_exact(self):
+        """A MIPS literal immediate is not a relocation just because it is an imm."""
+        ia = sigmaker.idaapi
+        self._offset_ops = set()
+        with sigmaker.WildcardPolicy.use(
+            sigmaker.WildcardPolicy(frozenset({ia.o_imm}))
+        ):
+            found, _, _ = self._run(
+                4,
+                [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_imm, 0, 1)],
+                processor_id=ia.PLFM_MIPS,
+            )
         self.assertFalse(found)
 
     def test_stack_displacement_not_wildcarded(self):
@@ -7662,5 +8893,5 @@ class TestSearchScope(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    # Run the tests (coverage is handled by the base class)
+    # Run the tests (coverage is handled by the CI runner).
     unittest.main(verbosity=2)

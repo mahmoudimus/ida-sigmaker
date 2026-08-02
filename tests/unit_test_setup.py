@@ -90,13 +90,24 @@ class TestIDASDKLayout(unittest.TestCase):
             library_dirs = []
             try:
                 with mock.patch.dict(os.environ, {"IDA_SDK": str(sdk)}, clear=False):
-                    using_ida_sdk(include_dirs, library_dirs)
+                    sdk_version = using_ida_sdk(include_dirs, library_dirs)
             finally:
                 setup_globals.update(original_globals)
 
+            self.assertEqual(sdk_version, 940)
             self.assertIn(include, include_dirs)
             self.assertIn(lib / "x64_win_64", library_dirs)
             self.assertIn(lib / "x64_win_qt", library_dirs)
+
+    def test_windows_sdk_version_enables_cxx17_compile_flag(self):
+        compile_args = self.setup_namespace["compile_args"]
+        setup_globals = compile_args.__globals__
+        original_ostype = setup_globals["OSTYPE"]
+        setup_globals["OSTYPE"] = "Windows"
+        try:
+            self.assertIn("/std:c++17", compile_args(sdk_version=940))
+        finally:
+            setup_globals["OSTYPE"] = original_ostype
 
 
 if __name__ == "__main__":

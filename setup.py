@@ -47,17 +47,20 @@ def determine_simd_flags() -> list[str]:
     return []
 
 
-def compile_args(debug_mode=False):
+def compile_args(debug_mode=False, sdk_version: int = 0):
     """Return platform-specific compilation arguments."""
     debug_flags = []
     simd_flags = determine_simd_flags()
     match OSTYPE:
         case "Windows":
+            standard_flags = ["/std:c++17"] if int(sdk_version) >= 940 else []
             if debug_mode:
                 debug_flags = ["/Z7", "/Od"]
             # For MSVC: `/TP` tells the compiler to treat sources as C++
             # files and `/EHa` enables asynchronous exception handling.
-            return ["/TP", "/EHa"] + debug_flags + simd_flags
+            return (
+                ["/TP", "/EHa"] + standard_flags + debug_flags + simd_flags
+            )
         case "Linux":
             # Suppress a few warnings that are often triggered by IDA
             # headers.
@@ -203,12 +206,12 @@ def using_ida_sdk(include_dirs, library_dirs):
     IDA_SDK = pathlib.Path(os.environ.get("IDA_SDK", "/opt/ida/9/sdk"))
     if not IDA_SDK.exists():
         raise FileNotFoundError(f"IDA SDK not found at {IDA_SDK}")
+    sdk_version = get_ida_sdk_version(IDA_SDK)
     include_dirs.append(_sdk_include_dir(IDA_SDK))
     library_dirs.append(_sdk_lib_dir(IDA_SDK))
 
     match OSTYPE:
         case "Windows":
-            sdk_version = get_ida_sdk_version(IDA_SDK)
             library_dirs.append(
                 _sdk_lib_dir(
                     IDA_SDK,
@@ -227,6 +230,7 @@ def using_ida_sdk(include_dirs, library_dirs):
             library_dirs.append(_sdk_lib_dir(IDA_SDK, "x64_linux_gcc_64"))
         case _:
             pass
+    return sdk_version
 
 
 def ext_modules(with_ida_sdk=False, debug_mode=False):
@@ -235,8 +239,9 @@ def ext_modules(with_ida_sdk=False, debug_mode=False):
     ]
     library_dirs = []
     libraries = []
+    sdk_version = 0
     if with_ida_sdk:
-        using_ida_sdk(include_dirs, library_dirs)
+        sdk_version = using_ida_sdk(include_dirs, library_dirs)
 
     include_paths = [str(path) for path in include_dirs]
     library_paths = [str(path) for path in library_dirs]
@@ -277,7 +282,7 @@ def ext_modules(with_ida_sdk=False, debug_mode=False):
             include_dirs=include_paths,
             library_dirs=library_paths,
             libraries=libraries,
-            extra_compile_args=compile_args(debug_mode),
+            extra_compile_args=compile_args(debug_mode, sdk_version),
             extra_link_args=link_args(debug_mode),
             define_macros=macros,
         )

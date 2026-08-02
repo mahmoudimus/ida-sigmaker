@@ -20,7 +20,7 @@ from setuptools import Extension, setup
 # Platform detection
 # Use the host system and architecture to adjust compiler options.
 OSTYPE = platform.system()
-ARCH = platform.processor() or platform.machine()
+ARCH = (platform.processor() or platform.machine()).lower()
 x64 = platform.architecture()[0] == "64bit"
 COMPILER_OPTIMIZATION_LEVEL = re.compile(r"-O[0-3]\b")
 
@@ -145,24 +145,86 @@ def link_args(debug_mode=False):
             return []
 
 
+def _sdk_include_dir(sdk_path: pathlib.Path) -> pathlib.Path:
+    """Return the include directory for legacy and GitHub SDK layouts."""
+    if (sdk_path / "src" / "include").exists():
+        return sdk_path / "src" / "include"
+    return sdk_path / "include"
+
+
+def _sdk_lib_dir(sdk_path: pathlib.Path, *subdirectories: str) -> pathlib.Path:
+    """Return a library directory for legacy and GitHub SDK layouts."""
+    root = (
+        sdk_path / "src" / "lib"
+        if (sdk_path / "src" / "lib").exists()
+        else sdk_path / "lib"
+    )
+    return root.joinpath(*subdirectories)
+
+
+def _windows_sdk_lib_subdir(
+    sdk_version: int,
+    library: str = LIBRARY,
+    is_64bit: bool = x64,
+) -> str:
+    """Return the Windows import-library directory for an IDA SDK version.
+
+    IDA 9.4 introduced native Windows ARM64 support and renamed the x64
+    import-library directory. Older SDKs use ``x64_win_vc_64``; IDA 9.4+
+    uses ``x64_win_64`` or ``arm64_win_64`` according to the build ABI.
+    """
+    normalized_library = str(library).lower()
+    is_arm64 = normalized_library in {"arm64", "aarch64"}
+
+    if is_arm64 and int(sdk_version) < 940:
+        raise ValueError("ARM64 Windows SDK libraries require IDA 9.4 or newer")
+
+    if int(sdk_version) >= 940:
+        if is_arm64:
+            return "arm64_win_64"
+        return "x64_win_64" if is_64bit else "x64_win_32"
+
+    return "x64_win_vc_64" if is_64bit else "x64_win_32"
+
+
+def get_ida_sdk_version(sdk_path: pathlib.Path) -> int:
+    """Read ``IDA_SDK_VERSION`` from the SDK's ``pro.h`` when available."""
+    pro_h = _sdk_include_dir(sdk_path) / "pro.h"
+    if pro_h.exists():
+        for line in pro_h.read_text(encoding="utf-8").splitlines():
+            if line.strip().startswith("#define IDA_SDK_VERSION"):
+                parts = line.strip().split()
+                if len(parts) >= 3 and parts[2].isdigit():
+                    return int(parts[2])
+    return 0
+
+
 def using_ida_sdk(include_dirs, library_dirs):
     IDA_SDK = pathlib.Path(os.environ.get("IDA_SDK", "/opt/ida/9/sdk"))
     if not IDA_SDK.exists():
         raise FileNotFoundError(f"IDA SDK not found at {IDA_SDK}")
-    include_dirs.append(IDA_SDK / "include")
-    library_dirs.append(IDA_SDK / "lib")
+    include_dirs.append(_sdk_include_dir(IDA_SDK))
+    library_dirs.append(_sdk_lib_dir(IDA_SDK))
 
     match OSTYPE:
         case "Windows":
-            library_dirs.append(IDA_SDK / "lib" / "x64_win_vc_64")
-            library_dirs.append(IDA_SDK / "lib" / "x64_win_qt")
+            sdk_version = get_ida_sdk_version(IDA_SDK)
+            library_dirs.append(
+                _sdk_lib_dir(
+                    IDA_SDK,
+                    _windows_sdk_lib_subdir(
+                        sdk_version, library=LIBRARY, is_64bit=x64
+                    ),
+                )
+            )
+            library_dirs.append(_sdk_lib_dir(IDA_SDK, "x64_win_qt"))
         case "Darwin":
             if LIBRARY == "arm64" or LIBRARY == "aarch64":
-                library_dirs.append(IDA_SDK / "lib" / "arm64_mac_clang_64")
+                library_dirs.append(_sdk_lib_dir(IDA_SDK, "arm64_mac_clang_64"))
             else:
-                library_dirs.append(IDA_SDK / "lib" / "x64_mac_clang_64")
+                library_dirs.append(_sdk_lib_dir(IDA_SDK, "x64_mac_clang_64"))
         case "Linux":
-            library_dirs.append(IDA_SDK / "lib" / "x64_linux_gcc_64")
+            library_dirs.append(_sdk_lib_dir(IDA_SDK, "x64_linux_gcc_64"))
         case _:
             pass
 

@@ -217,10 +217,35 @@ def get_ida_sdk_version(sdk_path: pathlib.Path) -> int:
 # import libraries. ida-qt-libs republishes them, built with QT_NAMESPACE=QT
 # and symbol-for-symbol identical to the last set Hex-Rays shipped.
 IDA_QT_REPO = "mahmoudimus/ida-qt-libs"
-IDA_QT_TAG = "ida-9.4.0-qt-6.8.2-win64"
+
+# IDA SDK version -> matching release. Each IDA release pins a specific Qt
+# version, so the artifact is chosen by SDK rather than hardcoded. 9.3 and 9.4
+# both ship Qt 6.8.2 and their import libraries are currently byte-identical,
+# but that is a coincidence of those two releases, not a rule.
+IDA_QT_TAGS = {
+    930: "ida-9.3-qt-6.8.2-win64",
+    940: "ida-9.4.0-qt-6.8.2-win64",
+}
 
 
-def _download_ida_qt(dest: pathlib.Path, tag: str = IDA_QT_TAG) -> pathlib.Path:
+def _ida_qt_tag(sdk_version: int) -> str:
+    """Return the ida-qt-libs release matching *sdk_version*."""
+    known = IDA_QT_TAGS.get(int(sdk_version))
+    if known:
+        return known
+
+    newest = IDA_QT_TAGS[max(IDA_QT_TAGS)]
+    print(
+        f"warning: no ida-qt-libs release recorded for SDK {sdk_version}; "
+        f"falling back to {newest}. If that IDA ships a different Qt version "
+        "the ABI will not match - set IDA_QT explicitly, or see "
+        f"https://github.com/{IDA_QT_REPO}/releases",
+        file=sys.stderr,
+    )
+    return newest
+
+
+def _download_ida_qt(dest: pathlib.Path, tag: str) -> pathlib.Path:
     """Download and checksum-verify an ida-qt-libs release into *dest*."""
     import hashlib
     import urllib.request
@@ -279,10 +304,11 @@ def _ida_qt_dir(sdk_path: pathlib.Path, sdk_version: int) -> pathlib.Path | None
     if os.environ.get("IDA_QT_NO_DOWNLOAD"):
         return None
 
+    tag = _ida_qt_tag(sdk_version)
     cache = pathlib.Path(__file__).parent / ".ida-qt"
-    extracted = cache / IDA_QT_TAG
+    extracted = cache / tag
     if not (extracted / "lib").is_dir():
-        extracted = _download_ida_qt(cache)
+        extracted = _download_ida_qt(cache, tag)
     return extracted / "lib"
 
 

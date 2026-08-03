@@ -58,8 +58,19 @@ def compile_args(debug_mode=False, sdk_version: int = 0):
                 debug_flags = ["/Z7", "/Od"]
             # For MSVC: `/TP` tells the compiler to treat sources as C++
             # files and `/EHa` enables asynchronous exception handling.
+            #
+            # Qt 6 headers additionally require conformance mode. Without
+            # `/Zc:__cplusplus` MSVC reports __cplusplus as 199711L whatever
+            # `/std:` says and qcompilerdetection.h raises C1189; without
+            # `/permissive-` ADL resolves Qt's comparesEqual/compareThreeWay
+            # ambiguously (C2666) and an incomplete QString trips C2139.
+            qt_flags = ["/Zc:__cplusplus", "/permissive-"]
             return (
-                ["/TP", "/EHa"] + standard_flags + debug_flags + simd_flags
+                ["/TP", "/EHa"]
+                + standard_flags
+                + qt_flags
+                + debug_flags
+                + simd_flags
             )
         case "Linux":
             # Suppress a few warnings that are often triggered by IDA
@@ -202,6 +213,79 @@ def get_ida_sdk_version(sdk_path: pathlib.Path) -> int:
     return 0
 
 
+# IDA SDK 9.4 stopped shipping lib/x64_win_qt, the prebuilt namespaced Qt6
+# import libraries. ida-qt-libs republishes them, built with QT_NAMESPACE=QT
+# and symbol-for-symbol identical to the last set Hex-Rays shipped.
+IDA_QT_REPO = "mahmoudimus/ida-qt-libs"
+IDA_QT_TAG = "ida-9.4.0-qt-6.8.2-win64"
+
+
+def _download_ida_qt(dest: pathlib.Path, tag: str = IDA_QT_TAG) -> pathlib.Path:
+    """Download and checksum-verify an ida-qt-libs release into *dest*."""
+    import hashlib
+    import urllib.request
+    import zipfile
+
+    base = f"https://github.com/{IDA_QT_REPO}/releases/download/{tag}"
+    dest.mkdir(parents=True, exist_ok=True)
+
+    with urllib.request.urlopen(f"{base}/SHA256SUMS") as response:
+        checksums = {
+            parts[1]: parts[0]
+            for parts in (line.split() for line in response.read().decode().splitlines())
+            if len(parts) == 2
+        }
+
+    archive = dest / f"{tag}.zip"
+    if not archive.is_file():
+        print(f"downloading {tag}...", file=sys.stderr)
+        urllib.request.urlretrieve(f"{base}/{tag}.zip", archive)
+
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    expected = checksums.get(archive.name)
+    if digest != expected:
+        archive.unlink(missing_ok=True)
+        raise RuntimeError(
+            f"checksum mismatch for {archive.name}: expected {expected}, got {digest}"
+        )
+
+    with zipfile.ZipFile(archive) as bundle:
+        bundle.extractall(dest)
+    return dest / tag
+
+
+def _ida_qt_dir(sdk_path: pathlib.Path, sdk_version: int) -> pathlib.Path | None:
+    """Return a directory containing Qt6*.lib, or None if Qt is unavailable.
+
+    Resolution order:
+      1. ``IDA_QT`` - an extracted ida-qt-libs release, or any directory with
+         namespaced Qt import libraries.
+      2. The SDK's own ``lib/x64_win_qt``, which exists through SDK 9.3.
+      3. A downloaded ida-qt-libs release, unless ``IDA_QT_NO_DOWNLOAD`` is set.
+    """
+    override = os.environ.get("IDA_QT")
+    if override:
+        candidate = pathlib.Path(override)
+        # Accept either the release root or its lib/ directory.
+        for path in (candidate / "lib", candidate):
+            if path.is_dir() and any(path.glob("Qt6*.lib")):
+                return path
+        raise FileNotFoundError(f"IDA_QT={override} contains no Qt6*.lib")
+
+    bundled = _sdk_lib_dir(sdk_path, "x64_win_qt")
+    if bundled.is_dir() and any(bundled.glob("Qt*.lib")):
+        return bundled
+
+    if os.environ.get("IDA_QT_NO_DOWNLOAD"):
+        return None
+
+    cache = pathlib.Path(__file__).parent / ".ida-qt"
+    extracted = cache / IDA_QT_TAG
+    if not (extracted / "lib").is_dir():
+        extracted = _download_ida_qt(cache)
+    return extracted / "lib"
+
+
 def using_ida_sdk(include_dirs, library_dirs):
     IDA_SDK = pathlib.Path(os.environ.get("IDA_SDK", "/opt/ida/9/sdk"))
     if not IDA_SDK.exists():
@@ -220,7 +304,14 @@ def using_ida_sdk(include_dirs, library_dirs):
                     ),
                 )
             )
-            library_dirs.append(_sdk_lib_dir(IDA_SDK, "x64_win_qt"))
+            qt_dir = _ida_qt_dir(IDA_SDK, sdk_version)
+            if qt_dir is not None:
+                library_dirs.append(qt_dir)
+                # An ida-qt-libs release carries headers alongside lib/; the
+                # SDK's own x64_win_qt does not.
+                qt_include = qt_dir.parent / "include"
+                if qt_include.is_dir():
+                    include_dirs.append(qt_include)
         case "Darwin":
             if LIBRARY == "arm64" or LIBRARY == "aarch64":
                 library_dirs.append(_sdk_lib_dir(IDA_SDK, "arm64_mac_clang_64"))

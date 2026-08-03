@@ -191,3 +191,6 @@ src/**/*.so
 src/**/*.dll
 src/**/*.html
 src/**/*.so.dSYM
+
+# ida-qt-libs release cache (namespaced Qt6 import libraries)
+.ida-qt/

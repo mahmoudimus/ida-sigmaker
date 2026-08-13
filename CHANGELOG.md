@@ -4,6 +4,12 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+## [1.14.3] - 2026-08-13
+
+### Added
+
+- **Windows ARM64 wheels now ship on PyPI.** The cibuildwheel matrix gained a native `windows-11-arm` build that produces `win_arm64` wheels for CPython 3.11-3.14 alongside the existing Intel matrix.
+
 ## [1.14.2] - 2026-07-21
 
 ### Fixed
@@ -44,7 +50,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 - **PyPI builds now run only for published releases.** Ordinary successful tests on `main` no longer launch an untagged wheel build, and the HCLI manifest version and exact PyPI dependency pin are synchronized from `sigmaker.__version__` during release preparation.
 
-[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.2...HEAD
+[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.3...HEAD
+[1.14.3]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.2...v1.14.3
 [1.14.2]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.1...v1.14.2
 [1.14.1]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.0...v1.14.1
 [1.14.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.13.0...v1.14.0

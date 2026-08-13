@@ -36,6 +36,11 @@ jobs:
                       runs-on: ubuntu-24.04-arm
                     - os: windows-intel
                       runs-on: windows-latest
+                    - os: windows-arm64
+                      # Native ARM64 Windows runner (public preview)
+                      runs-on: windows-11-arm
+                      # CPython ships official Windows ARM64 installers from 3.11 onward
+                      cibw-skip: "cp310-win_arm64"
                     - os: macos-intel
                       # macos-15-intel is the current x86_64 runner (macos-13 retired Dec 2025)
                       runs-on: macos-15-intel
@@ -53,6 +58,8 @@ jobs:
               env:
                   # Build CPython 3.10+ wheels only (as required by project)
                   CIBW_BUILD: "cp310-* cp311-* cp312-* cp313-* cp314-*"
+                  # Windows ARM64 has no official CPython 3.10 installer (3.11+ only)
+                  CIBW_SKIP: ${{ matrix.cibw-skip || '' }}
                   # if no annotation for this build group, this shouldn't be skipped
                   # CIBW_SKIP: "pp*"
               with:

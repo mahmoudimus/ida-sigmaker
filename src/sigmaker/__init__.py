@@ -5373,7 +5373,10 @@ class SigMakerPlugin(idaapi.plugin_t):
                 self.ACTION_SHOW_SIGMAKER,
                 "SigMaker",
                 _ActionHandler(self.run),
-                self.wanted_hotkey,
+                # No hotkey here: wanted_hotkey already binds Ctrl-Alt-S to the
+                # Edit/Plugins/Signature Maker (py) entry. Binding it again on
+                # this action makes IDA flag a shortcut conflict and disable one.
+                None,
                 "Show the signature maker dialog.",
                 154,
             )

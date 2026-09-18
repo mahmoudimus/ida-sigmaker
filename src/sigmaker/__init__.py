@@ -4816,6 +4816,7 @@ class _FunctionSigProgress:
         )
 
 
+@dataclasses.dataclass(slots=True, frozen=True)
 class _PseudocodeView:
     """A decompiler widget together with the cfunc it is displaying.
 
@@ -4831,11 +4832,10 @@ class _PseudocodeView:
     popup is populated before we know there is a cfunc to work with.
     """
 
-    __slots__ = ("widget", "cfunc")
-
-    def __init__(self, widget, cfunc):
-        self.widget = widget
-        self.cfunc = cfunc
+    #: The TWidget of the decompiler view.
+    widget: typing.Any
+    #: The idaapi.cfunc_t that view is displaying.
+    cfunc: typing.Any
 
     # -- widget-level, no cfunc needed ------------------------------------
 

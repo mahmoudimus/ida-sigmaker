@@ -32,6 +32,11 @@ import ida_allins
 import idaapi
 import idc
 
+try:
+    import ida_hexrays
+except ImportError:  # IDA installs without the decompiler
+    ida_hexrays = None  # type: ignore[assignment]
+
 _IDA_IS_IDAQ = idaapi.is_idaq
 _IDA_WARNING = idaapi.warning
 
@@ -4805,6 +4810,133 @@ class _FunctionSigProgress:
         )
 
 
+# ---------------------------------------------------------------------------
+# Pseudocode (decompiler) view helpers
+#
+# The pseudocode right-click actions have to map a text selection back to
+# addresses. Hex-Rays hands us one ctree item per (line, column) and every item
+# carries the ea it was generated from. The decompiler reorders code, so a
+# contiguous block of pseudocode lines can cover scattered addresses; we sign
+# the whole [min, max_end) span and print the resolved range so the extra bytes
+# are never a surprise.
+# ---------------------------------------------------------------------------
+
+#: Settings from the last dialog run, reused by the dialog-less right-click
+#: actions. None until the user opens the dialog at least once.
+_LAST_QUICK_CONFIG: typing.Optional["SigMakerConfig"] = None
+
+
+def _remember_quick_config(cfg: "SigMakerConfig") -> None:
+    """Remember the dialog's settings for the actions that skip the dialog."""
+    global _LAST_QUICK_CONFIG
+    _LAST_QUICK_CONFIG = cfg
+
+
+def _quick_config() -> "SigMakerConfig":
+    """Config for actions that skip the dialog: last used, else the dialog's
+    own defaults (IDA format, wildcard operands, wildcard optimized)."""
+    if _LAST_QUICK_CONFIG is not None:
+        return _LAST_QUICK_CONFIG
+    return SigMakerConfig(
+        output_format=SignatureType.IDA,
+        wildcard_operands=True,
+        continue_outside_of_function=False,
+        wildcard_optimized=True,
+    )
+
+
+def _visible_line_width(line: str) -> int:
+    """Width of a pseudocode line in display columns, color tags stripped."""
+    try:
+        return len(idaapi.tag_remove(line))
+    except Exception:
+        return len(line)
+
+
+def _simpleline_number(pos) -> typing.Optional[int]:
+    """Line number behind a twinpos_t sitting in a simpleline (text) view."""
+    place = getattr(pos, "at", None)
+    if place is None:
+        return None
+    caster = getattr(idaapi, "place_t_as_simpleline_place_t", None)
+    if caster is not None:
+        try:
+            simpleline = caster(place)
+        except Exception:
+            simpleline = None
+        number = getattr(simpleline, "n", None)
+        if number is not None:
+            return int(number)
+    number = getattr(place, "n", None)
+    return None if number is None else int(number)
+
+
+def _selected_pseudocode_lines(viewer) -> typing.Optional[tuple[int, int]]:
+    """First and last selected line numbers in a text view, or None when the
+    user has not selected anything."""
+    p0, p1 = idaapi.twinpos_t(), idaapi.twinpos_t()
+    if not idaapi.read_selection(viewer, p0, p1):
+        return None
+    first, last = _simpleline_number(p0), _simpleline_number(p1)
+    if first is None or last is None:
+        return None
+    return (first, last) if first <= last else (last, first)
+
+
+def _pseudocode_line_eas(cfunc, first_line: int, last_line: int) -> set[int]:
+    """Addresses every ctree item on the given pseudocode lines maps back to."""
+    if ida_hexrays is None:
+        return set()
+    pseudocode = cfunc.get_pseudocode()
+    eas: set[int] = set()
+    for lineno in range(max(first_line, 0), min(last_line, len(pseudocode) - 1) + 1):
+        line = pseudocode[lineno].line
+        for x in range(_visible_line_width(line)):
+            item = ida_hexrays.ctree_item_t()
+            if not cfunc.get_line_item(line, x, True, None, item, None):
+                continue
+            ea = item.get_ea()
+            if ea is not None and ea != idaapi.BADADDR:
+                eas.add(int(ea))
+    return eas
+
+
+def _pseudocode_selection_range(cfunc, viewer) -> typing.Optional[tuple[int, int]]:
+    """Address range [start, end) covered by the pseudocode selection."""
+    lines = _selected_pseudocode_lines(viewer)
+    if lines is None:
+        return None
+    eas = _pseudocode_line_eas(cfunc, *lines)
+    if not eas:
+        return None
+    start_ea = min(eas)
+    end_ea = int(idc.get_item_end(max(eas)))
+    if end_ea <= start_ea:
+        return None
+    return start_ea, end_ea
+
+
+def _is_pseudocode_widget(widget) -> bool:
+    """True for a decompiler view, False when the decompiler is unavailable."""
+    if ida_hexrays is None:
+        return False
+    return idaapi.get_widget_type(widget) == idaapi.BWN_PSEUDOCODE
+
+
+def _pseudocode_selection_predicate(widget, popup=None, ctx=None) -> bool:
+    """Attach the selection action only when there is something selected."""
+    return _is_pseudocode_widget(widget) and (
+        _selected_pseudocode_lines(widget) is not None
+    )
+
+
+def _pseudocode_function_predicate(widget, popup=None, ctx=None) -> bool:
+    """Attach the whole-function action only when nothing is selected."""
+    return _is_pseudocode_widget(widget) and (
+        _selected_pseudocode_lines(widget) is None
+    )
+
+
 # no cover: start
 # we do not cover the below because this is mainly executing IDA GUI functionality.
 # any logic here should be pulled out into a separate class and tested separately.
@@ -5094,13 +5226,45 @@ Quick Options:
         self.Free()
 
 
+def _pseudocode_vdui(widget):
+    """vdui_t for a decompiler widget, or None when there is not one."""
+    if ida_hexrays is None or widget is None:
+        return None
+    return ida_hexrays.get_widget_vdui(widget)
+
+
+@contextlib.contextmanager
+def _plugin_action_scope() -> typing.Iterator[None]:
+    """UI services plus the error handling every plugin action shares."""
+    ui_token = _UI_SERVICES_CTX.set(_ida_ui_services())
+    try:
+        yield
+    except Unexpected as e:
+        idaapi.msg(f"Error: {str(e)}\n")
+    except UserCanceledError:
+        # User cancellation is expected, not an error
+        idaapi.msg("Operation canceled by user\n")
+    except Exception as e:
+        LOGGER.error(
+            "Exception occurred: %s%s%s", e, os.linesep, traceback.format_exc()
+        )
+    finally:
+        _UI_SERVICES_CTX.reset(ui_token)
+
+
 class _ActionHandler(idaapi.action_handler_t):
     """Internal helper bridging IDA UI actions to plugin methods."""
 
-    def __init__(self, action_function, always_enabled: bool = False):
+    def __init__(
+        self,
+        action_function,
+        always_enabled: bool = False,
+        widget_types: typing.Optional[typing.Tuple[int, ...]] = None,
+    ):
         super().__init__()
         self.action_function = action_function
         self.always_enabled = always_enabled
+        self.widget_types = widget_types or (idaapi.BWN_DISASM,)
 
     def activate(self, ctx: idaapi.action_ctx_base_t) -> int:
         self.action_function(ctx=ctx)
@@ -5109,7 +5273,7 @@ class _ActionHandler(idaapi.action_handler_t):
     def update(self, ctx: idaapi.action_ctx_base_t) -> int:
         if self.always_enabled:
             return idaapi.AST_ENABLE_ALWAYS
-        if ctx.widget_type == idaapi.BWN_DISASM:
+        if ctx.widget_type in self.widget_types:
             return idaapi.AST_ENABLE_FOR_WIDGET
         return idaapi.AST_DISABLE_FOR_WIDGET
 
@@ -5162,6 +5326,8 @@ class SigMakerPlugin(idaapi.plugin_t):
     ACTION_SHOW_SIGMAKER: str = "pysigmaker:show"
     ACTION_START_PROFILING: str = "pysigmaker:start_profiling"
     ACTION_STOP_PROFILING: str = "pysigmaker:stop_profiling"
+    ACTION_PSEUDOCODE_SELECTION_SIG: str = "pysigmaker:pseudocode_selection_sig"
+    ACTION_PSEUDOCODE_FUNCTION_SIG: str = "pysigmaker:pseudocode_function_sig"
 
     def init(self) -> int:
         _Speedups.show_remediation()
@@ -5176,6 +5342,18 @@ class SigMakerPlugin(idaapi.plugin_t):
             _PopupHook(self.ACTION_SHOW_SIGMAKER, category="SigMaker"),
             _PopupHook(self.ACTION_START_PROFILING, category="SigMaker"),
             _PopupHook(self.ACTION_STOP_PROFILING, category="SigMaker"),
+            # Pseudocode view: exactly one of the two attaches, decided by
+            # whether the user has a selection, so the label always matches
+            # what the action will do. Top level, not under "SigMaker/", to
+            # keep these one click away.
+            _PopupHook(
+                self.ACTION_PSEUDOCODE_SELECTION_SIG,
+                predicate=_pseudocode_selection_predicate,
+            ),
+            _PopupHook(
+                self.ACTION_PSEUDOCODE_FUNCTION_SIG,
+                predicate=_pseudocode_function_predicate,
+            ),
         )
         return idaapi.PLUGIN_KEEP
 
@@ -5218,11 +5396,40 @@ class SigMakerPlugin(idaapi.plugin_t):
                 "Stop the active cProfile session and write the dump to the user IDA dir.",
             )
         )
+        idaapi.register_action(
+            idaapi.action_desc_t(
+                self.ACTION_PSEUDOCODE_SELECTION_SIG,
+                "SigMaker: signature for selection",
+                _ActionHandler(
+                    self._action_pseudocode_selection_sig,
+                    widget_types=(idaapi.BWN_PSEUDOCODE,),
+                ),
+                None,
+                "Create a signature for the code the selected pseudocode covers.",
+                154,
+            )
+        )
+        idaapi.register_action(
+            idaapi.action_desc_t(
+                self.ACTION_PSEUDOCODE_FUNCTION_SIG,
+                "SigMaker: xref + shortest unique signature for function",
+                _ActionHandler(
+                    self._action_pseudocode_function_sig,
+                    widget_types=(idaapi.BWN_PSEUDOCODE,),
+                ),
+                None,
+                "Print the shortest unique signature inside this function and "
+                "the shortest xref signatures into it.",
+                154,
+            )
+        )
 
     def _deregister_actions(self) -> None:
         idaapi.unregister_action(self.ACTION_SHOW_SIGMAKER)
         idaapi.unregister_action(self.ACTION_START_PROFILING)
         idaapi.unregister_action(self.ACTION_STOP_PROFILING)
+        idaapi.unregister_action(self.ACTION_PSEUDOCODE_SELECTION_SIG)
+        idaapi.unregister_action(self.ACTION_PSEUDOCODE_FUNCTION_SIG)
 
     def _action_start_profiling(self, ctx=None) -> None:
         start_profiling()
@@ -5257,6 +5464,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             output_partial_on_cancel=output_partial_on_cancel,
             scope_to_segment=scope_to_segment,
         )
+        _remember_quick_config(config)
 
         ui_token = _UI_SERVICES_CTX.set(_ida_ui_services())
         try:
@@ -5333,25 +5541,12 @@ class SigMakerPlugin(idaapi.plugin_t):
             idaapi.msg("Place cursor inside a function first.\n")
             return
 
-        try:
-            # ProgressBox inside MinimalFunctionSignatureGenerator.generate
-            # owns the wait box; no outer wrapper needed.
-            generator = MinimalFunctionSignatureGenerator(
-                InstructionProcessor(OperandProcessor())
-            )
-            result = generator.generate(pfn, config)
-            offset = int(result.address) - int(pfn.start_ea)
-            idaapi.msg(
-                f"Function signature (offset +{hex(offset)} into function "
-                f"{hex(pfn.start_ea)}{_func_name_suffix(int(pfn.start_ea))}):\n"
-            )
-            result.display(config)
+        if self._print_shortest_function_signature(pfn, config) is not None:
             return
-        except Unexpected:
-            idaapi.msg(
-                f"No unique signature inside function "
-                f"{hex(pfn.start_ea)}; trying xref signatures...\n"
-            )
+        idaapi.msg(
+            f"No unique signature inside function "
+            f"{hex(pfn.start_ea)}; trying xref signatures...\n"
+        )
 
         # XrefFinder opens its own bounded preflight wait box, then each
         # candidate generator owns its cancelable wait box.
@@ -5368,6 +5563,117 @@ class SigMakerPlugin(idaapi.plugin_t):
                 f"No unique signature found for function {hex(pfn.start_ea)} "
                 f"(no unique sig within body and no usable xrefs)\n"
             )
+
+    def _action_pseudocode_selection_sig(self, ctx=None) -> None:
+        """Right-click with a pseudocode selection: signature for exactly the
+        bytes those lines cover."""
+        widget = idaapi.get_current_viewer()
+        vu = _pseudocode_vdui(widget)
+        if vu is None or vu.cfunc is None:
+            idaapi.msg("No decompiled function under the cursor.\n")
+            return
+        selection = _pseudocode_selection_range(vu.cfunc, widget)
+        if selection is None:
+            idaapi.msg("Select one or more pseudocode lines first.\n")
+            return
+
+        start_ea, end_ea = selection
+        config = _quick_config()
+        with _plugin_action_scope():
+            # The decompiler reorders code, so print the span we resolved: it
+            # can be wider than the lines you highlighted.
+            idaapi.msg(
+                f"Selection covers 0x{start_ea:X} - 0x{end_ea:X} "
+                f"({end_ea - start_ea} bytes)\n"
+            )
+            with ProgressDialog(
+                "Signature for selection\n\n"
+                "Building a signature for the selected pseudocode.\n\n"
+                "Press Cancel to stop"
+            ):
+                signature = SignatureMaker().make_signature(
+                    start_ea, config, end=end_ea
+                )
+            signature.display(config)
+            self._report_uniqueness(signature, config, scope_ea=start_ea)
+
+    def _action_pseudocode_function_sig(self, ctx=None) -> None:
+        """Right-click with no pseudocode selection: shortest unique signature
+        inside the function plus the shortest xref signatures into it."""
+        widget = idaapi.get_current_viewer()
+        vu = _pseudocode_vdui(widget)
+        ea = idaapi.get_screen_ea()
+        if vu is not None and vu.cfunc is not None:
+            ea = int(vu.cfunc.entry_ea)
+        with _plugin_action_scope():
+            self._run_function_and_xref_sigs(ea, _quick_config())
+
+    @staticmethod
+    def _report_uniqueness(
+        signature: GeneratedSignature,
+        config: SigMakerConfig,
+        scope_ea: typing.Optional[int] = None,
+    ) -> None:
+        """Say whether a fixed-range signature actually matches one place."""
+        if not signature.signature:
+            return
+        pattern = format(signature.signature, SignatureType.IDA.value)
+        results = SignatureSearcher.from_signature(pattern).search(
+            scope_ea=scope_ea if config.scope_to_segment else None
+        )
+        count = results.match_count
+        if count == 1:
+            idaapi.msg("Signature is unique (1 match).\n")
+        else:
+            idaapi.msg(f"Signature is NOT unique ({count} matches).\n")
+
+    def _print_shortest_function_signature(
+        self, pfn, config: SigMakerConfig
+    ) -> typing.Optional[GeneratedSignature]:
+        """Print the shortest unique signature inside a function body, or
+        return None when the body has no unique signature."""
+        try:
+            # ProgressBox inside MinimalFunctionSignatureGenerator.generate
+            # owns the wait box; no outer wrapper needed.
+            generator = MinimalFunctionSignatureGenerator(
+                InstructionProcessor(OperandProcessor())
+            )
+            result = generator.generate(pfn, config)
+        except Unexpected:
+            return None
+        offset = int(result.address) - int(pfn.start_ea)
+        idaapi.msg(
+            f"Function signature (offset +{hex(offset)} into function "
+            f"{hex(pfn.start_ea)}{_func_name_suffix(int(pfn.start_ea))}):\n"
+        )
+        result.display(config)
+        return result
+
+    def _run_function_and_xref_sigs(self, ea: int, config: SigMakerConfig) -> None:
+        """Print both the shortest unique signature inside the function and the
+        shortest xref signatures into it."""
+        pfn = idaapi.get_func(ea)
+        if pfn is None:
+            idaapi.msg("Place cursor inside a function first.\n")
+            return
+
+        function_sig = self._print_shortest_function_signature(pfn, config)
+        if function_sig is None:
+            idaapi.msg(f"No unique signature inside function {hex(pfn.start_ea)}\n")
+
+        # XrefFinder opens its own bounded preflight wait box, then each
+        # candidate generator owns its cancelable wait box.
+        XrefFinder().find_xrefs(pfn.start_ea, config).display(cfg=config)
+
+        if function_sig is None:
+            # Nothing from the body, so the xref display's own clipboard copy
+            # stands.
+            return
+        # The xref display copied its #1; the function-body signature is the
+        # one you usually want, so it wins the clipboard.
+        fmted = format(function_sig.signature, config.output_format.value)
+        if Clipboard.set_text(fmted):
+            idaapi.msg("Copied the function signature to the clipboard.\n")
 
     def term(self) -> None:
         self._deregister_actions()

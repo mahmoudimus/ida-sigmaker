@@ -4,6 +4,10 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+### Added
+
+- **Right-click actions in the pseudocode view.** With one or more decompiler lines selected, "SigMaker: signature for selection" builds a signature over exactly the bytes those lines cover and reports whether it is unique. With nothing selected, "SigMaker: xref + shortest unique signature for function" prints both the shortest unique signature inside the function body and the shortest xref signatures into it. Both actions skip the dialog and reuse whatever settings you last picked in it, defaulting to the dialog's own defaults (IDA format, wildcard operands, wildcard optimized). Installs without the decompiler are unaffected: the actions never attach.
+
 ## [1.14.3] - 2026-08-13
 
 ### Added

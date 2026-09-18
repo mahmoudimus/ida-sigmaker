@@ -4922,28 +4922,21 @@ class _PseudocodeView:
     @staticmethod
     def _visible_line_width(line: str) -> int:
         """Width of a line in display columns, color tags stripped."""
-        try:
-            return len(idaapi.tag_remove(line))
-        except Exception:
-            return len(line)
+        return len(idaapi.tag_remove(line))
 
     @staticmethod
     def _line_number(pos) -> typing.Optional[int]:
-        """Line number behind a twinpos_t sitting in a simpleline view."""
+        """Line number behind a twinpos_t sitting in a simpleline view.
+
+        The cast returns None for a place that is not a simpleline place,
+        which is how a non-text view answers."""
         place = getattr(pos, "at", None)
         if place is None:
             return None
-        caster = getattr(idaapi, "place_t_as_simpleline_place_t", None)
-        if caster is not None:
-            try:
-                simpleline = caster(place)
-            except Exception:
-                simpleline = None
-            number = getattr(simpleline, "n", None)
-            if number is not None:
-                return int(number)
-        number = getattr(place, "n", None)
-        return None if number is None else int(number)
+        simpleline = idaapi.place_t_as_simpleline_place_t(place)
+        if simpleline is None:
+            return None
+        return int(simpleline.n)
 
 
 # no cover: start

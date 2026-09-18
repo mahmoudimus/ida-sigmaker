@@ -8976,11 +8976,11 @@ class TestPseudocodeSelection(unittest.TestCase):
         self._select(7, 3)
         self.assertEqual(sigmaker._PseudocodeView.selected_lines(MagicMock()), (3, 7))
 
-    def test_selected_lines_fall_back_to_place_attribute(self):
-        # Builds where the simpleline cast is unavailable: read .n off the place.
+    def test_selected_lines_none_for_a_non_simpleline_place(self):
+        # The cast answers None for a place that is not a simpleline place.
         sigmaker.idaapi.place_t_as_simpleline_place_t = MagicMock(return_value=None)
         self._select(4, 4)
-        self.assertEqual(sigmaker._PseudocodeView.selected_lines(MagicMock()), (4, 4))
+        self.assertIsNone(sigmaker._PseudocodeView.selected_lines(MagicMock()))
 
     def test_selected_lines_none_when_place_missing(self):
         sigmaker.idaapi.twinpos_t = MagicMock(
@@ -9064,6 +9064,15 @@ class TestPseudocodeSelection(unittest.TestCase):
         view = sigmaker._PseudocodeView.at(widget)
         self.assertIs(view.widget, widget)
         self.assertIs(view.cfunc, cfunc)
+
+    def test_entry_ea_comes_from_the_cfunc(self):
+        cfunc = _FakeCfunc(["aa"], {})
+        cfunc.entry_ea = 0x1400
+        self.assertEqual(self._view(cfunc).entry_ea, 0x1400)
+
+    def test_visible_line_width_strips_color_tags(self):
+        sigmaker.idaapi.tag_remove = MagicMock(return_value="abc")
+        self.assertEqual(sigmaker._PseudocodeView._visible_line_width("\x01abc\x02"), 3)
 
     def test_is_pseudocode_widget(self):
         sigmaker.idaapi.BWN_PSEUDOCODE = 47

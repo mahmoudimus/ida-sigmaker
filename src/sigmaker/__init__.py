@@ -32,11 +32,6 @@ import ida_allins
 import idaapi
 import idc
 
-try:
-    import ida_hexrays
-except ImportError:  # IDA installs without the decompiler
-    ida_hexrays = None  # type: ignore[assignment]
-
 _IDA_IS_IDAQ = idaapi.is_idaq
 _IDA_WARNING = idaapi.warning
 
@@ -4821,22 +4816,9 @@ class _FunctionSigProgress:
 # are never a surprise.
 # ---------------------------------------------------------------------------
 
-#: Settings from the last dialog run, reused by the dialog-less right-click
-#: actions. None until the user opens the dialog at least once.
-_LAST_QUICK_CONFIG: typing.Optional["SigMakerConfig"] = None
-
-
-def _remember_quick_config(cfg: "SigMakerConfig") -> None:
-    """Remember the dialog's settings for the actions that skip the dialog."""
-    global _LAST_QUICK_CONFIG
-    _LAST_QUICK_CONFIG = cfg
-
-
-def _quick_config() -> "SigMakerConfig":
-    """Config for actions that skip the dialog: last used, else the dialog's
-    own defaults (IDA format, wildcard operands, wildcard optimized)."""
-    if _LAST_QUICK_CONFIG is not None:
-        return _LAST_QUICK_CONFIG
+def _default_quick_config() -> "SigMakerConfig":
+    """Config the dialog-less actions fall back to before the dialog has been
+    opened: the dialog's own defaults."""
     return SigMakerConfig(
         output_format=SignatureType.IDA,
         wildcard_operands=True,
@@ -4885,14 +4867,12 @@ def _selected_pseudocode_lines(viewer) -> typing.Optional[tuple[int, int]]:
 
 def _pseudocode_line_eas(cfunc, first_line: int, last_line: int) -> set[int]:
     """Addresses every ctree item on the given pseudocode lines maps back to."""
-    if ida_hexrays is None:
-        return set()
     pseudocode = cfunc.get_pseudocode()
     eas: set[int] = set()
     for lineno in range(max(first_line, 0), min(last_line, len(pseudocode) - 1) + 1):
         line = pseudocode[lineno].line
         for x in range(_visible_line_width(line)):
-            item = ida_hexrays.ctree_item_t()
+            item = idaapi.ctree_item_t()
             if not cfunc.get_line_item(line, x, True, None, item, None):
                 continue
             ea = item.get_ea()
@@ -4917,9 +4897,8 @@ def _pseudocode_selection_range(cfunc, viewer) -> typing.Optional[tuple[int, int
 
 
 def _is_pseudocode_widget(widget) -> bool:
-    """True for a decompiler view, False when the decompiler is unavailable."""
-    if ida_hexrays is None:
-        return False
+    """True for a decompiler view. A decompiler-less install never has one, so
+    this doubles as the availability check."""
     return idaapi.get_widget_type(widget) == idaapi.BWN_PSEUDOCODE
 
 
@@ -5228,9 +5207,9 @@ Quick Options:
 
 def _pseudocode_vdui(widget):
     """vdui_t for a decompiler widget, or None when there is not one."""
-    if ida_hexrays is None or widget is None:
+    if widget is None:
         return None
-    return ida_hexrays.get_widget_vdui(widget)
+    return idaapi.get_widget_vdui(widget)
 
 
 @contextlib.contextmanager
@@ -5328,6 +5307,10 @@ class SigMakerPlugin(idaapi.plugin_t):
     ACTION_STOP_PROFILING: str = "pysigmaker:stop_profiling"
     ACTION_PSEUDOCODE_SELECTION_SIG: str = "pysigmaker:pseudocode_selection_sig"
     ACTION_PSEUDOCODE_FUNCTION_SIG: str = "pysigmaker:pseudocode_function_sig"
+
+    #: Settings from the last dialog run, reused by the right-click actions
+    #: that skip the dialog. None until the dialog has been opened once.
+    _last_config: typing.Optional[SigMakerConfig] = None
 
     def init(self) -> int:
         _Speedups.show_remediation()
@@ -5467,7 +5450,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             output_partial_on_cancel=output_partial_on_cancel,
             scope_to_segment=scope_to_segment,
         )
-        _remember_quick_config(config)
+        self._last_config = config
 
         ui_token = _UI_SERVICES_CTX.set(_ida_ui_services())
         try:
@@ -5567,6 +5550,11 @@ class SigMakerPlugin(idaapi.plugin_t):
                 f"(no unique sig within body and no usable xrefs)\n"
             )
 
+    def _quick_config(self) -> SigMakerConfig:
+        """Config for the actions that skip the dialog: whatever the dialog was
+        last run with, else its defaults."""
+        return self._last_config or _default_quick_config()
+
     def _action_pseudocode_selection_sig(self, ctx=None) -> None:
         """Right-click with a pseudocode selection: signature for exactly the
         bytes those lines cover."""
@@ -5581,7 +5569,7 @@ class SigMakerPlugin(idaapi.plugin_t):
             return
 
         start_ea, end_ea = selection
-        config = _quick_config()
+        config = self._quick_config()
         with _plugin_action_scope():
             # The decompiler reorders code, so print the span we resolved: it
             # can be wider than the lines you highlighted.
@@ -5609,7 +5597,7 @@ class SigMakerPlugin(idaapi.plugin_t):
         if vu is not None and vu.cfunc is not None:
             ea = int(vu.cfunc.entry_ea)
         with _plugin_action_scope():
-            self._run_function_and_xref_sigs(ea, _quick_config())
+            self._run_function_and_xref_sigs(ea, self._quick_config())
 
     @staticmethod
     def _report_uniqueness(

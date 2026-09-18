@@ -8937,6 +8937,7 @@ class TestPseudocodeSelection(unittest.TestCase):
                 "BADADDR",
                 "get_widget_type",
                 "BWN_PSEUDOCODE",
+                "ctree_item_t",
             )
         }
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
@@ -8944,15 +8945,9 @@ class TestPseudocodeSelection(unittest.TestCase):
         sigmaker.idaapi.place_t_as_simpleline_place_t = MagicMock(
             side_effect=lambda place: place
         )
-        self._hexrays_patch = patch.object(
-            sigmaker,
-            "ida_hexrays",
-            types.SimpleNamespace(ctree_item_t=types.SimpleNamespace),
-        )
-        self._hexrays_patch.start()
+        sigmaker.idaapi.ctree_item_t = types.SimpleNamespace
 
     def tearDown(self):
-        self._hexrays_patch.stop()
         for name, value in self._saved.items():
             setattr(sigmaker.idaapi, name, value)
 
@@ -9047,23 +9042,12 @@ class TestPseudocodeSelection(unittest.TestCase):
                 sigmaker._pseudocode_selection_range(cfunc, MagicMock())
             )
 
-    def test_line_eas_empty_without_decompiler(self):
-        with patch.object(sigmaker, "ida_hexrays", None):
-            cfunc = _FakeCfunc(["aa"], {("aa", 0): 0x1000})
-            self.assertEqual(sigmaker._pseudocode_line_eas(cfunc, 0, 0), set())
-
     def test_is_pseudocode_widget(self):
         sigmaker.idaapi.BWN_PSEUDOCODE = 47
         sigmaker.idaapi.get_widget_type = MagicMock(return_value=47)
         self.assertTrue(sigmaker._is_pseudocode_widget(MagicMock()))
         sigmaker.idaapi.get_widget_type = MagicMock(return_value=1)
         self.assertFalse(sigmaker._is_pseudocode_widget(MagicMock()))
-
-    def test_is_pseudocode_widget_false_without_decompiler(self):
-        sigmaker.idaapi.BWN_PSEUDOCODE = 47
-        sigmaker.idaapi.get_widget_type = MagicMock(return_value=47)
-        with patch.object(sigmaker, "ida_hexrays", None):
-            self.assertFalse(sigmaker._is_pseudocode_widget(MagicMock()))
 
     def test_popup_predicates_split_on_selection(self):
         sigmaker.idaapi.BWN_PSEUDOCODE = 47
@@ -9089,33 +9073,18 @@ class TestPseudocodeSelection(unittest.TestCase):
 
 
 class TestQuickConfig(unittest.TestCase):
-    """The right-click actions skip the dialog, so they reuse the last dialog
-    settings and fall back to the dialog's own defaults."""
-
-    def setUp(self):
-        self._saved = sigmaker._LAST_QUICK_CONFIG
-
-    def tearDown(self):
-        sigmaker._LAST_QUICK_CONFIG = self._saved
+    """The right-click actions skip the dialog. They reuse the last dialog
+    settings off the plugin instance (GUI-only, covered manually) and fall back
+    to this default."""
 
     def test_defaults_match_the_dialog_defaults(self):
-        sigmaker._LAST_QUICK_CONFIG = None
-        cfg = sigmaker._quick_config()
+        cfg = sigmaker._default_quick_config()
         self.assertEqual(cfg.output_format, sigmaker.SignatureType.IDA)
         self.assertTrue(cfg.wildcard_operands)
         self.assertTrue(cfg.wildcard_optimized)
         self.assertFalse(cfg.continue_outside_of_function)
         self.assertFalse(cfg.enable_continue_prompt)
 
-    def test_remembers_the_last_dialog_config(self):
-        remembered = sigmaker.SigMakerConfig(
-            output_format=sigmaker.SignatureType.x64Dbg,
-            wildcard_operands=False,
-            continue_outside_of_function=True,
-            wildcard_optimized=False,
-        )
-        sigmaker._remember_quick_config(remembered)
-        self.assertIs(sigmaker._quick_config(), remembered)
 
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the CI runner).

@@ -998,6 +998,17 @@ class SigMakerConfig:
     # long as the eventual search is scoped to the same segment. Default off.
     scope_to_segment: bool = False
 
+    @classmethod
+    def quick_defaults(cls) -> "SigMakerConfig":
+        """What the right-click actions use before the dialog has ever run:
+        the dialog's own defaults."""
+        return cls(
+            output_format=SignatureType.IDA,
+            wildcard_operands=True,
+            continue_outside_of_function=False,
+            wildcard_optimized=True,
+        )
+
 
 @dataclasses.dataclass(slots=True, frozen=True, repr=False)
 class Match:
@@ -4805,115 +4816,134 @@ class _FunctionSigProgress:
         )
 
 
-# ---------------------------------------------------------------------------
-# Pseudocode (decompiler) view helpers
-#
-# The pseudocode right-click actions have to map a text selection back to
-# addresses. Hex-Rays hands us one ctree item per (line, column) and every item
-# carries the ea it was generated from. The decompiler reorders code, so a
-# contiguous block of pseudocode lines can cover scattered addresses; we sign
-# the whole [min, max_end) span and print the resolved range so the extra bytes
-# are never a surprise.
-# ---------------------------------------------------------------------------
+class _PseudocodeView:
+    """A decompiler widget together with the cfunc it is displaying.
 
-def _default_quick_config() -> "SigMakerConfig":
-    """Config the dialog-less actions fall back to before the dialog has been
-    opened: the dialog's own defaults."""
-    return SigMakerConfig(
-        output_format=SignatureType.IDA,
-        wildcard_operands=True,
-        continue_outside_of_function=False,
-        wildcard_optimized=True,
-    )
+    The pseudocode right-click actions have to map a text selection back to
+    addresses. Hex-Rays hands us one ctree item per (line, column) and every
+    item carries the ea it was generated from, so a selection resolves to the
+    span of the addresses its items name. The decompiler reorders code, so a
+    contiguous block of pseudocode lines can cover scattered addresses; we sign
+    the whole [min, max_end) span and the caller prints the resolved range so
+    the extra bytes are never a surprise.
 
+    The popup predicates and the widget checks are classmethods because the
+    popup is populated before we know there is a cfunc to work with.
+    """
 
-def _visible_line_width(line: str) -> int:
-    """Width of a pseudocode line in display columns, color tags stripped."""
-    try:
-        return len(idaapi.tag_remove(line))
-    except Exception:
-        return len(line)
+    __slots__ = ("widget", "cfunc")
 
+    def __init__(self, widget, cfunc):
+        self.widget = widget
+        self.cfunc = cfunc
 
-def _simpleline_number(pos) -> typing.Optional[int]:
-    """Line number behind a twinpos_t sitting in a simpleline (text) view."""
-    place = getattr(pos, "at", None)
-    if place is None:
-        return None
-    caster = getattr(idaapi, "place_t_as_simpleline_place_t", None)
-    if caster is not None:
+    # -- widget-level, no cfunc needed ------------------------------------
+
+    @staticmethod
+    def is_pseudocode_widget(widget) -> bool:
+        """True for a decompiler view. A decompiler-less install never has one,
+        so this doubles as the availability check."""
+        return idaapi.get_widget_type(widget) == idaapi.BWN_PSEUDOCODE
+
+    @classmethod
+    def at(cls, widget) -> typing.Optional["_PseudocodeView"]:
+        """Wrap a decompiler widget, or None when there is nothing decompiled."""
+        if widget is None:
+            return None
+        vu = idaapi.get_widget_vdui(widget)
+        if vu is None or vu.cfunc is None:
+            return None
+        return cls(widget, vu.cfunc)
+
+    @classmethod
+    def selected_lines(cls, widget) -> typing.Optional[tuple[int, int]]:
+        """First and last selected line numbers in a text view, or None when
+        the user has not selected anything."""
+        p0, p1 = idaapi.twinpos_t(), idaapi.twinpos_t()
+        if not idaapi.read_selection(widget, p0, p1):
+            return None
+        first, last = cls._line_number(p0), cls._line_number(p1)
+        if first is None or last is None:
+            return None
+        return (first, last) if first <= last else (last, first)
+
+    @classmethod
+    def has_selection(cls, widget) -> bool:
+        return cls.selected_lines(widget) is not None
+
+    @classmethod
+    def selection_popup_predicate(cls, widget, popup=None, ctx=None) -> bool:
+        """Attach the selection action only when there is something selected."""
+        return cls.is_pseudocode_widget(widget) and cls.has_selection(widget)
+
+    @classmethod
+    def function_popup_predicate(cls, widget, popup=None, ctx=None) -> bool:
+        """Attach the whole-function action only when nothing is selected."""
+        return cls.is_pseudocode_widget(widget) and not cls.has_selection(widget)
+
+    # -- selection to addresses -------------------------------------------
+
+    def line_eas(self, first_line: int, last_line: int) -> set[int]:
+        """Addresses every ctree item on the given lines maps back to."""
+        pseudocode = self.cfunc.get_pseudocode()
+        eas: set[int] = set()
+        last = min(last_line, len(pseudocode) - 1)
+        for lineno in range(max(first_line, 0), last + 1):
+            line = pseudocode[lineno].line
+            for x in range(self._visible_line_width(line)):
+                item = idaapi.ctree_item_t()
+                if not self.cfunc.get_line_item(line, x, True, None, item, None):
+                    continue
+                ea = item.get_ea()
+                if ea is not None and ea != idaapi.BADADDR:
+                    eas.add(int(ea))
+        return eas
+
+    def selection_range(self) -> typing.Optional[tuple[int, int]]:
+        """Address range [start, end) covered by the current selection."""
+        lines = self.selected_lines(self.widget)
+        if lines is None:
+            return None
+        eas = self.line_eas(*lines)
+        if not eas:
+            return None
+        start_ea = min(eas)
+        end_ea = int(idc.get_item_end(max(eas)))
+        if end_ea <= start_ea:
+            return None
+        return start_ea, end_ea
+
+    @property
+    def entry_ea(self) -> int:
+        return int(self.cfunc.entry_ea)
+
+    # -- internals ---------------------------------------------------------
+
+    @staticmethod
+    def _visible_line_width(line: str) -> int:
+        """Width of a line in display columns, color tags stripped."""
         try:
-            simpleline = caster(place)
+            return len(idaapi.tag_remove(line))
         except Exception:
-            simpleline = None
-        number = getattr(simpleline, "n", None)
-        if number is not None:
-            return int(number)
-    number = getattr(place, "n", None)
-    return None if number is None else int(number)
+            return len(line)
 
-
-def _selected_pseudocode_lines(viewer) -> typing.Optional[tuple[int, int]]:
-    """First and last selected line numbers in a text view, or None when the
-    user has not selected anything."""
-    p0, p1 = idaapi.twinpos_t(), idaapi.twinpos_t()
-    if not idaapi.read_selection(viewer, p0, p1):
-        return None
-    first, last = _simpleline_number(p0), _simpleline_number(p1)
-    if first is None or last is None:
-        return None
-    return (first, last) if first <= last else (last, first)
-
-
-def _pseudocode_line_eas(cfunc, first_line: int, last_line: int) -> set[int]:
-    """Addresses every ctree item on the given pseudocode lines maps back to."""
-    pseudocode = cfunc.get_pseudocode()
-    eas: set[int] = set()
-    for lineno in range(max(first_line, 0), min(last_line, len(pseudocode) - 1) + 1):
-        line = pseudocode[lineno].line
-        for x in range(_visible_line_width(line)):
-            item = idaapi.ctree_item_t()
-            if not cfunc.get_line_item(line, x, True, None, item, None):
-                continue
-            ea = item.get_ea()
-            if ea is not None and ea != idaapi.BADADDR:
-                eas.add(int(ea))
-    return eas
-
-
-def _pseudocode_selection_range(cfunc, viewer) -> typing.Optional[tuple[int, int]]:
-    """Address range [start, end) covered by the pseudocode selection."""
-    lines = _selected_pseudocode_lines(viewer)
-    if lines is None:
-        return None
-    eas = _pseudocode_line_eas(cfunc, *lines)
-    if not eas:
-        return None
-    start_ea = min(eas)
-    end_ea = int(idc.get_item_end(max(eas)))
-    if end_ea <= start_ea:
-        return None
-    return start_ea, end_ea
-
-
-def _is_pseudocode_widget(widget) -> bool:
-    """True for a decompiler view. A decompiler-less install never has one, so
-    this doubles as the availability check."""
-    return idaapi.get_widget_type(widget) == idaapi.BWN_PSEUDOCODE
-
-
-def _pseudocode_selection_predicate(widget, popup=None, ctx=None) -> bool:
-    """Attach the selection action only when there is something selected."""
-    return _is_pseudocode_widget(widget) and (
-        _selected_pseudocode_lines(widget) is not None
-    )
-
-
-def _pseudocode_function_predicate(widget, popup=None, ctx=None) -> bool:
-    """Attach the whole-function action only when nothing is selected."""
-    return _is_pseudocode_widget(widget) and (
-        _selected_pseudocode_lines(widget) is None
-    )
+    @staticmethod
+    def _line_number(pos) -> typing.Optional[int]:
+        """Line number behind a twinpos_t sitting in a simpleline view."""
+        place = getattr(pos, "at", None)
+        if place is None:
+            return None
+        caster = getattr(idaapi, "place_t_as_simpleline_place_t", None)
+        if caster is not None:
+            try:
+                simpleline = caster(place)
+            except Exception:
+                simpleline = None
+            number = getattr(simpleline, "n", None)
+            if number is not None:
+                return int(number)
+        number = getattr(place, "n", None)
+        return None if number is None else int(number)
 
 
 # no cover: start
@@ -5205,32 +5235,6 @@ Quick Options:
         self.Free()
 
 
-def _pseudocode_vdui(widget):
-    """vdui_t for a decompiler widget, or None when there is not one."""
-    if widget is None:
-        return None
-    return idaapi.get_widget_vdui(widget)
-
-
-@contextlib.contextmanager
-def _plugin_action_scope() -> typing.Iterator[None]:
-    """UI services plus the error handling every plugin action shares."""
-    ui_token = _UI_SERVICES_CTX.set(_ida_ui_services())
-    try:
-        yield
-    except Unexpected as e:
-        idaapi.msg(f"Error: {str(e)}\n")
-    except UserCanceledError:
-        # User cancellation is expected, not an error
-        idaapi.msg("Operation canceled by user\n")
-    except Exception as e:
-        LOGGER.error(
-            "Exception occurred: %s%s%s", e, os.linesep, traceback.format_exc()
-        )
-    finally:
-        _UI_SERVICES_CTX.reset(ui_token)
-
-
 class _ActionHandler(idaapi.action_handler_t):
     """Internal helper bridging IDA UI actions to plugin methods."""
 
@@ -5331,11 +5335,11 @@ class SigMakerPlugin(idaapi.plugin_t):
             # keep these one click away.
             _PopupHook(
                 self.ACTION_PSEUDOCODE_SELECTION_SIG,
-                predicate=_pseudocode_selection_predicate,
+                predicate=_PseudocodeView.selection_popup_predicate,
             ),
             _PopupHook(
                 self.ACTION_PSEUDOCODE_FUNCTION_SIG,
-                predicate=_pseudocode_function_predicate,
+                predicate=_PseudocodeView.function_popup_predicate,
             ),
         )
         return idaapi.PLUGIN_KEEP
@@ -5550,27 +5554,44 @@ class SigMakerPlugin(idaapi.plugin_t):
                 f"(no unique sig within body and no usable xrefs)\n"
             )
 
+    @contextlib.contextmanager
+    def _action_scope(self) -> typing.Iterator[None]:
+        """UI services plus the error handling every plugin action shares."""
+        ui_token = _UI_SERVICES_CTX.set(_ida_ui_services())
+        try:
+            yield
+        except Unexpected as e:
+            idaapi.msg(f"Error: {str(e)}\n")
+        except UserCanceledError:
+            # User cancellation is expected, not an error
+            idaapi.msg("Operation canceled by user\n")
+        except Exception as e:
+            LOGGER.error(
+                "Exception occurred: %s%s%s", e, os.linesep, traceback.format_exc()
+            )
+        finally:
+            _UI_SERVICES_CTX.reset(ui_token)
+
     def _quick_config(self) -> SigMakerConfig:
         """Config for the actions that skip the dialog: whatever the dialog was
         last run with, else its defaults."""
-        return self._last_config or _default_quick_config()
+        return self._last_config or SigMakerConfig.quick_defaults()
 
     def _action_pseudocode_selection_sig(self, ctx=None) -> None:
         """Right-click with a pseudocode selection: signature for exactly the
         bytes those lines cover."""
-        widget = idaapi.get_current_viewer()
-        vu = _pseudocode_vdui(widget)
-        if vu is None or vu.cfunc is None:
+        view = _PseudocodeView.at(idaapi.get_current_viewer())
+        if view is None:
             idaapi.msg("No decompiled function under the cursor.\n")
             return
-        selection = _pseudocode_selection_range(vu.cfunc, widget)
+        selection = view.selection_range()
         if selection is None:
             idaapi.msg("Select one or more pseudocode lines first.\n")
             return
 
         start_ea, end_ea = selection
         config = self._quick_config()
-        with _plugin_action_scope():
+        with self._action_scope():
             # The decompiler reorders code, so print the span we resolved: it
             # can be wider than the lines you highlighted.
             idaapi.msg(
@@ -5591,12 +5612,9 @@ class SigMakerPlugin(idaapi.plugin_t):
     def _action_pseudocode_function_sig(self, ctx=None) -> None:
         """Right-click with no pseudocode selection: shortest unique signature
         inside the function plus the shortest xref signatures into it."""
-        widget = idaapi.get_current_viewer()
-        vu = _pseudocode_vdui(widget)
-        ea = idaapi.get_screen_ea()
-        if vu is not None and vu.cfunc is not None:
-            ea = int(vu.cfunc.entry_ea)
-        with _plugin_action_scope():
+        view = _PseudocodeView.at(idaapi.get_current_viewer())
+        ea = idaapi.get_screen_ea() if view is None else view.entry_ea
+        with self._action_scope():
             self._run_function_and_xref_sigs(ea, self._quick_config())
 
     @staticmethod

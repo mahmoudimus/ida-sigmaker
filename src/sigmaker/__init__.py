@@ -4832,10 +4832,11 @@ class _PseudocodeView:
     popup is populated before we know there is a cfunc to work with.
     """
 
-    #: The TWidget of the decompiler view.
+    #: The decompiler view's TWidget. IDAPython exposes no Python-level name
+    #: for it, so there is nothing more specific to say than "opaque handle".
     widget: typing.Any
-    #: The idaapi.cfunc_t that view is displaying.
-    cfunc: typing.Any
+    #: vdui_t.cfunc is a refcounted proxy, not a bare cfunc_t.
+    cfunc: idaapi.cfuncptr_t
 
     # -- widget-level, no cfunc needed ------------------------------------
 

@@ -8892,6 +8892,270 @@ class TestSearchScope(unittest.TestCase):
         self.assertIsNone(fa.call_args.kwargs.get("scope"))
 
 
+
+class _FakePseudocode(list):
+    """Minimal stand-in for the strvec_t returned by cfunc_t.get_pseudocode()."""
+
+    def __init__(self, lines):
+        super().__init__(types.SimpleNamespace(line=text) for text in lines)
+
+
+class _FakeCfunc:
+    """cfunc_t stub: maps (line text, column) to a ctree item.
+
+    A map value is either the item's ea or an (ea, citype) pair. get_ea() is
+    wired to a decoy: the code under test must read the item's own ea, since
+    get_ea() answers obj_ea for a cot_obj and would report a callee's entry
+    point instead of the call site.
+    """
+
+    DECOY_OBJ_EA = 0xDEAD0000
+
+    def __init__(self, lines, items, entry_ea=0x1000):
+        self._pseudocode = _FakePseudocode(lines)
+        self._items = items
+        self.entry_ea = entry_ea
+
+    def get_pseudocode(self):
+        return self._pseudocode
+
+    def get_line_item(self, line, x, is_ctree_line, phead, item, ptail):
+        spec = self._items.get((line, x))
+        if spec is None:
+            return False
+        ea, citype = spec if isinstance(spec, tuple) else (spec, sigmaker.idaapi.VDI_EXPR)
+        item.citype = citype
+        item.it = types.SimpleNamespace(ea=ea)
+        item.get_ea = lambda: _FakeCfunc.DECOY_OBJ_EA
+        return True
+
+
+def _fake_twinpos(line_number):
+    return types.SimpleNamespace(at=types.SimpleNamespace(n=line_number))
+
+
+class TestPseudocodeSelection(unittest.TestCase):
+    """Pseudocode right-click helpers: resolving a text selection in the
+    decompiler view down to the address range it covers."""
+
+    def setUp(self):
+        self._saved = {
+            name: getattr(sigmaker.idaapi, name, None)
+            for name in (
+                "twinpos_t",
+                "read_selection",
+                "place_t_as_simpleline_place_t",
+                "tag_remove",
+                "BADADDR",
+                "get_widget_type",
+                "BWN_PSEUDOCODE",
+                "ctree_item_t",
+                "get_widget_vdui",
+                "VDI_EXPR",
+                "get_func",
+                "func_contains",
+            )
+        }
+        sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
+        sigmaker.idaapi.tag_remove = lambda line: line
+        sigmaker.idaapi.place_t_as_simpleline_place_t = MagicMock(
+            side_effect=lambda place: place
+        )
+        sigmaker.idaapi.ctree_item_t = types.SimpleNamespace
+        sigmaker.idaapi.VDI_EXPR = 1
+        sigmaker.idaapi.get_func = MagicMock(return_value=MagicMock())
+        sigmaker.idaapi.func_contains = MagicMock(return_value=True)
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            setattr(sigmaker.idaapi, name, value)
+
+    def _view(self, cfunc, widget=None):
+        return sigmaker._PseudocodeView(widget or MagicMock(), cfunc)
+
+    def _select(self, first, last):
+        sigmaker.idaapi.twinpos_t = MagicMock(
+            side_effect=[_fake_twinpos(first), _fake_twinpos(last)]
+        )
+        sigmaker.idaapi.read_selection = MagicMock(return_value=True)
+
+    def test_no_selection_returns_none(self):
+        sigmaker.idaapi.twinpos_t = MagicMock(
+            side_effect=[_fake_twinpos(1), _fake_twinpos(3)]
+        )
+        sigmaker.idaapi.read_selection = MagicMock(return_value=False)
+        self.assertIsNone(sigmaker._PseudocodeView.selected_lines(MagicMock()))
+
+    def test_selected_lines_read_from_simpleline_places(self):
+        self._select(2, 5)
+        self.assertEqual(sigmaker._PseudocodeView.selected_lines(MagicMock()), (2, 5))
+
+    def test_reversed_selection_is_normalized(self):
+        self._select(7, 3)
+        self.assertEqual(sigmaker._PseudocodeView.selected_lines(MagicMock()), (3, 7))
+
+    def test_selected_lines_none_for_a_non_simpleline_place(self):
+        # The cast answers None for a place that is not a simpleline place.
+        sigmaker.idaapi.place_t_as_simpleline_place_t = MagicMock(return_value=None)
+        self._select(4, 4)
+        self.assertIsNone(sigmaker._PseudocodeView.selected_lines(MagicMock()))
+
+    def test_selected_lines_none_when_place_missing(self):
+        sigmaker.idaapi.twinpos_t = MagicMock(
+            side_effect=[
+                types.SimpleNamespace(at=None),
+                types.SimpleNamespace(at=None),
+            ]
+        )
+        sigmaker.idaapi.read_selection = MagicMock(return_value=True)
+        self.assertIsNone(sigmaker._PseudocodeView.selected_lines(MagicMock()))
+
+    def test_line_eas_collects_every_column(self):
+        cfunc = _FakeCfunc(
+            ["aa", "bb", "cc"],
+            {("aa", 0): 0x1000, ("bb", 1): 0x1010, ("cc", 0): 0x1020},
+        )
+        self.assertEqual(
+            self._view(cfunc).line_eas(0, 1), {0x1000, 0x1010}
+        )
+
+    def test_line_eas_ignores_the_object_ea_of_a_name(self):
+        # Regression: a callee name is a cot_obj, so get_ea() answers the
+        # callee's entry point. Two such names on the selected lines used to
+        # resolve to the range between two unrelated functions.
+        cfunc = _FakeCfunc(["aa"], {("aa", 0): 0x1004, ("aa", 1): 0x1008})
+        self.assertEqual(self._view(cfunc).line_eas(0, 0), {0x1004, 0x1008})
+
+    def test_line_eas_drops_items_outside_the_decompiled_function(self):
+        sigmaker.idaapi.func_contains = MagicMock(
+            side_effect=lambda pfn, ea: ea < 0x2000
+        )
+        cfunc = _FakeCfunc(["aa"], {("aa", 0): 0x1004, ("aa", 1): 0x9000})
+        self.assertEqual(self._view(cfunc).line_eas(0, 0), {0x1004})
+
+    def test_line_eas_skips_non_expression_items(self):
+        cfunc = _FakeCfunc(
+            ["aa"], {("aa", 0): (0x1004, 2), ("aa", 1): 0x1008}
+        )
+        self.assertEqual(self._view(cfunc).line_eas(0, 0), {0x1008})
+
+    def test_line_eas_skips_badaddr_items(self):
+        cfunc = _FakeCfunc(
+            ["aa"], {("aa", 0): sigmaker.idaapi.BADADDR, ("aa", 1): 0x2000}
+        )
+        self.assertEqual(self._view(cfunc).line_eas(0, 0), {0x2000})
+
+    def test_line_eas_clamps_to_available_lines(self):
+        cfunc = _FakeCfunc(["aa"], {("aa", 0): 0x1000})
+        self.assertEqual(self._view(cfunc).line_eas(0, 99), {0x1000})
+
+    def test_selection_range_spans_min_ea_to_end_of_last_item(self):
+        self._select(0, 1)
+        cfunc = _FakeCfunc(["aa", "bb"], {("aa", 0): 0x1010, ("bb", 0): 0x1000})
+        with patch.object(
+            sigmaker.idc, "get_item_end", MagicMock(return_value=0x1014)
+        ) as get_item_end:
+            self.assertEqual(
+                self._view(cfunc).selection_range(),
+                (0x1000, 0x1014),
+            )
+        get_item_end.assert_called_once_with(0x1010)
+
+    def test_selection_range_none_without_selection(self):
+        sigmaker.idaapi.twinpos_t = MagicMock(
+            side_effect=[_fake_twinpos(0), _fake_twinpos(0)]
+        )
+        sigmaker.idaapi.read_selection = MagicMock(return_value=False)
+        cfunc = _FakeCfunc(["aa"], {("aa", 0): 0x1000})
+        self.assertIsNone(self._view(cfunc).selection_range())
+
+    def test_selection_range_none_when_no_item_has_an_address(self):
+        self._select(0, 0)
+        cfunc = _FakeCfunc(["aa"], {})
+        self.assertIsNone(self._view(cfunc).selection_range())
+
+    def test_selection_range_none_when_end_not_after_start(self):
+        self._select(0, 0)
+        cfunc = _FakeCfunc(["aa"], {("aa", 0): 0x1000})
+        with patch.object(
+            sigmaker.idc, "get_item_end", MagicMock(return_value=0x1000)
+        ):
+            self.assertIsNone(
+                self._view(cfunc).selection_range()
+            )
+
+    def test_at_returns_none_without_a_widget_or_cfunc(self):
+        self.assertIsNone(sigmaker._PseudocodeView.at(None))
+        sigmaker.idaapi.get_widget_vdui = MagicMock(return_value=None)
+        self.assertIsNone(sigmaker._PseudocodeView.at(MagicMock()))
+        sigmaker.idaapi.get_widget_vdui = MagicMock(
+            return_value=types.SimpleNamespace(cfunc=None)
+        )
+        self.assertIsNone(sigmaker._PseudocodeView.at(MagicMock()))
+
+    def test_at_wraps_the_widget_and_its_cfunc(self):
+        cfunc = _FakeCfunc(["aa"], {})
+        widget = MagicMock()
+        sigmaker.idaapi.get_widget_vdui = MagicMock(
+            return_value=types.SimpleNamespace(cfunc=cfunc)
+        )
+        view = sigmaker._PseudocodeView.at(widget)
+        self.assertIs(view.widget, widget)
+        self.assertIs(view.cfunc, cfunc)
+
+    def test_entry_ea_comes_from_the_cfunc(self):
+        cfunc = _FakeCfunc(["aa"], {})
+        cfunc.entry_ea = 0x1400
+        self.assertEqual(self._view(cfunc).entry_ea, 0x1400)
+
+    def test_visible_line_width_strips_color_tags(self):
+        sigmaker.idaapi.tag_remove = MagicMock(return_value="abc")
+        self.assertEqual(sigmaker._PseudocodeView._visible_line_width("\x01abc\x02"), 3)
+
+    def test_is_pseudocode_widget(self):
+        sigmaker.idaapi.BWN_PSEUDOCODE = 47
+        sigmaker.idaapi.get_widget_type = MagicMock(return_value=47)
+        self.assertTrue(sigmaker._PseudocodeView.is_pseudocode_widget(MagicMock()))
+        sigmaker.idaapi.get_widget_type = MagicMock(return_value=1)
+        self.assertFalse(sigmaker._PseudocodeView.is_pseudocode_widget(MagicMock()))
+
+    def test_popup_predicates_split_on_selection(self):
+        sigmaker.idaapi.BWN_PSEUDOCODE = 47
+        sigmaker.idaapi.get_widget_type = MagicMock(return_value=47)
+        self._select(0, 1)
+        self.assertTrue(
+            sigmaker._PseudocodeView.selection_popup_predicate(MagicMock(), None, None)
+        )
+        self._select(0, 1)
+        self.assertFalse(
+            sigmaker._PseudocodeView.function_popup_predicate(MagicMock(), None, None)
+        )
+        sigmaker.idaapi.twinpos_t = MagicMock(
+            side_effect=[_fake_twinpos(0) for _ in range(4)]
+        )
+        sigmaker.idaapi.read_selection = MagicMock(return_value=False)
+        self.assertFalse(
+            sigmaker._PseudocodeView.selection_popup_predicate(MagicMock(), None, None)
+        )
+        self.assertTrue(
+            sigmaker._PseudocodeView.function_popup_predicate(MagicMock(), None, None)
+        )
+
+
+class TestQuickConfig(unittest.TestCase):
+    """The right-click actions skip the dialog. They reuse the last dialog
+    settings off the plugin instance (GUI-only, covered manually) and fall back
+    to this default."""
+
+    def test_quick_defaults_match_the_dialog_defaults(self):
+        cfg = sigmaker.SigMakerConfig.quick_defaults()
+        self.assertEqual(cfg.output_format, sigmaker.SignatureType.IDA)
+        self.assertTrue(cfg.wildcard_operands)
+        self.assertTrue(cfg.wildcard_optimized)
+        self.assertFalse(cfg.continue_outside_of_function)
+        self.assertFalse(cfg.enable_continue_prompt)
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the CI runner).
     unittest.main(verbosity=2)

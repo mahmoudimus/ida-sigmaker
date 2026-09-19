@@ -4,6 +4,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+## [1.15.0] - 2026-09-19
+
 ### Added
 
 - **Right-click actions in the pseudocode view.** With one or more decompiler lines selected, "SigMaker: signature for selection" builds a signature over exactly the bytes those lines cover and reports whether it is unique. With nothing selected, "SigMaker: xref + shortest unique signature for function" prints both the shortest unique signature inside the function body and the shortest xref signatures into it. Both actions skip the dialog and reuse whatever settings you last picked in it, defaulting to the dialog's own defaults (IDA format, wildcard operands, wildcard optimized). Installs without the decompiler are unaffected: the actions never attach.
@@ -58,7 +60,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 - **PyPI builds now run only for published releases.** Ordinary successful tests on `main` no longer launch an untagged wheel build, and the HCLI manifest version and exact PyPI dependency pin are synchronized from `sigmaker.__version__` during release preparation.
 
-[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.3...HEAD
+[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.15.0...HEAD
+[1.15.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.3...v1.15.0
 [1.14.3]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.2...v1.14.3
 [1.14.2]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.1...v1.14.2
 [1.14.1]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.0...v1.14.1

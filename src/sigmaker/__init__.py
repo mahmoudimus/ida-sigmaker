@@ -4885,7 +4885,8 @@ class _PseudocodeView:
     # -- selection to addresses -------------------------------------------
 
     def line_eas(self, first_line: int, last_line: int) -> set[int]:
-        """Addresses every ctree item on the given lines maps back to."""
+        """Addresses the ctree items on the given lines were generated from."""
+        pfn = idaapi.get_func(self.entry_ea)
         pseudocode = self.cfunc.get_pseudocode()
         eas: set[int] = set()
         last = min(last_line, len(pseudocode) - 1)
@@ -4895,10 +4896,29 @@ class _PseudocodeView:
                 item = idaapi.ctree_item_t()
                 if not self.cfunc.get_line_item(line, x, True, None, item, None):
                     continue
-                ea = item.get_ea()
-                if ea is not None and ea != idaapi.BADADDR:
-                    eas.add(int(ea))
+                ea = self._item_ea(item)
+                if ea is None:
+                    continue
+                if pfn is not None and not idaapi.func_contains(pfn, ea):
+                    continue
+                eas.add(ea)
         return eas
+
+    @staticmethod
+    def _item_ea(item) -> typing.Optional[int]:
+        """The address a ctree item was generated from, or None.
+
+        Deliberately not ctree_item_t.get_ea(): that answers obj_ea for a
+        cot_obj, so the callee name in `sub_X(...)` reports the callee's entry
+        point rather than the call site, and a selection spanning two calls
+        resolves to the range between two unrelated functions. The item's own
+        ea is the instruction it came from. The caller clamps to the
+        decompiled function as a second line of defense.
+        """
+        if item.citype != idaapi.VDI_EXPR:
+            return None
+        ea = item.it.ea
+        return None if ea == idaapi.BADADDR else int(ea)
 
     def selection_range(self) -> typing.Optional[tuple[int, int]]:
         """Address range [start, end) covered by the current selection."""

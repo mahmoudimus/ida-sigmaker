@@ -8901,20 +8901,32 @@ class _FakePseudocode(list):
 
 
 class _FakeCfunc:
-    """cfunc_t stub: maps (line text, column) to the ea of the ctree item."""
+    """cfunc_t stub: maps (line text, column) to a ctree item.
 
-    def __init__(self, lines, items):
+    A map value is either the item's ea or an (ea, citype) pair. get_ea() is
+    wired to a decoy: the code under test must read the item's own ea, since
+    get_ea() answers obj_ea for a cot_obj and would report a callee's entry
+    point instead of the call site.
+    """
+
+    DECOY_OBJ_EA = 0xDEAD0000
+
+    def __init__(self, lines, items, entry_ea=0x1000):
         self._pseudocode = _FakePseudocode(lines)
         self._items = items
+        self.entry_ea = entry_ea
 
     def get_pseudocode(self):
         return self._pseudocode
 
     def get_line_item(self, line, x, is_ctree_line, phead, item, ptail):
-        ea = self._items.get((line, x))
-        if ea is None:
+        spec = self._items.get((line, x))
+        if spec is None:
             return False
-        item.get_ea = lambda ea=ea: ea
+        ea, citype = spec if isinstance(spec, tuple) else (spec, sigmaker.idaapi.VDI_EXPR)
+        item.citype = citype
+        item.it = types.SimpleNamespace(ea=ea)
+        item.get_ea = lambda: _FakeCfunc.DECOY_OBJ_EA
         return True
 
 
@@ -8939,6 +8951,9 @@ class TestPseudocodeSelection(unittest.TestCase):
                 "BWN_PSEUDOCODE",
                 "ctree_item_t",
                 "get_widget_vdui",
+                "VDI_EXPR",
+                "get_func",
+                "func_contains",
             )
         }
         sigmaker.idaapi.BADADDR = 0xFFFFFFFFFFFFFFFF
@@ -8947,6 +8962,9 @@ class TestPseudocodeSelection(unittest.TestCase):
             side_effect=lambda place: place
         )
         sigmaker.idaapi.ctree_item_t = types.SimpleNamespace
+        sigmaker.idaapi.VDI_EXPR = 1
+        sigmaker.idaapi.get_func = MagicMock(return_value=MagicMock())
+        sigmaker.idaapi.func_contains = MagicMock(return_value=True)
 
     def tearDown(self):
         for name, value in self._saved.items():
@@ -9000,6 +9018,26 @@ class TestPseudocodeSelection(unittest.TestCase):
         self.assertEqual(
             self._view(cfunc).line_eas(0, 1), {0x1000, 0x1010}
         )
+
+    def test_line_eas_ignores_the_object_ea_of_a_name(self):
+        # Regression: a callee name is a cot_obj, so get_ea() answers the
+        # callee's entry point. Two such names on the selected lines used to
+        # resolve to the range between two unrelated functions.
+        cfunc = _FakeCfunc(["aa"], {("aa", 0): 0x1004, ("aa", 1): 0x1008})
+        self.assertEqual(self._view(cfunc).line_eas(0, 0), {0x1004, 0x1008})
+
+    def test_line_eas_drops_items_outside_the_decompiled_function(self):
+        sigmaker.idaapi.func_contains = MagicMock(
+            side_effect=lambda pfn, ea: ea < 0x2000
+        )
+        cfunc = _FakeCfunc(["aa"], {("aa", 0): 0x1004, ("aa", 1): 0x9000})
+        self.assertEqual(self._view(cfunc).line_eas(0, 0), {0x1004})
+
+    def test_line_eas_skips_non_expression_items(self):
+        cfunc = _FakeCfunc(
+            ["aa"], {("aa", 0): (0x1004, 2), ("aa", 1): 0x1008}
+        )
+        self.assertEqual(self._view(cfunc).line_eas(0, 0), {0x1008})
 
     def test_line_eas_skips_badaddr_items(self):
         cfunc = _FakeCfunc(

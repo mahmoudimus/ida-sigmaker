@@ -4,7 +4,7 @@
     "plugin": {
         "name": "SigMaker",
         "entryPoint": "src/sigmaker/__init__.py",
-        "version": "1.15.0",
+        "version": "1.15.1",
         "idaVersions": [
             "9.0",
             "9.0sp1",
@@ -38,7 +38,7 @@
         "license": "MIT",
         "logoPath": "assets/sigmaker-logo.png",
         "pythonDependencies": [
-            "sigmaker==1.15.0"
+            "sigmaker==1.15.1"
         ],
         "urls": {
             "repository": "https://github.com/mahmoudimus/ida-sigmaker",

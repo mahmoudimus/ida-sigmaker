@@ -4,6 +4,10 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+### Fixed
+
+- **`hcli plugin install SigMaker` works on IDA 9.5.** The plugin manifest's `idaVersions` list skipped 9.5, so hcli refused to resolve any SigMaker version for it. 9.5 is now declared alongside 9.0 through 9.4 and 10.0.
+
 ## [1.15.0] - 2026-09-19
 
 ### Added

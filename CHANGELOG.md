@@ -4,6 +4,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+## [1.15.1] - 2026-10-28
+
 ### Fixed
 
 - **`hcli plugin install SigMaker` works on IDA 9.5.** The plugin manifest's `idaVersions` list skipped 9.5, so hcli refused to resolve any SigMaker version for it. 9.5 is now declared alongside 9.0 through 9.4 and 10.0.
@@ -64,7 +66,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 - **PyPI builds now run only for published releases.** Ordinary successful tests on `main` no longer launch an untagged wheel build, and the HCLI manifest version and exact PyPI dependency pin are synchronized from `sigmaker.__version__` during release preparation.
 
-[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.15.0...HEAD
+[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.15.1...HEAD
+[1.15.1]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.15.0...v1.15.1
 [1.15.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.3...v1.15.0
 [1.14.3]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.2...v1.14.3
 [1.14.2]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.1...v1.14.2

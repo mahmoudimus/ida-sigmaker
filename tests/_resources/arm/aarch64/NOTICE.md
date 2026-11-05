@@ -21,3 +21,23 @@ Fixture SHA-256:
 ```text
 3be9e894133f07070f9fd8dda5da8874d990315176ba9de4ad030010067dabad
 ```
+
+## AArch64 Struct-Offset Fixture
+
+`aarch64_struct_offsets.o` is built from the adjacent
+`aarch64_struct_offsets.s`. It reproduces the latest-build instructions from
+issue #97 (struct member offsets in `MOV`/`LDR`, an SP-based and a non-SP `STP`)
+to exercise the opt-in AArch64 field wildcards. Built with Apple Clang 21.0.0
+(`clang-2100.1.1.101`):
+
+```text
+clang -target aarch64-none-elf -c \
+    tests/_resources/arm/aarch64/aarch64_struct_offsets.s \
+    -o tests/_resources/arm/aarch64/aarch64_struct_offsets.o
+```
+
+Fixture SHA-256:
+
+```text
+4417d846189836c525ef541701e8f92ef995c2c436cee9eada87c2792f9d00b5
+```

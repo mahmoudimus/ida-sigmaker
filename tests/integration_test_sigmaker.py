@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 import os
@@ -1043,6 +1044,66 @@ class TestAArch64RelocationFixture(OperandFixtureIntegrationTest):
                 f"{self._signature_for_instruction(ea, instruction):ida}",
                 expected_signature,
             )
+
+
+class TestAArch64StructOffsetFixture(OperandFixtureIntegrationTest):
+    """Issue #97: opt-in AArch64 struct-offset and register-field wildcards."""
+
+    _fixture_parts = ("arm", "aarch64", "aarch64_struct_offsets.o")
+    # (offset, bytes, mnemonic, default, struct-only, registers-only, both)
+    _instructions = (
+        (0x00, "03 80 8A D2", "MOV", "03 80 8A D2", "? ? ? D2", "? 80 8A D2", "? ? ? D2"),
+        (0x04, "18 00 03 8B", "ADD", "18 00 03 8B", "18 00 03 8B", "? ? ? 8B", "? ? ? 8B"),
+        (0x08, "13 4B 40 B9", "LDR", "13 4B 40 B9", "13 ? ? B9", "? ? 40 B9", "? ? ? B9"),
+        (0x0C, "7F 06 00 31", "CMN", "7F 06 00 31", "7F 06 00 31", "? ? 00 31", "? ? 00 31"),
+        (0x10, "1A 30 6A F9", "LDR", "1A 30 6A F9", "1A ? ? F9", "? ? 6A F9", "? ? ? F9"),
+        (0x14, "F3 53 01 A9", "STP", "F3 53 01 A9", "F3 53 01 A9", "? ? 01 A9", "? ? 01 A9"),
+        (0x18, "15 5B 02 A9", "STP", "15 5B 02 A9", "15 ? ? A9", "? ? 02 A9", "? ? ? A9"),
+        (0x1C, "F4 03 01 2A", "MOV", "F4 03 01 2A", "F4 03 01 2A", "? ? ? 2A", "? ? ? 2A"),
+        (0x20, "C0 03 5F D6", "RET", "C0 03 5F D6", "C0 03 5F D6", "C0 03 5F D6", "C0 03 5F D6"),
+    )
+
+    def _signatures(self, struct_offsets, register_fields):
+        policy = dataclasses.replace(
+            sigmaker.WildcardPolicy.for_arm(),
+            aarch64_struct_offsets=struct_offsets,
+            aarch64_register_fields=register_fields,
+        )
+        base = idc.get_name_ea_simple("sigmaker_aarch64_struct_offsets")
+        self.assertNotEqual(base, idaapi.BADADDR)
+        out = []
+        with sigmaker.WildcardPolicy.use(policy):
+            for offset, raw, mnemonic, *_ in self._instructions:
+                ea = base + offset
+                instruction = self._decode_instruction(
+                    ea, bytes.fromhex(raw), mnemonic
+                )
+                out.append(f"{self._signature_for_instruction(ea, instruction):ida}")
+        return out
+
+    def test_database_is_aarch64(self):
+        self.assertEqual(idaapi.ph_get_id(), idaapi.PLFM_ARM)
+        self.assertTrue(idaapi.inf_is_64bit())
+
+    def test_default_policy_is_unchanged(self):
+        self.assertEqual(
+            self._signatures(False, False), [row[3] for row in self._instructions]
+        )
+
+    def test_struct_offsets_only(self):
+        self.assertEqual(
+            self._signatures(True, False), [row[4] for row in self._instructions]
+        )
+
+    def test_register_fields_only(self):
+        self.assertEqual(
+            self._signatures(False, True), [row[5] for row in self._instructions]
+        )
+
+    def test_both_flags(self):
+        self.assertEqual(
+            self._signatures(True, True), [row[6] for row in self._instructions]
+        )
 
 
 class TestMipsHi16Lo16Fixture(OperandFixtureIntegrationTest):

@@ -5159,6 +5159,7 @@ class ConfigureOperandWildcardBitmaskForm(idaapi.Form):
     """Interactive form to configure wildcardable operands using checkboxes."""
 
     def __init__(self) -> None:
+        self._has_aarch64_fields = False
         F = idaapi.Form
         # Define the form layout
         form_text = """BUTTON YES* OK
@@ -5222,6 +5223,14 @@ Select operand types that should be wildcarded:
             registers.extend(
                 ["opt8", "opt9", "opt10", "opt11", "opt12", "opt13", "opt14"]
             )
+            if idaapi.inf_is_64bit():
+                # Issue #97. No '#' inside form text: IDA uses it for hints.
+                form_text += """
+
+AArch64 field wildcards (opt-in, issue 97):
+<#Wildcard only the bytes holding MOV/MOVK immediates and non-SP LDR/STR/LDP/STP offsets. Small MOV literals are masked too.#Struct offsets:{a64Offsets}>
+<#Wildcard only the bytes holding register fields. Use instead of General Register for tighter patterns.#Register fields:{a64Registers}>{cAArch64Fields}>"""
+                self._has_aarch64_fields = True
         elif proc_arch == idaapi.PLFM_PPC:
             form_text += """
 <Special purpose register :{opt8}>
@@ -5244,14 +5253,36 @@ Select operand types that should be wildcarded:
                 value=options,
             ),
         }
+        if self._has_aarch64_fields:
+            current = WildcardPolicy.current()
+            controls["cAArch64Fields"] = F.ChkGroupControl(
+                ("a64Offsets", "a64Registers"),
+                value=int(current.aarch64_struct_offsets)
+                | (int(current.aarch64_register_fields) << 1),
+            )
         super().__init__(form_text, controls)
 
     def OnFormChange(self, fid: int) -> int:
         """Callback invoked when the form state changes."""
+        current = WildcardPolicy.current()
         if fid == self.cWildcardableOperands.id:  # type: ignore
             # re-shift b/c we skipped o_void
             mask = self.GetControlValue(self.cWildcardableOperands) << 1  # type: ignore
-            WildcardPolicy.set_current(WildcardPolicy.from_mask(mask))
+            WildcardPolicy.set_current(
+                dataclasses.replace(
+                    current,
+                    allowed_types=WildcardPolicy.from_mask(mask).allowed_types,
+                )
+            )
+        elif self._has_aarch64_fields and fid == self.cAArch64Fields.id:  # type: ignore
+            bits = self.GetControlValue(self.cAArch64Fields)  # type: ignore
+            WildcardPolicy.set_current(
+                dataclasses.replace(
+                    current,
+                    aarch64_struct_offsets=bool(bits & 1),
+                    aarch64_register_fields=bool(bits & 2),
+                )
+            )
         return 1
 
 

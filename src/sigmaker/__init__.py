@@ -1937,6 +1937,59 @@ _NON_ARM_OPERAND_EVALUATOR = _OperandWildcardEvaluator(
     _NON_ARM_FALLBACK_RULES,
 )
 
+_AARCH64_SP = 31
+
+
+def _bit_field_bytes(lo_bit: int, hi_bit: int) -> tuple[int, int]:
+    """Return the (offset, length) byte span covering bits lo_bit..hi_bit."""
+    return lo_bit // 8, hi_bit // 8 - lo_bit // 8 + 1
+
+
+def _hull_byte_ranges(
+    a: typing.Optional[tuple[int, int]],
+    b: typing.Optional[tuple[int, int]],
+) -> typing.Optional[tuple[int, int]]:
+    """Return the smallest (offset, length) range covering both ranges."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    lo = min(a[0], b[0])
+    hi = max(a[0] + a[1], b[0] + b[1])
+    return lo, hi - lo
+
+
+def _aarch64_field_range(
+    word: int, *, struct_offsets: bool, register_fields: bool
+) -> typing.Optional[tuple[int, int]]:
+    """Byte range holding the selected fields of one AArch64 instruction.
+
+    Issue #97. Struct offsets are move-wide immediates and non-SP load/store
+    displacements; register fields are Rd/Rt/Rn/Rm/Rt2. Branches, returns and
+    unlisted encodings return None and keep the existing operand rules.
+    """
+    rn = (word >> 5) & 0x1F
+    if word & 0x1F800000 == 0x12800000:  # MOVN / MOVZ / MOVK
+        offsets, registers = _bit_field_bytes(5, 20), _bit_field_bytes(0, 4)
+    elif word & 0x3B000000 == 0x39000000:  # LDR/STR (unsigned immediate)
+        offsets = None if rn == _AARCH64_SP else _bit_field_bytes(10, 21)
+        registers = _bit_field_bytes(0, 9)
+    elif word & 0x3A000000 == 0x28000000:  # LDP/STP (all addressing forms)
+        offsets = None if rn == _AARCH64_SP else _bit_field_bytes(15, 21)
+        registers = _bit_field_bytes(0, 14)
+    elif word & 0x1F000000 == 0x11000000:  # ADD/SUB (immediate), incl. CMN/CMP
+        offsets, registers = None, _bit_field_bytes(0, 9)
+    elif word & 0x1F000000 in (0x0A000000, 0x0B000000):  # shifted register
+        offsets, registers = None, _bit_field_bytes(0, 20)
+    else:
+        return None
+    selected = None
+    if struct_offsets:
+        selected = _hull_byte_ranges(selected, offsets)
+    if register_fields:
+        selected = _hull_byte_ranges(selected, registers)
+    return selected
+
 
 class OperandProcessor:
     """Select byte ranges according to the current operand wildcard policy."""

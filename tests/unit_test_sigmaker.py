@@ -9156,6 +9156,93 @@ class TestQuickConfig(unittest.TestCase):
         self.assertFalse(cfg.enable_continue_prompt)
 
 
+class TestAArch64FieldRange(unittest.TestCase):
+    """Issue #97: byte ranges of AArch64 offset and register fields.
+
+    Words are little-endian instruction encodings produced by clang
+    (aarch64-none-elf); bytes in comments are file order.
+    """
+
+    # (word, disassembly, struct-only, registers-only, both)
+    CASES = (
+        (0xD28A8003, "mov x3, #0x5400", (0, 3), (0, 1), (0, 3)),
+        (0x8B030018, "add x24, x0, x3", None, (0, 3), (0, 3)),
+        (0xB9404B13, "ldr w19, [x24, #0x48]", (1, 2), (0, 2), (0, 3)),
+        (0x3100067F, "cmn w19, #1", None, (0, 2), (0, 2)),
+        (0xF96A301A, "ldr x26, [x0, #0x5460]", (1, 2), (0, 2), (0, 3)),
+        (0xA90153F3, "stp x19, x20, [sp, #0x10]", None, (0, 2), (0, 2)),
+        (0xA9025B15, "stp x21, x22, [x24, #0x20]", (1, 2), (0, 2), (0, 3)),
+        (0x2A0103F4, "mov w20, w1", None, (0, 3), (0, 3)),
+        (0xF94007E0, "ldr x0, [sp, #8]", None, (0, 2), (0, 2)),
+        (0xA9B67BFD, "stp x29, x30, [sp, #-0xa0]!", None, (0, 2), (0, 2)),
+        (0xF2A24691, "movk x17, #0x1234, lsl #16", (0, 3), (0, 1), (0, 3)),
+        (0x528000E1, "mov w1, #7", (0, 3), (0, 1), (0, 3)),
+        (0x3940C022, "ldrb w2, [x1, #0x30]", (1, 2), (0, 2), (0, 3)),
+    )
+    UNCLASSIFIED = (
+        (0xD65F03C0, "ret"),
+        (0x540001E0, "b.eq #0x3c"),
+        (0x14000004, "b #0x10"),
+        (0x34001483, "cbz w3, ..."),
+    )
+
+    def test_struct_offsets_only(self):
+        for word, text, expected, _, _ in self.CASES:
+            with self.subTest(text):
+                self.assertEqual(
+                    sigmaker._aarch64_field_range(
+                        word, struct_offsets=True, register_fields=False
+                    ),
+                    expected,
+                )
+
+    def test_register_fields_only(self):
+        for word, text, _, expected, _ in self.CASES:
+            with self.subTest(text):
+                self.assertEqual(
+                    sigmaker._aarch64_field_range(
+                        word, struct_offsets=False, register_fields=True
+                    ),
+                    expected,
+                )
+
+    def test_both_flags_take_the_hull(self):
+        for word, text, _, _, expected in self.CASES:
+            with self.subTest(text):
+                self.assertEqual(
+                    sigmaker._aarch64_field_range(
+                        word, struct_offsets=True, register_fields=True
+                    ),
+                    expected,
+                )
+
+    def test_no_flags_selects_nothing(self):
+        for word, text, *_ in self.CASES:
+            with self.subTest(text):
+                self.assertIsNone(
+                    sigmaker._aarch64_field_range(
+                        word, struct_offsets=False, register_fields=False
+                    )
+                )
+
+    def test_branches_and_returns_are_left_to_existing_rules(self):
+        for word, text in self.UNCLASSIFIED:
+            with self.subTest(text):
+                self.assertIsNone(
+                    sigmaker._aarch64_field_range(
+                        word, struct_offsets=True, register_fields=True
+                    )
+                )
+
+    def test_hull_byte_ranges(self):
+        hull = sigmaker._hull_byte_ranges
+        self.assertIsNone(hull(None, None))
+        self.assertEqual(hull((1, 2), None), (1, 2))
+        self.assertEqual(hull(None, (0, 1)), (0, 1))
+        self.assertEqual(hull((1, 2), (0, 1)), (0, 3))
+        self.assertEqual(hull((0, 4), (1, 2)), (0, 4))
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the CI runner).
     unittest.main(verbosity=2)

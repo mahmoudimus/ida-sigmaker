@@ -4,6 +4,10 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+### Added
+
+- **AArch64 struct-offset and register-field wildcards (opt-in).** Two new checkboxes in the operand-type dialog on AArch64 databases, also available to scripts as `SigMakerConfig(wildcard_struct_offsets=True)` and `wildcard_register_fields=True`. Struct offsets wildcard only the bytes holding `MOV`/`MOVK` immediates and non-SP `LDR`/`STR`/`LDP`/`STP` offsets, so signatures survive struct layout changes between builds; small literals like `MOV W1, #7` are masked too. Register fields wildcard only the bytes holding register numbers, a tighter alternative to "General Register" (which masks 3 of 4 bytes). Both are off by default; existing signatures are unchanged. (#97)
+
 ## [1.15.1] - 2026-10-28
 
 ### Fixed

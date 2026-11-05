@@ -9375,6 +9375,115 @@ class TestAArch64FieldWildcardSelection(unittest.TestCase):
         self.assertFalse(found)
 
 
+class TestAArch64FieldConfigBridge(unittest.TestCase):
+    """Issue #97: SigMakerConfig flags reach the wildcard policy."""
+
+    EXISTING_FIELDS = [
+        "output_format",
+        "wildcard_operands",
+        "continue_outside_of_function",
+        "wildcard_optimized",
+        "enable_continue_prompt",
+        "ask_longer_signature",
+        "print_top_x",
+        "max_single_signature_length",
+        "max_xref_signature_length",
+        "prompt_interval",
+        "output_partial_on_cancel",
+        "scope_to_segment",
+    ]
+
+    def _cfg(self, **kwargs):
+        return sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=True,
+            continue_outside_of_function=False,
+            wildcard_optimized=True,
+            **kwargs,
+        )
+
+    def setUp(self):
+        self._detect = patch.object(
+            sigmaker.WildcardPolicy,
+            "detect_from_processor",
+            return_value=sigmaker.WildcardPolicy(frozenset({5})),
+        )
+        self._detect.start()
+
+    def tearDown(self):
+        self._detect.stop()
+
+    def test_new_fields_are_appended_with_safe_defaults(self):
+        names = [f.name for f in dataclasses.fields(sigmaker.SigMakerConfig)]
+        self.assertEqual(names[: len(self.EXISTING_FIELDS)], self.EXISTING_FIELDS)
+        self.assertEqual(
+            names[len(self.EXISTING_FIELDS):],
+            ["wildcard_struct_offsets", "wildcard_register_fields"],
+        )
+        cfg = self._cfg()
+        self.assertFalse(cfg.wildcard_struct_offsets)
+        self.assertFalse(cfg.wildcard_register_fields)
+
+    def test_scope_is_a_no_op_when_flags_are_off(self):
+        before = sigmaker.WildcardPolicy.current()
+        with sigmaker._cfg_policy_scope(self._cfg()):
+            self.assertEqual(sigmaker.WildcardPolicy.current(), before)
+
+    def test_scope_enables_flags_and_keeps_operand_types(self):
+        cfg = self._cfg(wildcard_struct_offsets=True)
+        with sigmaker._cfg_policy_scope(cfg):
+            policy = sigmaker.WildcardPolicy.current()
+            self.assertTrue(policy.aarch64_struct_offsets)
+            self.assertFalse(policy.aarch64_register_fields)
+            self.assertEqual(policy.allowed_types, frozenset({5}))
+        self.assertFalse(sigmaker.WildcardPolicy.current().aarch64_struct_offsets)
+
+    def test_scope_never_disables_a_flag_already_on(self):
+        token = sigmaker.WildcardPolicy.set_current(
+            sigmaker.WildcardPolicy(frozenset(), aarch64_register_fields=True)
+        )
+        try:
+            with sigmaker._cfg_policy_scope(self._cfg(wildcard_struct_offsets=True)):
+                policy = sigmaker.WildcardPolicy.current()
+                self.assertTrue(policy.aarch64_register_fields)
+                self.assertTrue(policy.aarch64_struct_offsets)
+        finally:
+            sigmaker.WildcardPolicy.reset_current(token)
+
+    def test_make_signature_generates_inside_the_scope(self):
+        seen = []
+
+        class FakeGenerator:
+            def generate(self, start_ea, cfg, policy=None):
+                seen.append(sigmaker.WildcardPolicy.current())
+                return sigmaker.GeneratedSignature(sigmaker.Signature())
+
+        # SignatureMaker is a slots dataclass, so patch the class, not the instance.
+        with patch.object(
+            sigmaker.SignatureMaker, "_create_generator", return_value=FakeGenerator()
+        ):
+            sigmaker.SignatureMaker().make_signature(
+                0x1000,
+                self._cfg(wildcard_register_fields=True),
+                progress_reporter=MagicMock(),
+            )
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].aarch64_register_fields)
+
+    def test_find_xrefs_runs_inside_the_scope(self):
+        seen = []
+
+        def fake(self_, ea, cfg):
+            seen.append(sigmaker.WildcardPolicy.current())
+            return sigmaker.XrefGeneratedSignature([])
+
+        with patch.object(sigmaker.XrefFinder, "_find_xrefs", fake):
+            sigmaker.XrefFinder().find_xrefs(
+                0x1000, self._cfg(wildcard_struct_offsets=True)
+            )
+        self.assertTrue(seen[0].aarch64_struct_offsets)
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the CI runner).
     unittest.main(verbosity=2)

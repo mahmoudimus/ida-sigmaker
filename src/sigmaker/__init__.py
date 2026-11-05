@@ -997,6 +997,11 @@ class SigMakerConfig:
     # duplicated across segments (e.g. a boot section and a main section) as
     # long as the eventual search is scoped to the same segment. Default off.
     scope_to_segment: bool = False
+    # Issue #97: on AArch64, wildcard only the bytes holding move-wide
+    # immediates and non-SP load/store displacements (struct member offsets),
+    # and/or only the bytes holding register fields. Default off.
+    wildcard_struct_offsets: bool = False
+    wildcard_register_fields: bool = False
 
     @classmethod
     def quick_defaults(cls) -> "SigMakerConfig":
@@ -1536,6 +1541,28 @@ class WildcardPolicy:
         ```
         """
         return cls._Use(policy, cls)
+
+
+def _cfg_policy_scope(cfg: SigMakerConfig) -> typing.ContextManager[typing.Any]:
+    """Apply SigMakerConfig's opt-in AArch64 field flags to the current policy.
+
+    Config flags only enable; a flag already on in the current policy (for
+    example from the operand-type dialog) stays on.
+    """
+    if not (cfg.wildcard_struct_offsets or cfg.wildcard_register_fields):
+        return contextlib.nullcontext()
+    current = WildcardPolicy.current()
+    return WildcardPolicy.use(
+        dataclasses.replace(
+            current,
+            aarch64_struct_offsets=(
+                current.aarch64_struct_offsets or cfg.wildcard_struct_offsets
+            ),
+            aarch64_register_fields=(
+                current.aarch64_register_fields or cfg.wildcard_register_fields
+            ),
+        )
+    )
 
 
 def _func_name_suffix(ea: int) -> str:
@@ -3167,6 +3194,31 @@ class SignatureMaker:
     ) -> GeneratedSignature:
         """Creates a signature for a single address (unique) or an address range.
 
+        See _make_signature for arguments. Applies cfg's opt-in wildcard
+        flags (issue #97) for the duration of the call.
+        """
+        with _cfg_policy_scope(cfg):
+            return self._make_signature(
+                ea,
+                cfg,
+                end,
+                progress_reporter=progress_reporter,
+                policy=policy,
+                buf=buf,
+            )
+
+    def _make_signature(
+        self,
+        ea: int | Match,
+        cfg: SigMakerConfig,
+        end: int | None = None,
+        *,
+        progress_reporter: typing.Optional[ProgressReporter] = None,
+        policy: GenerationPolicy = GenerationPolicy.strict(),
+        buf: typing.Optional["InMemoryBuffer"] = None,
+    ) -> GeneratedSignature:
+        """Creates a signature for a single address (unique) or an address range.
+
         Args:
             ea: Starting address for signature generation
             cfg: Configuration for signature generation
@@ -3282,6 +3334,11 @@ class XrefFinder:
 
     def find_xrefs(self, ea: int, cfg: SigMakerConfig) -> XrefGeneratedSignature:
         """Find XREF signatures to a given address."""
+        with _cfg_policy_scope(cfg):
+            return self._find_xrefs(ea, cfg)
+
+    def _find_xrefs(self, ea: int, cfg: SigMakerConfig) -> XrefGeneratedSignature:
+        """Find XREF signatures to a given address (see find_xrefs)."""
         xref_signatures: list[GeneratedSignature] = []
         ui = UIServices.current()
         shortest_len = cfg.max_xref_signature_length + 1

@@ -9243,6 +9243,138 @@ class TestAArch64FieldRange(unittest.TestCase):
         self.assertEqual(hull((0, 4), (1, 2)), (0, 4))
 
 
+class TestAArch64FieldWildcardSelection(unittest.TestCase):
+    """Issue #97: opt-in AArch64 field masks merge with existing coverage."""
+
+    class _Op:
+        def __init__(self, type_, offb, n):
+            self.type = type_
+            self.offb = offb
+            self.n = n
+
+    class _Ins:
+        def __init__(self, size, ops, ea=0x1000, itype=0):
+            self.size = size
+            self._ops = ops
+            self.ea = ea
+            self.itype = itype
+
+        def __iter__(self):
+            return iter(self._ops)
+
+    def setUp(self):
+        ia = sigmaker.idaapi
+        self._saved = {
+            k: getattr(ia, k, None)
+            for k in (
+                "get_flags", "is_off", "get_bytes", "ph_get_id", "inf_is_be",
+                "inf_is_64bit", "PLFM_386", "PLFM_ARM", "PLFM_MIPS",
+            )
+        }
+        ia.PLFM_386 = 1
+        ia.PLFM_ARM = 2
+        ia.PLFM_MIPS = 3
+        ia.get_flags = MagicMock(return_value=0)
+        ia.is_off = MagicMock(return_value=False)
+        ia.ph_get_id = MagicMock(return_value=ia.PLFM_ARM)
+        ia.inf_is_be = MagicMock(return_value=False)
+        ia.inf_is_64bit = MagicMock(return_value=True)
+        self._word = 0
+        ia.get_bytes = MagicMock(
+            side_effect=lambda ea, n: self._word.to_bytes(4, "little")[:n]
+        )
+        self._tok = None
+
+    def tearDown(self):
+        if self._tok is not None:
+            sigmaker.WildcardPolicy.reset_current(self._tok)
+        for k, v in self._saved.items():
+            setattr(sigmaker.idaapi, k, v)
+
+    def _policy(self, *, types=None, struct_offsets=False, register_fields=False):
+        ia = sigmaker.idaapi
+        if types is None:
+            types = {ia.o_mem, ia.o_displ, ia.o_imm, ia.o_near, ia.o_far}
+        self._tok = sigmaker.WildcardPolicy.set_current(
+            sigmaker.WildcardPolicy(
+                frozenset(types),
+                aarch64_struct_offsets=struct_offsets,
+                aarch64_register_fields=register_fields,
+            )
+        )
+
+    def _run(self, word, ops):
+        self._word = word
+        off, length = [0], [0]
+        found = sigmaker.OperandProcessor().get_operand(
+            self._Ins(4, ops), off, length, True
+        )
+        return found, off[0], length[0]
+
+    def _ldr_x26_struct(self):
+        ia = sigmaker.idaapi
+        # LDR X26, [X0,#0x5460]: o_reg + o_displ, not is_off.
+        return 0xF96A301A, [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_displ, 0, 1)]
+
+    def test_policy_flags_default_off(self):
+        policy = sigmaker.WildcardPolicy(frozenset())
+        self.assertFalse(policy.aarch64_struct_offsets)
+        self.assertFalse(policy.aarch64_register_fields)
+
+    def test_flags_off_keeps_struct_offset_exact(self):
+        self._policy()
+        found, _, _ = self._run(*self._ldr_x26_struct())
+        self.assertFalse(found)
+        sigmaker.idaapi.get_bytes.assert_not_called()
+
+    def test_struct_offsets_mask_displacement_bytes(self):
+        self._policy(struct_offsets=True)
+        self.assertEqual(self._run(*self._ldr_x26_struct()), (True, 1, 2))
+
+    def test_register_fields_mask_register_bytes(self):
+        self._policy(register_fields=True)
+        self.assertEqual(self._run(*self._ldr_x26_struct()), (True, 0, 2))
+
+    def test_both_flags_mask_hull(self):
+        self._policy(struct_offsets=True, register_fields=True)
+        self.assertEqual(self._run(*self._ldr_x26_struct()), (True, 0, 3))
+
+    def test_movz_literal_with_struct_offsets(self):
+        ia = sigmaker.idaapi
+        self._policy(struct_offsets=True)
+        ops = [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_imm, 0, 1)]
+        self.assertEqual(self._run(0xD28A8003, ops), (True, 0, 3))
+
+    def test_branch_stays_whole_instruction(self):
+        ia = sigmaker.idaapi
+        self._policy(struct_offsets=True, register_fields=True)
+        self.assertEqual(
+            self._run(0x540001E0, [self._Op(ia.o_near, 0, 0)]), (True, 0, 4)
+        )
+
+    def test_general_registers_coverage_is_kept_when_wider(self):
+        ia = sigmaker.idaapi
+        self._policy(
+            types={ia.o_reg, ia.o_mem, ia.o_displ, ia.o_imm, ia.o_near, ia.o_far},
+            struct_offsets=True,
+        )
+        # Existing ARM register coverage is bytes 0..2; hull with (1, 2).
+        self.assertEqual(self._run(*self._ldr_x26_struct()), (True, 0, 3))
+
+    def test_arm32_database_ignores_flags(self):
+        sigmaker.idaapi.inf_is_64bit.return_value = False
+        self._policy(struct_offsets=True, register_fields=True)
+        found, _, _ = self._run(*self._ldr_x26_struct())
+        self.assertFalse(found)
+
+    def test_x86_database_ignores_flags(self):
+        ia = sigmaker.idaapi
+        ia.ph_get_id.return_value = ia.PLFM_386
+        self._policy(types=set(), struct_offsets=True, register_fields=True)
+        found, _, _ = self._run(*self._ldr_x26_struct())
+        self.assertFalse(found)
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the CI runner).
     unittest.main(verbosity=2)

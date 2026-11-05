@@ -1353,6 +1353,9 @@ class WildcardPolicy:
     """
 
     allowed_types: frozenset[int]
+    # Issue #97: opt-in AArch64 field masks; see _aarch64_field_range.
+    aarch64_struct_offsets: bool = False
+    aarch64_register_fields: bool = False
     _ctx = WILDCARD_POLICY_CTX
 
     class RarelyWildcardable(enum.IntEnum):
@@ -1998,6 +2001,9 @@ class OperandProcessor:
         processor_id = idaapi.ph_get_id()
         self._default_policy = WildcardPolicy.detect_from_processor()
         self._uses_arm_ranges = processor_id == idaapi.PLFM_ARM
+        self._uses_aarch64_fields = self._uses_arm_ranges and bool(
+            idaapi.inf_is_64bit()
+        )
         self._uses_mips_ranges = processor_id == idaapi.PLFM_MIPS
         self._mips_immediate_offset = (
             2 if self._uses_mips_ranges and idaapi.inf_is_be() else 0
@@ -2020,9 +2026,30 @@ class OperandProcessor:
         every byte; MIPS immediate rules mask the endian-correct 16-bit field;
         ordinary ARM operand coverage preserves the high opcode/condition byte
         by masking the low ins.size - 1 bytes. Generic coverage starts at the
-        operand's IDA-reported offb and extends to the instruction end.
+        operand's IDA-reported offb and extends to the instruction end. On
+        AArch64, opt-in field masks (issue #97) widen the result to cover the
+        selected offset and register fields.
         """
         policy = WildcardPolicy._current_or(self._default_policy)
+        selected = self._select_operand_range(ins, policy, wildcard_optimized)
+        if self._uses_aarch64_fields and (
+            policy.aarch64_struct_offsets or policy.aarch64_register_fields
+        ):
+            selected = _hull_byte_ranges(
+                selected, self._aarch64_field_selection(ins, policy)
+            )
+        if selected is None:
+            return False
+        off[0], length[0] = selected
+        return True
+
+    def _select_operand_range(
+        self,
+        ins: idaapi.insn_t,
+        policy: WildcardPolicy,
+        wildcard_optimized: bool,
+    ) -> typing.Optional[tuple[int, int]]:
+        """Return the evaluator's (offset, length) for the first eligible operand."""
         for op in ins:
             if op.type == idaapi.o_void:
                 continue
@@ -2035,19 +2062,29 @@ class OperandProcessor:
             if coverage is _WildcardCoverage.SKIP:
                 continue
             if coverage is _WildcardCoverage.WHOLE_INSTRUCTION:
-                off[0] = 0
-                length[0] = ins.size
-            elif coverage is _WildcardCoverage.MIPS_IMMEDIATE:
-                off[0] = self._mips_immediate_offset
-                length[0] = 2
-            else:
-                off[0] = op.offb
-                if self._uses_arm_ranges:
-                    length[0] = ins.size - 1 if ins.size in (2, 4, 8) else 0
-                else:
-                    length[0] = ins.size - op.offb
-            return True
-        return False
+                return 0, ins.size
+            if coverage is _WildcardCoverage.MIPS_IMMEDIATE:
+                return self._mips_immediate_offset, 2
+            if self._uses_arm_ranges:
+                return op.offb, ins.size - 1 if ins.size in (2, 4, 8) else 0
+            return op.offb, ins.size - op.offb
+        return None
+
+    @staticmethod
+    def _aarch64_field_selection(
+        ins: idaapi.insn_t, policy: WildcardPolicy
+    ) -> typing.Optional[tuple[int, int]]:
+        """Return the opt-in field range for one 4-byte AArch64 instruction."""
+        if ins.size != 4:
+            return None
+        raw = idaapi.get_bytes(ins.ea, 4)
+        if not raw or len(raw) != 4:
+            return None
+        return _aarch64_field_range(
+            int.from_bytes(raw, "little"),
+            struct_offsets=policy.aarch64_struct_offsets,
+            register_fields=policy.aarch64_register_fields,
+        )
 
 
 class InstructionProcessor:

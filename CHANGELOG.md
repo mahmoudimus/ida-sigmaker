@@ -4,6 +4,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+## [1.16.0] - 2026-11-06
+
 ### Added
 
 - **AArch64 struct-offset and register-field wildcards (opt-in).** Two new checkboxes in the operand-type dialog on AArch64 databases, also available to scripts as `SigMakerConfig(wildcard_struct_offsets=True)` and `wildcard_register_fields=True`. Struct offsets wildcard only the bytes holding `MOV`/`MOVK` immediates and non-SP `LDR`/`STR`/`LDP`/`STP` offsets, so signatures survive struct layout changes between builds; small literals like `MOV W1, #7` are masked too. Register fields wildcard only the bytes holding register numbers, a tighter alternative to "General Register" (which masks 3 of 4 bytes). Both are off by default; existing signatures are unchanged. (#97)
@@ -70,7 +72,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 - **PyPI builds now run only for published releases.** Ordinary successful tests on `main` no longer launch an untagged wheel build, and the HCLI manifest version and exact PyPI dependency pin are synchronized from `sigmaker.__version__` during release preparation.
 
-[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.15.1...HEAD
+[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.16.0...HEAD
+[1.16.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.15.1...v1.16.0
 [1.15.1]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.15.0...v1.15.1
 [1.15.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.3...v1.15.0
 [1.14.3]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.2...v1.14.3

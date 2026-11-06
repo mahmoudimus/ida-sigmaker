@@ -9156,6 +9156,334 @@ class TestQuickConfig(unittest.TestCase):
         self.assertFalse(cfg.enable_continue_prompt)
 
 
+class TestAArch64FieldRange(unittest.TestCase):
+    """Issue #97: byte ranges of AArch64 offset and register fields.
+
+    Words are little-endian instruction encodings produced by clang
+    (aarch64-none-elf); bytes in comments are file order.
+    """
+
+    # (word, disassembly, struct-only, registers-only, both)
+    CASES = (
+        (0xD28A8003, "mov x3, #0x5400", (0, 3), (0, 1), (0, 3)),
+        (0x8B030018, "add x24, x0, x3", None, (0, 3), (0, 3)),
+        (0xB9404B13, "ldr w19, [x24, #0x48]", (1, 2), (0, 2), (0, 3)),
+        (0x3100067F, "cmn w19, #1", None, (0, 2), (0, 2)),
+        (0xF96A301A, "ldr x26, [x0, #0x5460]", (1, 2), (0, 2), (0, 3)),
+        (0xA90153F3, "stp x19, x20, [sp, #0x10]", None, (0, 2), (0, 2)),
+        (0xA9025B15, "stp x21, x22, [x24, #0x20]", (1, 2), (0, 2), (0, 3)),
+        (0x2A0103F4, "mov w20, w1", None, (0, 3), (0, 3)),
+        (0xF94007E0, "ldr x0, [sp, #8]", None, (0, 2), (0, 2)),
+        (0xA9B67BFD, "stp x29, x30, [sp, #-0xa0]!", None, (0, 2), (0, 2)),
+        (0xF2A24691, "movk x17, #0x1234, lsl #16", (0, 3), (0, 1), (0, 3)),
+        (0x528000E1, "mov w1, #7", (0, 3), (0, 1), (0, 3)),
+        (0x3940C022, "ldrb w2, [x1, #0x30]", (1, 2), (0, 2), (0, 3)),
+    )
+    UNCLASSIFIED = (
+        (0xD65F03C0, "ret"),
+        (0x540001E0, "b.eq #0x3c"),
+        (0x14000004, "b #0x10"),
+        (0x34001483, "cbz w3, ..."),
+    )
+
+    def test_struct_offsets_only(self):
+        for word, text, expected, _, _ in self.CASES:
+            with self.subTest(text):
+                self.assertEqual(
+                    sigmaker._aarch64_field_range(
+                        word, struct_offsets=True, register_fields=False
+                    ),
+                    expected,
+                )
+
+    def test_register_fields_only(self):
+        for word, text, _, expected, _ in self.CASES:
+            with self.subTest(text):
+                self.assertEqual(
+                    sigmaker._aarch64_field_range(
+                        word, struct_offsets=False, register_fields=True
+                    ),
+                    expected,
+                )
+
+    def test_both_flags_take_the_hull(self):
+        for word, text, _, _, expected in self.CASES:
+            with self.subTest(text):
+                self.assertEqual(
+                    sigmaker._aarch64_field_range(
+                        word, struct_offsets=True, register_fields=True
+                    ),
+                    expected,
+                )
+
+    def test_no_flags_selects_nothing(self):
+        for word, text, *_ in self.CASES:
+            with self.subTest(text):
+                self.assertIsNone(
+                    sigmaker._aarch64_field_range(
+                        word, struct_offsets=False, register_fields=False
+                    )
+                )
+
+    def test_branches_and_returns_are_left_to_existing_rules(self):
+        for word, text in self.UNCLASSIFIED:
+            with self.subTest(text):
+                self.assertIsNone(
+                    sigmaker._aarch64_field_range(
+                        word, struct_offsets=True, register_fields=True
+                    )
+                )
+
+    def test_hull_byte_ranges(self):
+        hull = sigmaker._hull_byte_ranges
+        self.assertIsNone(hull(None, None))
+        self.assertEqual(hull((1, 2), None), (1, 2))
+        self.assertEqual(hull(None, (0, 1)), (0, 1))
+        self.assertEqual(hull((1, 2), (0, 1)), (0, 3))
+        self.assertEqual(hull((0, 4), (1, 2)), (0, 4))
+
+
+class TestAArch64FieldWildcardSelection(unittest.TestCase):
+    """Issue #97: opt-in AArch64 field masks merge with existing coverage."""
+
+    class _Op:
+        def __init__(self, type_, offb, n):
+            self.type = type_
+            self.offb = offb
+            self.n = n
+
+    class _Ins:
+        def __init__(self, size, ops, ea=0x1000, itype=0):
+            self.size = size
+            self._ops = ops
+            self.ea = ea
+            self.itype = itype
+
+        def __iter__(self):
+            return iter(self._ops)
+
+    def setUp(self):
+        ia = sigmaker.idaapi
+        self._saved = {
+            k: getattr(ia, k, None)
+            for k in (
+                "get_flags", "is_off", "get_bytes", "ph_get_id", "inf_is_be",
+                "inf_is_64bit", "PLFM_386", "PLFM_ARM", "PLFM_MIPS",
+            )
+        }
+        ia.PLFM_386 = 1
+        ia.PLFM_ARM = 2
+        ia.PLFM_MIPS = 3
+        ia.get_flags = MagicMock(return_value=0)
+        ia.is_off = MagicMock(return_value=False)
+        ia.ph_get_id = MagicMock(return_value=ia.PLFM_ARM)
+        ia.inf_is_be = MagicMock(return_value=False)
+        ia.inf_is_64bit = MagicMock(return_value=True)
+        self._word = 0
+        ia.get_bytes = MagicMock(
+            side_effect=lambda ea, n: self._word.to_bytes(4, "little")[:n]
+        )
+        self._tok = None
+
+    def tearDown(self):
+        if self._tok is not None:
+            sigmaker.WildcardPolicy.reset_current(self._tok)
+        for k, v in self._saved.items():
+            setattr(sigmaker.idaapi, k, v)
+
+    def _policy(self, *, types=None, struct_offsets=False, register_fields=False):
+        ia = sigmaker.idaapi
+        if types is None:
+            types = {ia.o_mem, ia.o_displ, ia.o_imm, ia.o_near, ia.o_far}
+        self._tok = sigmaker.WildcardPolicy.set_current(
+            sigmaker.WildcardPolicy(
+                frozenset(types),
+                aarch64_struct_offsets=struct_offsets,
+                aarch64_register_fields=register_fields,
+            )
+        )
+
+    def _run(self, word, ops):
+        self._word = word
+        off, length = [0], [0]
+        found = sigmaker.OperandProcessor().get_operand(
+            self._Ins(4, ops), off, length, True
+        )
+        return found, off[0], length[0]
+
+    def _ldr_x26_struct(self):
+        ia = sigmaker.idaapi
+        # LDR X26, [X0,#0x5460]: o_reg + o_displ, not is_off.
+        return 0xF96A301A, [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_displ, 0, 1)]
+
+    def test_policy_flags_default_off(self):
+        policy = sigmaker.WildcardPolicy(frozenset())
+        self.assertFalse(policy.aarch64_struct_offsets)
+        self.assertFalse(policy.aarch64_register_fields)
+
+    def test_flags_off_keeps_struct_offset_exact(self):
+        self._policy()
+        found, _, _ = self._run(*self._ldr_x26_struct())
+        self.assertFalse(found)
+        sigmaker.idaapi.get_bytes.assert_not_called()
+
+    def test_struct_offsets_mask_displacement_bytes(self):
+        self._policy(struct_offsets=True)
+        self.assertEqual(self._run(*self._ldr_x26_struct()), (True, 1, 2))
+
+    def test_register_fields_mask_register_bytes(self):
+        self._policy(register_fields=True)
+        self.assertEqual(self._run(*self._ldr_x26_struct()), (True, 0, 2))
+
+    def test_both_flags_mask_hull(self):
+        self._policy(struct_offsets=True, register_fields=True)
+        self.assertEqual(self._run(*self._ldr_x26_struct()), (True, 0, 3))
+
+    def test_movz_literal_with_struct_offsets(self):
+        ia = sigmaker.idaapi
+        self._policy(struct_offsets=True)
+        ops = [self._Op(ia.o_reg, 0, 0), self._Op(ia.o_imm, 0, 1)]
+        self.assertEqual(self._run(0xD28A8003, ops), (True, 0, 3))
+
+    def test_branch_stays_whole_instruction(self):
+        ia = sigmaker.idaapi
+        self._policy(struct_offsets=True, register_fields=True)
+        self.assertEqual(
+            self._run(0x540001E0, [self._Op(ia.o_near, 0, 0)]), (True, 0, 4)
+        )
+
+    def test_general_registers_coverage_is_kept_when_wider(self):
+        ia = sigmaker.idaapi
+        self._policy(
+            types={ia.o_reg, ia.o_mem, ia.o_displ, ia.o_imm, ia.o_near, ia.o_far},
+            struct_offsets=True,
+        )
+        # Existing ARM register coverage is bytes 0..2; hull with (1, 2).
+        self.assertEqual(self._run(*self._ldr_x26_struct()), (True, 0, 3))
+
+    def test_arm32_database_ignores_flags(self):
+        sigmaker.idaapi.inf_is_64bit.return_value = False
+        self._policy(struct_offsets=True, register_fields=True)
+        found, _, _ = self._run(*self._ldr_x26_struct())
+        self.assertFalse(found)
+
+    def test_x86_database_ignores_flags(self):
+        ia = sigmaker.idaapi
+        ia.ph_get_id.return_value = ia.PLFM_386
+        self._policy(types=set(), struct_offsets=True, register_fields=True)
+        found, _, _ = self._run(*self._ldr_x26_struct())
+        self.assertFalse(found)
+
+
+class TestAArch64FieldConfigBridge(unittest.TestCase):
+    """Issue #97: SigMakerConfig flags reach the wildcard policy."""
+
+    EXISTING_FIELDS = [
+        "output_format",
+        "wildcard_operands",
+        "continue_outside_of_function",
+        "wildcard_optimized",
+        "enable_continue_prompt",
+        "ask_longer_signature",
+        "print_top_x",
+        "max_single_signature_length",
+        "max_xref_signature_length",
+        "prompt_interval",
+        "output_partial_on_cancel",
+        "scope_to_segment",
+    ]
+
+    def _cfg(self, **kwargs):
+        return sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=True,
+            continue_outside_of_function=False,
+            wildcard_optimized=True,
+            **kwargs,
+        )
+
+    def setUp(self):
+        self._detect = patch.object(
+            sigmaker.WildcardPolicy,
+            "detect_from_processor",
+            return_value=sigmaker.WildcardPolicy(frozenset({5})),
+        )
+        self._detect.start()
+
+    def tearDown(self):
+        self._detect.stop()
+
+    def test_new_fields_are_appended_with_safe_defaults(self):
+        names = [f.name for f in dataclasses.fields(sigmaker.SigMakerConfig)]
+        self.assertEqual(names[: len(self.EXISTING_FIELDS)], self.EXISTING_FIELDS)
+        self.assertEqual(
+            names[len(self.EXISTING_FIELDS):],
+            ["wildcard_struct_offsets", "wildcard_register_fields"],
+        )
+        cfg = self._cfg()
+        self.assertFalse(cfg.wildcard_struct_offsets)
+        self.assertFalse(cfg.wildcard_register_fields)
+
+    def test_scope_is_a_no_op_when_flags_are_off(self):
+        before = sigmaker.WildcardPolicy.current()
+        with sigmaker._cfg_policy_scope(self._cfg()):
+            self.assertEqual(sigmaker.WildcardPolicy.current(), before)
+
+    def test_scope_enables_flags_and_keeps_operand_types(self):
+        cfg = self._cfg(wildcard_struct_offsets=True)
+        with sigmaker._cfg_policy_scope(cfg):
+            policy = sigmaker.WildcardPolicy.current()
+            self.assertTrue(policy.aarch64_struct_offsets)
+            self.assertFalse(policy.aarch64_register_fields)
+            self.assertEqual(policy.allowed_types, frozenset({5}))
+        self.assertFalse(sigmaker.WildcardPolicy.current().aarch64_struct_offsets)
+
+    def test_scope_never_disables_a_flag_already_on(self):
+        token = sigmaker.WildcardPolicy.set_current(
+            sigmaker.WildcardPolicy(frozenset(), aarch64_register_fields=True)
+        )
+        try:
+            with sigmaker._cfg_policy_scope(self._cfg(wildcard_struct_offsets=True)):
+                policy = sigmaker.WildcardPolicy.current()
+                self.assertTrue(policy.aarch64_register_fields)
+                self.assertTrue(policy.aarch64_struct_offsets)
+        finally:
+            sigmaker.WildcardPolicy.reset_current(token)
+
+    def test_make_signature_generates_inside_the_scope(self):
+        seen = []
+
+        class FakeGenerator:
+            def generate(self, start_ea, cfg, policy=None):
+                seen.append(sigmaker.WildcardPolicy.current())
+                return sigmaker.GeneratedSignature(sigmaker.Signature())
+
+        # SignatureMaker is a slots dataclass, so patch the class, not the instance.
+        with patch.object(
+            sigmaker.SignatureMaker, "_create_generator", return_value=FakeGenerator()
+        ):
+            sigmaker.SignatureMaker().make_signature(
+                0x1000,
+                self._cfg(wildcard_register_fields=True),
+                progress_reporter=MagicMock(),
+            )
+        self.assertEqual(len(seen), 1)
+        self.assertTrue(seen[0].aarch64_register_fields)
+
+    def test_find_xrefs_runs_inside_the_scope(self):
+        seen = []
+
+        def fake(self_, ea, cfg):
+            seen.append(sigmaker.WildcardPolicy.current())
+            return sigmaker.XrefGeneratedSignature([])
+
+        with patch.object(sigmaker.XrefFinder, "_find_xrefs", fake):
+            sigmaker.XrefFinder().find_xrefs(
+                0x1000, self._cfg(wildcard_struct_offsets=True)
+            )
+        self.assertTrue(seen[0].aarch64_struct_offsets)
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the CI runner).
     unittest.main(verbosity=2)

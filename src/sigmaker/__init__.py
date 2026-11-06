@@ -997,6 +997,11 @@ class SigMakerConfig:
     # duplicated across segments (e.g. a boot section and a main section) as
     # long as the eventual search is scoped to the same segment. Default off.
     scope_to_segment: bool = False
+    # Issue #97: on AArch64, wildcard only the bytes holding move-wide
+    # immediates and non-SP load/store displacements (struct member offsets),
+    # and/or only the bytes holding register fields. Default off.
+    wildcard_struct_offsets: bool = False
+    wildcard_register_fields: bool = False
 
     @classmethod
     def quick_defaults(cls) -> "SigMakerConfig":
@@ -1353,6 +1358,9 @@ class WildcardPolicy:
     """
 
     allowed_types: frozenset[int]
+    # Issue #97: opt-in AArch64 field masks; see _aarch64_field_range.
+    aarch64_struct_offsets: bool = False
+    aarch64_register_fields: bool = False
     _ctx = WILDCARD_POLICY_CTX
 
     class RarelyWildcardable(enum.IntEnum):
@@ -1533,6 +1541,28 @@ class WildcardPolicy:
         ```
         """
         return cls._Use(policy, cls)
+
+
+def _cfg_policy_scope(cfg: SigMakerConfig) -> typing.ContextManager[typing.Any]:
+    """Apply SigMakerConfig's opt-in AArch64 field flags to the current policy.
+
+    Config flags only enable; a flag already on in the current policy (for
+    example from the operand-type dialog) stays on.
+    """
+    if not (cfg.wildcard_struct_offsets or cfg.wildcard_register_fields):
+        return contextlib.nullcontext()
+    current = WildcardPolicy.current()
+    return WildcardPolicy.use(
+        dataclasses.replace(
+            current,
+            aarch64_struct_offsets=(
+                current.aarch64_struct_offsets or cfg.wildcard_struct_offsets
+            ),
+            aarch64_register_fields=(
+                current.aarch64_register_fields or cfg.wildcard_register_fields
+            ),
+        )
+    )
 
 
 def _func_name_suffix(ea: int) -> str:
@@ -1937,6 +1967,59 @@ _NON_ARM_OPERAND_EVALUATOR = _OperandWildcardEvaluator(
     _NON_ARM_FALLBACK_RULES,
 )
 
+_AARCH64_SP = 31
+
+
+def _bit_field_bytes(lo_bit: int, hi_bit: int) -> tuple[int, int]:
+    """Return the (offset, length) byte span covering bits lo_bit..hi_bit."""
+    return lo_bit // 8, hi_bit // 8 - lo_bit // 8 + 1
+
+
+def _hull_byte_ranges(
+    a: typing.Optional[tuple[int, int]],
+    b: typing.Optional[tuple[int, int]],
+) -> typing.Optional[tuple[int, int]]:
+    """Return the smallest (offset, length) range covering both ranges."""
+    if a is None:
+        return b
+    if b is None:
+        return a
+    lo = min(a[0], b[0])
+    hi = max(a[0] + a[1], b[0] + b[1])
+    return lo, hi - lo
+
+
+def _aarch64_field_range(
+    word: int, *, struct_offsets: bool, register_fields: bool
+) -> typing.Optional[tuple[int, int]]:
+    """Byte range holding the selected fields of one AArch64 instruction.
+
+    Issue #97. Struct offsets are move-wide immediates and non-SP load/store
+    displacements; register fields are Rd/Rt/Rn/Rm/Rt2. Branches, returns and
+    unlisted encodings return None and keep the existing operand rules.
+    """
+    rn = (word >> 5) & 0x1F
+    if word & 0x1F800000 == 0x12800000:  # MOVN / MOVZ / MOVK
+        offsets, registers = _bit_field_bytes(5, 20), _bit_field_bytes(0, 4)
+    elif word & 0x3B000000 == 0x39000000:  # LDR/STR (unsigned immediate)
+        offsets = None if rn == _AARCH64_SP else _bit_field_bytes(10, 21)
+        registers = _bit_field_bytes(0, 9)
+    elif word & 0x3A000000 == 0x28000000:  # LDP/STP (all addressing forms)
+        offsets = None if rn == _AARCH64_SP else _bit_field_bytes(15, 21)
+        registers = _bit_field_bytes(0, 14)
+    elif word & 0x1F000000 == 0x11000000:  # ADD/SUB (immediate), incl. CMN/CMP
+        offsets, registers = None, _bit_field_bytes(0, 9)
+    elif word & 0x1F000000 in (0x0A000000, 0x0B000000):  # shifted register
+        offsets, registers = None, _bit_field_bytes(0, 20)
+    else:
+        return None
+    selected = None
+    if struct_offsets:
+        selected = _hull_byte_ranges(selected, offsets)
+    if register_fields:
+        selected = _hull_byte_ranges(selected, registers)
+    return selected
+
 
 class OperandProcessor:
     """Select byte ranges according to the current operand wildcard policy."""
@@ -1945,6 +2028,9 @@ class OperandProcessor:
         processor_id = idaapi.ph_get_id()
         self._default_policy = WildcardPolicy.detect_from_processor()
         self._uses_arm_ranges = processor_id == idaapi.PLFM_ARM
+        self._uses_aarch64_fields = self._uses_arm_ranges and bool(
+            idaapi.inf_is_64bit()
+        )
         self._uses_mips_ranges = processor_id == idaapi.PLFM_MIPS
         self._mips_immediate_offset = (
             2 if self._uses_mips_ranges and idaapi.inf_is_be() else 0
@@ -1967,9 +2053,30 @@ class OperandProcessor:
         every byte; MIPS immediate rules mask the endian-correct 16-bit field;
         ordinary ARM operand coverage preserves the high opcode/condition byte
         by masking the low ins.size - 1 bytes. Generic coverage starts at the
-        operand's IDA-reported offb and extends to the instruction end.
+        operand's IDA-reported offb and extends to the instruction end. On
+        AArch64, opt-in field masks (issue #97) widen the result to cover the
+        selected offset and register fields.
         """
         policy = WildcardPolicy._current_or(self._default_policy)
+        selected = self._select_operand_range(ins, policy, wildcard_optimized)
+        if self._uses_aarch64_fields and (
+            policy.aarch64_struct_offsets or policy.aarch64_register_fields
+        ):
+            selected = _hull_byte_ranges(
+                selected, self._aarch64_field_selection(ins, policy)
+            )
+        if selected is None:
+            return False
+        off[0], length[0] = selected
+        return True
+
+    def _select_operand_range(
+        self,
+        ins: idaapi.insn_t,
+        policy: WildcardPolicy,
+        wildcard_optimized: bool,
+    ) -> typing.Optional[tuple[int, int]]:
+        """Return the evaluator's (offset, length) for the first eligible operand."""
         for op in ins:
             if op.type == idaapi.o_void:
                 continue
@@ -1982,19 +2089,29 @@ class OperandProcessor:
             if coverage is _WildcardCoverage.SKIP:
                 continue
             if coverage is _WildcardCoverage.WHOLE_INSTRUCTION:
-                off[0] = 0
-                length[0] = ins.size
-            elif coverage is _WildcardCoverage.MIPS_IMMEDIATE:
-                off[0] = self._mips_immediate_offset
-                length[0] = 2
-            else:
-                off[0] = op.offb
-                if self._uses_arm_ranges:
-                    length[0] = ins.size - 1 if ins.size in (2, 4, 8) else 0
-                else:
-                    length[0] = ins.size - op.offb
-            return True
-        return False
+                return 0, ins.size
+            if coverage is _WildcardCoverage.MIPS_IMMEDIATE:
+                return self._mips_immediate_offset, 2
+            if self._uses_arm_ranges:
+                return op.offb, ins.size - 1 if ins.size in (2, 4, 8) else 0
+            return op.offb, ins.size - op.offb
+        return None
+
+    @staticmethod
+    def _aarch64_field_selection(
+        ins: idaapi.insn_t, policy: WildcardPolicy
+    ) -> typing.Optional[tuple[int, int]]:
+        """Return the opt-in field range for one 4-byte AArch64 instruction."""
+        if ins.size != 4:
+            return None
+        raw = idaapi.get_bytes(ins.ea, 4)
+        if not raw or len(raw) != 4:
+            return None
+        return _aarch64_field_range(
+            int.from_bytes(raw, "little"),
+            struct_offsets=policy.aarch64_struct_offsets,
+            register_fields=policy.aarch64_register_fields,
+        )
 
 
 class InstructionProcessor:
@@ -3077,6 +3194,31 @@ class SignatureMaker:
     ) -> GeneratedSignature:
         """Creates a signature for a single address (unique) or an address range.
 
+        See _make_signature for arguments. Applies cfg's opt-in wildcard
+        flags (issue #97) for the duration of the call.
+        """
+        with _cfg_policy_scope(cfg):
+            return self._make_signature(
+                ea,
+                cfg,
+                end,
+                progress_reporter=progress_reporter,
+                policy=policy,
+                buf=buf,
+            )
+
+    def _make_signature(
+        self,
+        ea: int | Match,
+        cfg: SigMakerConfig,
+        end: int | None = None,
+        *,
+        progress_reporter: typing.Optional[ProgressReporter] = None,
+        policy: GenerationPolicy = GenerationPolicy.strict(),
+        buf: typing.Optional["InMemoryBuffer"] = None,
+    ) -> GeneratedSignature:
+        """Creates a signature for a single address (unique) or an address range.
+
         Args:
             ea: Starting address for signature generation
             cfg: Configuration for signature generation
@@ -3192,6 +3334,11 @@ class XrefFinder:
 
     def find_xrefs(self, ea: int, cfg: SigMakerConfig) -> XrefGeneratedSignature:
         """Find XREF signatures to a given address."""
+        with _cfg_policy_scope(cfg):
+            return self._find_xrefs(ea, cfg)
+
+    def _find_xrefs(self, ea: int, cfg: SigMakerConfig) -> XrefGeneratedSignature:
+        """Find XREF signatures to a given address (see find_xrefs)."""
         xref_signatures: list[GeneratedSignature] = []
         ui = UIServices.current()
         shortest_len = cfg.max_xref_signature_length + 1
@@ -5012,6 +5159,7 @@ class ConfigureOperandWildcardBitmaskForm(idaapi.Form):
     """Interactive form to configure wildcardable operands using checkboxes."""
 
     def __init__(self) -> None:
+        self._has_aarch64_fields = False
         F = idaapi.Form
         # Define the form layout
         form_text = """BUTTON YES* OK
@@ -5075,6 +5223,14 @@ Select operand types that should be wildcarded:
             registers.extend(
                 ["opt8", "opt9", "opt10", "opt11", "opt12", "opt13", "opt14"]
             )
+            if idaapi.inf_is_64bit():
+                # Issue #97. No '#' inside form text: IDA uses it for hints.
+                form_text += """
+
+AArch64 field wildcards (opt-in, issue 97):
+<#Wildcard only the bytes holding MOV/MOVK immediates and non-SP LDR/STR/LDP/STP offsets. Small MOV literals are masked too.#Struct offsets:{a64Offsets}>
+<#Wildcard only the bytes holding register fields. Use instead of General Register for tighter patterns.#Register fields:{a64Registers}>{cAArch64Fields}>"""
+                self._has_aarch64_fields = True
         elif proc_arch == idaapi.PLFM_PPC:
             form_text += """
 <Special purpose register :{opt8}>
@@ -5097,14 +5253,36 @@ Select operand types that should be wildcarded:
                 value=options,
             ),
         }
+        if self._has_aarch64_fields:
+            current = WildcardPolicy.current()
+            controls["cAArch64Fields"] = F.ChkGroupControl(
+                ("a64Offsets", "a64Registers"),
+                value=int(current.aarch64_struct_offsets)
+                | (int(current.aarch64_register_fields) << 1),
+            )
         super().__init__(form_text, controls)
 
     def OnFormChange(self, fid: int) -> int:
         """Callback invoked when the form state changes."""
+        current = WildcardPolicy.current()
         if fid == self.cWildcardableOperands.id:  # type: ignore
             # re-shift b/c we skipped o_void
             mask = self.GetControlValue(self.cWildcardableOperands) << 1  # type: ignore
-            WildcardPolicy.set_current(WildcardPolicy.from_mask(mask))
+            WildcardPolicy.set_current(
+                dataclasses.replace(
+                    current,
+                    allowed_types=WildcardPolicy.from_mask(mask).allowed_types,
+                )
+            )
+        elif self._has_aarch64_fields and fid == self.cAArch64Fields.id:  # type: ignore
+            bits = self.GetControlValue(self.cAArch64Fields)  # type: ignore
+            WildcardPolicy.set_current(
+                dataclasses.replace(
+                    current,
+                    aarch64_struct_offsets=bool(bits & 1),
+                    aarch64_register_fields=bool(bits & 2),
+                )
+            )
         return 1
 
 

@@ -4670,6 +4670,40 @@ _AARCH64_ENCODINGS: tuple[
 )
 
 
+#: Fields holding a PC-relative address, per encoding class. IDA does not
+#: report ARM operand byte offsets, so the single-build policy wildcards these
+#: instructions whole; the cross-build merge narrows that to the address field
+#: and keeps the opcode (``? ? ? 34`` rather than ``? ? ? ?`` for a CBZ).
+_AARCH64_ADDRESS_FIELDS: dict[str, tuple[tuple[int, int], ...]] = {
+    "B/BL": ((0, 25),),
+    "B.cond": ((5, 23),),
+    "CBZ/CBNZ": ((5, 23),),
+    "TBZ/TBNZ": ((5, 18),),
+    "ADR/ADRP": ((5, 23), (29, 30)),
+    "LDR (literal)": ((5, 23),),
+}
+
+
+def _narrow_to_address_fields(
+    word: int, wildcards: typing.Sequence[bool]
+) -> list[bool]:
+    """Shrink a whole-instruction wildcard to the bytes of its address field.
+
+    Leaves ``wildcards`` unchanged for instructions without a PC-relative
+    address field, or when nothing is wildcarded.
+    """
+    encoding = _aarch64_encoding(word)
+    if encoding is None or not any(wildcards):
+        return list(wildcards)
+    fields = _AARCH64_ADDRESS_FIELDS.get(encoding[0])
+    if fields is None:
+        return list(wildcards)
+    masked = {
+        index for lo, hi in fields for index in range(lo // 8, hi // 8 + 1)
+    }
+    return [index in masked for index in range(len(wildcards))]
+
+
 def _aarch64_encoding(
     word: int,
 ) -> typing.Optional[tuple[str, tuple[tuple[int, int], ...]]]:
@@ -5099,8 +5133,15 @@ class CrossBuildSignatureMaker:
                 processor.append_instruction_to_sig(
                     signature, ea, insn, True, cfg.wildcard_optimized
                 )
-                for index, byte in enumerate(signature[: merge.SLOT_SIZE]):
-                    mask[slot.offset + index] = byte.is_wildcard
+                word = int.from_bytes(
+                    merge.reference[slot.offset : slot.offset + merge.SLOT_SIZE],
+                    "little",
+                )
+                narrowed = _narrow_to_address_fields(
+                    word,
+                    [byte.is_wildcard for byte in signature[: merge.SLOT_SIZE]],
+                )
+                mask[slot.offset : slot.offset + len(narrowed)] = narrowed
         return mask
 
 
@@ -6010,6 +6051,7 @@ class SigMakerPlugin(idaapi.plugin_t):
     ACTION_STOP_PROFILING: str = "pysigmaker:stop_profiling"
     ACTION_PSEUDOCODE_SELECTION_SIG: str = "pysigmaker:pseudocode_selection_sig"
     ACTION_PSEUDOCODE_FUNCTION_SIG: str = "pysigmaker:pseudocode_function_sig"
+    ACTION_CROSS_BUILD_SIG: str = "pysigmaker:cross_build_sig"
 
     #: Settings from the last dialog run, reused by the right-click actions
     #: that skip the dialog. None until the dialog has been opened once.
@@ -6028,6 +6070,15 @@ class SigMakerPlugin(idaapi.plugin_t):
             _PopupHook(self.ACTION_SHOW_SIGMAKER, category="SigMaker"),
             _PopupHook(self.ACTION_START_PROFILING, category="SigMaker"),
             _PopupHook(self.ACTION_STOP_PROFILING, category="SigMaker"),
+            # Issue #100: only offered where it works (AArch64 for now).
+            _PopupHook(
+                self.ACTION_CROSS_BUILD_SIG,
+                predicate=lambda widget, popup, ctx: (
+                    _PopupHook.is_disassembly_widget(widget, popup, ctx)
+                    and CrossBuildSignatureMaker.supported()
+                ),
+                category="SigMaker",
+            ),
             # Pseudocode view: exactly one of the two attaches, decided by
             # whether the user has a selection, so the label always matches
             # what the action will do. Top level, not under "SigMaker/", to
@@ -6112,6 +6163,17 @@ class SigMakerPlugin(idaapi.plugin_t):
                 154,
             )
         )
+        idaapi.register_action(
+            idaapi.action_desc_t(
+                self.ACTION_CROSS_BUILD_SIG,
+                "Cross-build signature for function...",
+                _ActionHandler(self._action_cross_build_sig),
+                None,
+                "Merge this function with the same function pasted from other "
+                "builds into one signature that matches all of them.",
+                154,
+            )
+        )
 
     def _deregister_actions(self) -> None:
         idaapi.unregister_action(self.ACTION_SHOW_SIGMAKER)
@@ -6119,6 +6181,7 @@ class SigMakerPlugin(idaapi.plugin_t):
         idaapi.unregister_action(self.ACTION_STOP_PROFILING)
         idaapi.unregister_action(self.ACTION_PSEUDOCODE_SELECTION_SIG)
         idaapi.unregister_action(self.ACTION_PSEUDOCODE_FUNCTION_SIG)
+        idaapi.unregister_action(self.ACTION_CROSS_BUILD_SIG)
 
     def _action_start_profiling(self, ctx=None) -> None:
         start_profiling()
@@ -6315,6 +6378,49 @@ class SigMakerPlugin(idaapi.plugin_t):
         ea = idaapi.get_screen_ea() if view is None else view.entry_ea
         with self._action_scope():
             self._run_function_and_xref_sigs(ea, self._quick_config())
+
+    _CROSS_BUILD_PROMPT: typing.ClassVar[str] = (
+        "Paste the same function from your other builds, start of function first.\n"
+        "Raw hex or IDA listing lines with opcode bytes.\n"
+        "Separate builds with a blank line or a line of ---."
+    )
+
+    def _action_cross_build_sig(self, ctx=None) -> None:
+        """Right-click: merge this function with pasted copies from other
+        builds into one signature (issue #100)."""
+        ea = idaapi.get_screen_ea()
+        with self._action_scope():
+            pfn = idaapi.get_func(ea)
+            if pfn is None:
+                idaapi.msg("Place cursor inside a function first.\n")
+                return
+            text = idaapi.ask_text(0, "", self._CROSS_BUILD_PROMPT)
+            if not text:
+                idaapi.msg("No builds pasted.\n")
+                return
+            builds = CrossBuildText.parse(text)
+            if not builds:
+                idaapi.msg("Found no opcode bytes in the pasted text.\n")
+                return
+            config = self._quick_config()
+            with ProgressDialog(
+                "Cross-build signature\n\n"
+                "Merging the builds and checking uniqueness.\n\n"
+                "Press Cancel to stop"
+            ):
+                result = CrossBuildSignatureMaker().make(
+                    int(pfn.start_ea), builds, config
+                )
+            lines = result.report_lines(
+                config, _func_name_suffix(int(pfn.start_ea))
+            )
+            for line in lines:
+                idaapi.msg(f"{line}\n")
+            question = "\n".join(lines[1:-1]) + "\n\nCopy the signature to the clipboard?"
+            if idaapi.ask_yn(idaapi.ASKBTN_YES, f"HIDECANCEL\n{question}") == idaapi.ASKBTN_YES:
+                fmted = format(result.signature, config.output_format.value)
+                if Clipboard.set_text(fmted):
+                    idaapi.msg("Copied the cross-build signature to the clipboard.\n")
 
     @staticmethod
     def _report_uniqueness(

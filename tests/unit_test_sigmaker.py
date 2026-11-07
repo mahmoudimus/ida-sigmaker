@@ -9602,6 +9602,38 @@ class TestCrossBuildSlotVerdict(unittest.TestCase):
         self.assertIsNone(sigmaker._aarch64_encoding(0x00000000))
 
 
+class TestNarrowToAddressFields(unittest.TestCase):
+    """Issue #100: whole-branch wildcards shrink to the address field."""
+
+    def narrow(self, word, wildcards=(True, True, True, True)):
+        return sigmaker._narrow_to_address_fields(word, list(wildcards))
+
+    def test_cbz_keeps_its_opcode_byte(self):
+        self.assertEqual(self.narrow(0x34001483), [True, True, True, False])
+
+    def test_b_cond_keeps_its_opcode_byte(self):
+        self.assertEqual(self.narrow(0x540001E0), [True, True, True, False])
+
+    def test_b_and_adrp_stay_whole(self):
+        self.assertEqual(self.narrow(0x14000004), [True, True, True, True])
+        self.assertEqual(self.narrow(0x90000000), [True, True, True, True])
+
+    def test_tbz_masks_only_the_displacement(self):
+        self.assertEqual(self.narrow(0x36080040), [True, True, True, False])
+
+    def test_non_address_instruction_is_unchanged(self):
+        self.assertEqual(
+            self.narrow(0xB9404B13, (False, True, True, False)),
+            [False, True, True, False],
+        )
+
+    def test_nothing_wildcarded_stays_exact(self):
+        self.assertEqual(self.narrow(0x34001483, (False,) * 4), [False] * 4)
+
+    def test_unknown_encoding_is_unchanged(self):
+        self.assertEqual(self.narrow(0x00000000), [True] * 4)
+
+
 class TestCrossBuildMerge(unittest.TestCase):
     """Issue #100: merge the same function from several builds."""
 

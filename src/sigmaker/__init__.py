@@ -6417,6 +6417,8 @@ class SigMakerPlugin(idaapi.plugin_t):
             for line in lines:
                 idaapi.msg(f"{line}\n")
             question = "\n".join(lines[1:-1]) + "\n\nCopy the signature to the clipboard?"
+            # ask_yn takes a printf-style format string.
+            question = question.replace("%", "%%")
             if idaapi.ask_yn(idaapi.ASKBTN_YES, f"HIDECANCEL\n{question}") == idaapi.ASKBTN_YES:
                 fmted = format(result.signature, config.output_format.value)
                 if Clipboard.set_text(fmted):

@@ -9484,6 +9484,428 @@ class TestAArch64FieldConfigBridge(unittest.TestCase):
         self.assertTrue(seen[0].aarch64_struct_offsets)
 
 
+_ISSUE97_BUILDS = {
+    # The same function from three game builds, as posted on issue #97.
+    "A_old": "43 14 00 34|FD 7B B6 A9|FD 03 00 91|F7 63 03 A9|F7 03 03 2A|F9 6B 04 A9|F9 03 02 AA|02 7A 8A D2|18 00 02 8B|F3 53 01 A9|F4 03 01 2A|F5 5B 02 A9|F6 03 00 AA|13 1B 40 B9|7F 06 00 31|E0 01 00 54|03 00 6A F9|04 00 00 14",
+    "B_prev": "83 14 00 34|FD 7B B6 A9|FD 03 00 91|F7 63 03 A9|F7 03 03 2A|03 60 8A D2|18 00 03 8B|F3 53 01 A9|F4 03 01 2A|F5 5B 02 A9|F6 03 00 AA|F9 6B 04 A9|F9 03 02 AA|13 1B 40 B9|7F 06 00 31|E0 01 00 54|03 98 69 F9|04 00 00 14",
+    "C_latest": "83 14 00 34|FD 7B B6 A9|FD 03 00 91|F7 63 03 A9|F7 03 03 2A|03 80 8A D2|18 00 03 8B|F3 53 01 A9|F4 03 01 2A|F5 5B 02 A9|F6 03 00 AA|F9 6B 04 A9|F9 03 02 AA|13 4B 40 B9|7F 06 00 31|E0 01 00 54|1A 30 6A F9|04 00 00 14",
+}
+# The signature hand-built on issue #97 and confirmed unique in all four builds.
+_ISSUE97_HAND_SIG = (
+    "? ? ? 34 FD 7B B6 A9 FD 03 00 91 F7 63 03 A9 F7 03 03 2A "
+    + " ".join(["?"] * 32)
+    + " 13 ? ? B9 7F 06 00 31 E0 01 00 54 ? ? ? F9 04 00 00 14"
+)
+
+
+def _issue97_build(name):
+    return bytes.fromhex(_ISSUE97_BUILDS[name].replace("|", " "))
+
+
+def _words(*words):
+    return b"".join(word.to_bytes(4, "little") for word in words)
+
+
+class TestCrossBuildSlotVerdict(unittest.TestCase):
+    """Issue #100: one instruction slot merged across builds."""
+
+    def verdict(self, *words):
+        return sigmaker._aarch64_slot_verdict(list(words))
+
+    def test_identical_words_are_exact(self):
+        self.assertEqual(
+            self.verdict(0xB9404B13, 0xB9404B13),
+            (sigmaker.CrossBuildVerdict.EXACT, (False, False, False, False)),
+        )
+
+    def test_changed_load_offset_masks_only_the_offset_bytes(self):
+        # LDR W19, [X24,#0x48] vs [X24,#0x18]: imm12 (bits 10..21) -> bytes 1, 2
+        self.assertEqual(
+            self.verdict(0xB9404B13, 0xB9401B13),
+            (sigmaker.CrossBuildVerdict.FIELDS, (False, True, True, False)),
+        )
+
+    def test_changed_register_and_offset_masks_both_fields(self):
+        # LDR X26, [X0,#0x5460] vs LDR X3, [X0,#0x5330]
+        self.assertEqual(
+            self.verdict(0xF96A301A, 0xF9699803),
+            (sigmaker.CrossBuildVerdict.FIELDS, (True, True, True, False)),
+        )
+
+    def test_move_wide_immediate_masks_bytes_0_to_2(self):
+        # MOV X3, #0x5400 vs MOV X3, #0x5300
+        self.assertEqual(
+            self.verdict(0xD28A8003, 0xD28A6003),
+            (sigmaker.CrossBuildVerdict.FIELDS, (True, True, True, False)),
+        )
+
+    def test_whole_field_is_masked_even_where_bytes_agree(self):
+        # CBZ W3 +0x290 vs +0x288: imm19 bits 5..23 differ only in byte 0,
+        # but the whole field (bytes 0..2) is wildcarded.
+        self.assertEqual(
+            self.verdict(0x34001483, 0x34001443),
+            (sigmaker.CrossBuildVerdict.FIELDS, (True, True, True, False)),
+        )
+
+    def test_different_opcode_is_a_class_change(self):
+        # B +0x10 vs BL +0x10: same layout, different opcode bit 31
+        self.assertEqual(
+            self.verdict(0x14000004, 0x94000004),
+            (sigmaker.CrossBuildVerdict.CLASS, (True, True, True, True)),
+        )
+
+    def test_different_encoding_class_is_a_class_change(self):
+        # STP X25, X26 vs MOV X3, #0x5300
+        self.assertEqual(
+            self.verdict(0xA9046BF9, 0xD28A6003)[0], sigmaker.CrossBuildVerdict.CLASS
+        )
+
+    def test_unknown_encoding_that_differs_is_a_class_change(self):
+        self.assertEqual(
+            self.verdict(0x00000001, 0x00000002)[0], sigmaker.CrossBuildVerdict.CLASS
+        )
+
+    def test_condition_change_is_a_class_change(self):
+        # B.EQ vs B.NE with the same displacement
+        self.assertEqual(
+            self.verdict(0x540001E0, 0x540001E1)[0], sigmaker.CrossBuildVerdict.CLASS
+        )
+
+    def test_encoding_table_names(self):
+        cases = {
+            0x14000004: "B/BL",
+            0x94000004: "B/BL",
+            0x540001E0: "B.cond",
+            0x34001483: "CBZ/CBNZ",
+            0x36080040: "TBZ/TBNZ",
+            0x90000000: "ADR/ADRP",
+            0x58000040: "LDR (literal)",
+            0xD28A8003: "MOVN/MOVZ/MOVK",
+            0xB9404B13: "LDR/STR (immediate)",
+            0xF85F83A0: "LDUR/STUR",
+            0xF8408420: "LDR/STR (post-index)",
+            0xF8408C20: "LDR/STR (pre-index)",
+            0xF8626820: "LDR/STR (register)",
+            0xA90153F3: "LDP/STP",
+            0x3100067F: "ADD/SUB (immediate)",
+            0x92400C00: "logical (immediate)",
+            0xD340FC00: "bitfield",
+            0x2A0103F4: "logical (register)",
+            0x8B030018: "ADD/SUB (register)",
+            0x9B027C20: "MADD/MSUB",
+            0x9A821020: "CSEL",
+            0xD65F03C0: "BR/BLR/RET",
+        }
+        for word, name in cases.items():
+            with self.subTest(word=hex(word)):
+                self.assertEqual(sigmaker._aarch64_encoding(word)[0], name)
+        self.assertIsNone(sigmaker._aarch64_encoding(0x00000000))
+
+
+class TestCrossBuildMerge(unittest.TestCase):
+    """Issue #100: merge the same function from several builds."""
+
+    def merge(self, reference, *others):
+        return sigmaker.CrossBuildMerge.aarch64(
+            _issue97_build(reference), [_issue97_build(o) for o in others]
+        )
+
+    def test_reproduces_the_issue_97_hand_built_signature(self):
+        merge = self.merge("C_latest", "B_prev", "A_old")
+        self.assertEqual(f"{merge.signature():ida}", _ISSUE97_HAND_SIG)
+        self.assertEqual(merge.build_count, 3)
+
+    def test_slot_breakdown_for_issue_97(self):
+        merge = self.merge("C_latest", "B_prev", "A_old")
+        V = sigmaker.CrossBuildVerdict
+        self.assertEqual(
+            [slot.verdict for slot in merge.slots],
+            # Slots 5-6 hold MOV/ADD in C but STP/MOV in A: a different
+            # instruction there. The diff pairs A's moved STP/MOV run with C's
+            # slots 11-12 only if no longer run crosses it, and one does, so
+            # those two read as "class" rather than "moved". Same wildcards.
+            [V.FIELDS] + [V.EXACT] * 4 + [V.CLASS] * 2 + [V.MOVED] * 6
+            + [V.FIELDS, V.EXACT, V.EXACT, V.FIELDS, V.EXACT],
+        )
+        self.assertEqual(
+            merge.verdict_counts(),
+            {V.EXACT: 7, V.FIELDS: 3, V.MOVED: 6, V.CLASS: 2},
+        )
+
+    def test_hand_signature_matches_every_build_at_the_start(self):
+        merge = self.merge("C_latest", "B_prev", "A_old")
+        signature = merge.signature()
+        for build in ("A_old", "B_prev", "C_latest"):
+            with self.subTest(build=build):
+                self.assertEqual(
+                    sigmaker.CrossBuildMerge.matches_at(
+                        _issue97_build(build), signature
+                    ),
+                    [0],
+                )
+
+    def test_two_builds_without_reordering_only_mask_changed_fields(self):
+        merge = self.merge("C_latest", "B_prev")
+        self.assertEqual(
+            f"{merge.signature():ida}",
+            "83 14 00 34 FD 7B B6 A9 FD 03 00 91 F7 63 03 A9 F7 03 03 2A "
+            "? ? ? D2 18 00 03 8B F3 53 01 A9 F4 03 01 2A F5 5B 02 A9 "
+            "F6 03 00 AA F9 6B 04 A9 F9 03 02 AA 13 ? ? B9 7F 06 00 31 "
+            "E0 01 00 54 ? ? ? F9 04 00 00 14",
+        )
+        self.assertNotIn(
+            sigmaker.CrossBuildVerdict.MOVED,
+            [slot.verdict for slot in merge.slots],
+        )
+
+    def test_swapped_instructions_are_moved(self):
+        a, b, c, d = 0xD503201F, 0xAA0003F6, 0x2A0103F4, 0xD65F03C0
+        merge = sigmaker.CrossBuildMerge.aarch64(
+            _words(a, b, c, d), [_words(a, c, b, d)]
+        )
+        V = sigmaker.CrossBuildVerdict
+        self.assertEqual(
+            [slot.verdict for slot in merge.slots], [V.EXACT, V.MOVED, V.MOVED, V.EXACT]
+        )
+
+    def test_builds_are_cut_to_the_shortest(self):
+        merge = sigmaker.CrossBuildMerge.aarch64(
+            _issue97_build("C_latest"), [_issue97_build("B_prev")[:20]]
+        )
+        self.assertEqual(len(merge.slots), 5)
+        self.assertEqual(len(merge.reference), 20)
+        self.assertEqual([len(o) for o in merge.others], [20])
+
+    def test_partial_trailing_instruction_is_ignored(self):
+        merge = sigmaker.CrossBuildMerge.aarch64(
+            _issue97_build("C_latest"), [_issue97_build("B_prev")[:7]]
+        )
+        self.assertEqual(len(merge.slots), 1)
+
+    def test_needs_another_build(self):
+        with self.assertRaises(ValueError):
+            sigmaker.CrossBuildMerge.aarch64(_issue97_build("C_latest"), [])
+
+    def test_needs_a_whole_instruction(self):
+        with self.assertRaises(ValueError):
+            sigmaker.CrossBuildMerge.aarch64(b"\x00\x01\x02", [b"\x00\x01\x02"])
+
+    def test_signature_prefix_and_extra_wildcards(self):
+        merge = self.merge("C_latest", "B_prev")
+        self.assertEqual(f"{merge.signature(2):ida}", "83 14 00 34 FD 7B B6 A9")
+        extra = [True, True, True, True] + [False] * (len(merge.slots) * 4 - 4)
+        self.assertEqual(f"{merge.signature(2, extra):ida}", "? ? ? ? FD 7B B6 A9")
+
+    def test_trailing_wildcards_are_trimmed(self):
+        merge = sigmaker.CrossBuildMerge.aarch64(
+            _words(0xD503201F, 0xD28A8003), [_words(0xD503201F, 0xA9046BF9)]
+        )
+        self.assertEqual(f"{merge.signature():ida}", "1F 20 03 D5")
+
+    def test_matches_at_handles_empty_and_misses(self):
+        empty = sigmaker.Signature()
+        self.assertEqual(sigmaker.CrossBuildMerge.matches_at(b"\x00" * 8, empty), [])
+        merge = self.merge("C_latest", "B_prev")
+        self.assertEqual(
+            sigmaker.CrossBuildMerge.matches_at(b"\x00" * 80, merge.signature()), []
+        )
+
+
+class TestCrossBuildText(unittest.TestCase):
+    """Issue #100: parse pasted builds."""
+
+    LISTING_C = """\
+83 14 00 34                     CBZ             W3, locret_CF1AE0 ; Compare and Branch on Zero
+FD 7B B6 A9                     STP             X29, X30, [SP,#var_A0]! ; Store Pair
+FD 03 00 91                     MOV             X29, SP         ; Rd = Op2
+"""
+    LISTING_A = """\
+43 14 00 34                     CBZ             W3, locret_D624E8 ; Compare and Branch on Zero
+FD 7B B6 A9                     STP             X29, X30, [SP,#var_A0]! ; Store Pair
+"""
+
+    def parse(self, text):
+        return sigmaker.CrossBuildText.parse(text)
+
+    def test_ida_listing_builds_split_on_blank_lines(self):
+        builds = self.parse(self.LISTING_C + "\n" + self.LISTING_A)
+        self.assertEqual(
+            builds,
+            [
+                bytes.fromhex("83140034 FD7BB6A9 FD030091"),
+                bytes.fromhex("43140034 FD7BB6A9"),
+            ],
+        )
+
+    def test_raw_hex_and_pipes(self):
+        text = _ISSUE97_BUILDS["A_old"] + "\n\n" + _ISSUE97_BUILDS["B_prev"]
+        self.assertEqual(
+            self.parse(text), [_issue97_build("A_old"), _issue97_build("B_prev")]
+        )
+
+    def test_compact_hex(self):
+        self.assertEqual(self.parse("83140034FD7BB6A9"), [bytes.fromhex("83140034FD7BB6A9")])
+
+    def test_dash_separator(self):
+        text = "83 14 00 34\n---\n43 14 00 34\n"
+        self.assertEqual(
+            self.parse(text), [bytes.fromhex("83140034"), bytes.fromhex("43140034")]
+        )
+
+    def test_addressed_listing_ignores_blank_lines_between_contiguous_lines(self):
+        text = (
+            "__text:0000000000CF1850 83 14 00 34    CBZ W3, locret_CF1AE0\n"
+            "__text:0000000000CF1854 04 00 00 14    B   loc_CF1864\n"
+            "__text:0000000000CF1858 ; ---------------------------------\n"
+            "\n"
+            "__text:0000000000CF1858 loc_CF1858:\n"
+            "__text:0000000000CF1858 C0 03 5F D6    RET\n"
+        )
+        self.assertEqual(self.parse(text), [bytes.fromhex("83140034 04000014 C0035FD6")])
+
+    def test_addressed_listing_splits_on_an_address_jump(self):
+        text = (
+            "__text:0000000000CF1850 83 14 00 34    CBZ W3, locret_CF1AE0\n"
+            "__text:0000000000D624E0 43 14 00 34    CBZ W3, locret_D624E8\n"
+        )
+        self.assertEqual(
+            self.parse(text), [bytes.fromhex("83140034"), bytes.fromhex("43140034")]
+        )
+
+    def test_bare_address_column(self):
+        text = "0000000000CF1850 83 14 00 34    CBZ W3, locret_CF1AE0\n"
+        self.assertEqual(self.parse(text), [bytes.fromhex("83140034")])
+
+    def test_label_and_comment_lines_are_skipped(self):
+        text = "sub_CF1850:\n; a comment\n83 14 00 34    CBZ W3, x\n"
+        self.assertEqual(self.parse(text), [bytes.fromhex("83140034")])
+
+    def test_empty_text(self):
+        self.assertEqual(self.parse(""), [])
+        self.assertEqual(self.parse("\n\n---\n"), [])
+
+
+class TestCrossBuildSignatureMaker(unittest.TestCase):
+    """Issue #100: grow the merged signature until unique in the database."""
+
+    def _cfg(self, **kwargs):
+        return sigmaker.SigMakerConfig(
+            output_format=sigmaker.SignatureType.IDA,
+            wildcard_operands=True,
+            continue_outside_of_function=False,
+            wildcard_optimized=True,
+            **kwargs,
+        )
+
+    def setUp(self):
+        self.reference = _issue97_build("C_latest")
+        self.others = [_issue97_build("B_prev"), _issue97_build("A_old")]
+        pfn = MagicMock(start_ea=0x1000, end_ea=0x1000 + 0x400)
+        self.searched = []
+        self.unique_from_bytes = 40
+
+        def find_all(pattern, **kwargs):
+            self.searched.append(pattern)
+            length = len(pattern.split())
+            if length >= self.unique_from_bytes:
+                return [sigmaker.Match(0x1000)]
+            return [sigmaker.Match(0x1000), sigmaker.Match(0x2000)]
+
+        self.patches = [
+            patch.object(sigmaker.CrossBuildSignatureMaker, "supported", return_value=True),
+            patch.object(sigmaker.idaapi, "get_func", return_value=pfn),
+            patch.object(sigmaker.idaapi, "get_bytes", return_value=self.reference),
+            patch.object(
+                sigmaker.CrossBuildSignatureMaker,
+                "_single_build_wildcards",
+                side_effect=lambda pfn, merge, cfg: [False] * (len(merge.slots) * 4),
+            ),
+            patch.object(sigmaker.SignatureSearcher, "find_all", side_effect=find_all),
+            patch.object(
+                sigmaker._Speedups, "current",
+                return_value=MagicMock(available=False),
+            ),
+            patch.object(sigmaker.SearchResults, "current_imagebase", return_value=None),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self.patches):
+            p.stop()
+
+    def test_grows_to_the_shortest_unique_prefix(self):
+        result = sigmaker.CrossBuildSignatureMaker().make(0x1010, self.others, self._cfg())
+        self.assertTrue(result.unique)
+        self.assertEqual(result.match_count, 1)
+        self.assertEqual(int(result.address), 0x1000)
+        # Prefixes grow by whole instructions. Prefixes ending inside the
+        # moved run trim back to 20 bytes, so the first with 40+ bytes ends
+        # at the LDR W19 slot: 14 instructions, 56 bytes.
+        self.assertEqual(len(result.signature), 56)
+        self.assertTrue(f"{result.signature:ida}".endswith("13 ? ? B9"))
+
+    def test_full_hand_signature_when_only_the_full_length_is_unique(self):
+        self.unique_from_bytes = 72
+        result = sigmaker.CrossBuildSignatureMaker().make(0x1010, self.others, self._cfg())
+        self.assertEqual(f"{result.signature:ida}", _ISSUE97_HAND_SIG)
+        self.assertTrue(result.unique)
+
+    def test_not_unique_returns_the_full_merge(self):
+        self.unique_from_bytes = 1000
+        result = sigmaker.CrossBuildSignatureMaker().make(0x1010, self.others, self._cfg())
+        self.assertFalse(result.unique)
+        self.assertEqual(result.match_count, 2)
+        self.assertEqual(f"{result.signature:ida}", _ISSUE97_HAND_SIG)
+        self.assertEqual(len(self.searched), 1)
+
+    def test_reads_no_more_than_the_longest_pasted_build(self):
+        sigmaker.CrossBuildSignatureMaker().make(0x1010, self.others, self._cfg())
+        sigmaker.idaapi.get_bytes.assert_called_with(0x1000, 72)
+
+    def test_report_lines(self):
+        self.unique_from_bytes = 72
+        result = sigmaker.CrossBuildSignatureMaker().make(0x1010, self.others, self._cfg())
+        lines = result.report_lines(self._cfg(), " (sub_1000)")
+        self.assertEqual(
+            lines[0],
+            "Cross-build signature for 0x1000 (sub_1000) (this database + 2 pasted builds)",
+        )
+        self.assertIn("7 identical, 3 with changed fields, 6 moved, 2 different", lines[1])
+        self.assertIn("18 instructions (72 bytes, 32 exact)", lines[2])
+        self.assertEqual(lines[3], "  pasted build 1: matches at +0x0")
+        self.assertEqual(lines[4], "  pasted build 2: matches at +0x0")
+        self.assertEqual(lines[5], "  this database: unique (1 match)")
+        self.assertEqual(lines[6], f"  IDA: {_ISSUE97_HAND_SIG}")
+
+    def test_report_lines_not_unique_and_miss(self):
+        self.unique_from_bytes = 1000
+        result = sigmaker.CrossBuildSignatureMaker().make(0x1010, self.others[:1], self._cfg())
+        lines = result.report_lines(self._cfg())
+        self.assertIn("this database + 1 pasted build)", lines[0])
+        self.assertEqual(lines[-2], "  this database: NOT unique (2 or more matches)")
+
+    def test_rejects_non_aarch64(self):
+        with patch.object(
+            sigmaker.CrossBuildSignatureMaker, "supported", return_value=False
+        ):
+            with self.assertRaises(sigmaker.Unexpected):
+                sigmaker.CrossBuildSignatureMaker().make(0x1010, self.others, self._cfg())
+
+    def test_rejects_no_function(self):
+        sigmaker.idaapi.get_func.return_value = None
+        with self.assertRaises(sigmaker.Unexpected):
+            sigmaker.CrossBuildSignatureMaker().make(0x1010, self.others, self._cfg())
+
+    def test_rejects_no_builds(self):
+        with self.assertRaises(sigmaker.Unexpected):
+            sigmaker.CrossBuildSignatureMaker().make(0x1010, [], self._cfg())
+
+    def test_rejects_builds_shorter_than_an_instruction(self):
+        with self.assertRaises(sigmaker.Unexpected):
+            sigmaker.CrossBuildSignatureMaker().make(0x1010, [b"\x00\x01"], self._cfg())
+
+
 if __name__ == "__main__":
     # Run the tests (coverage is handled by the CI runner).
     unittest.main(verbosity=2)

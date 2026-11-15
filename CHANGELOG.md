@@ -4,6 +4,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-11-15
+
 ### Added
 
 - **Cross-build signatures (AArch64).** Right-click in the disassembly, SigMaker > *Cross-build signature for function...*, and paste the same function from your other builds (raw hex or IDA listing lines with opcode bytes). SigMaker lines the builds up instruction by instruction: bytes identical everywhere stay exact, fields that changed (offsets, registers, immediates) are wildcarded field by field, and instructions the compiler moved are wildcarded whole. It then grows the signature until it is unique in the open database and shows whether it matches every pasted build before copying it. Scripts can use `CrossBuildSignatureMaker().make(ea, builds, cfg)` with `CrossBuildText.parse(text)`. Nothing changes unless you use the new action. (#100)
@@ -76,7 +78,8 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 - **PyPI builds now run only for published releases.** Ordinary successful tests on `main` no longer launch an untagged wheel build, and the HCLI manifest version and exact PyPI dependency pin are synchronized from `sigmaker.__version__` during release preparation.
 
-[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.16.0...HEAD
+[Unreleased]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.17.0...HEAD
+[1.17.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.16.0...v1.17.0
 [1.16.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.15.1...v1.16.0
 [1.15.1]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.15.0...v1.15.1
 [1.15.0]: https://github.com/mahmoudimus/ida-sigmaker/compare/v1.14.3...v1.15.0

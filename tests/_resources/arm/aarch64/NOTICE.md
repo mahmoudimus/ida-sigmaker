@@ -41,3 +41,23 @@ Fixture SHA-256:
 ```text
 4417d846189836c525ef541701e8f92ef995c2c436cee9eada87c2792f9d00b5
 ```
+
+## AArch64 Cross-Build Fixture
+
+`aarch64_cross_build.o` is built from the adjacent `aarch64_cross_build.s`. It
+holds the latest build of the issue #97 function (as `.inst` words, padded with
+`NOP`s so its branch targets fall inside the function) and a decoy that shares
+its first five instructions, to exercise the issue #100 cross-build signature
+merge. Built with Apple Clang 21.0.0 (`clang-2100.1.1.101`):
+
+```text
+clang -target aarch64-none-elf -c \
+    tests/_resources/arm/aarch64/aarch64_cross_build.s \
+    -o tests/_resources/arm/aarch64/aarch64_cross_build.o
+```
+
+Fixture SHA-256:
+
+```text
+8017521d878355b0a753d87ad16beb32cfc61dcc48a81f7d1e76ce94f282b5be
+```

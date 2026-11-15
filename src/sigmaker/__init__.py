@@ -12,6 +12,7 @@ import contextlib
 import contextvars
 import csv
 import dataclasses
+import difflib
 import enum
 import functools
 import io
@@ -4610,6 +4611,553 @@ class BatchSignatureSearcher:
         )
 
 
+# ---------------------------------------------------------------------------
+# Cross-build signatures (issue #100)
+#
+# Merge the same function from several builds into one signature: bytes that
+# are identical in every build stay exact, fields that changed (offsets,
+# registers, immediates) are wildcarded field by field, and instructions the
+# compiler rescheduled are wildcarded whole. AArch64 only for now: its fixed
+# 4-byte instructions line up slot by slot from the function start.
+# ---------------------------------------------------------------------------
+
+
+class CrossBuildVerdict(enum.Enum):
+    """Why one instruction slot of a cross-build signature looks the way it does."""
+
+    #: Identical in every build.
+    EXACT = "exact"
+    #: Same instruction in every build; only the fields that changed are wildcarded.
+    FIELDS = "fields"
+    #: The compiler moved this instruction between builds; wildcarded whole.
+    MOVED = "moved"
+    #: A different instruction at this slot in some build; wildcarded whole.
+    CLASS = "class"
+
+
+_A64_RT = (0, 4)
+_A64_RN = (5, 9)
+_A64_RM = (16, 20)
+
+#: AArch64 encoding classes for the cross-build merge, first match wins:
+#: (mask, value, name, fields). Fields are inclusive (lo_bit, hi_bit) ranges.
+#: Bits outside every field are the opcode, so builds that differ there hold a
+#: different instruction at that slot.
+_AARCH64_ENCODINGS: tuple[
+    tuple[int, int, str, tuple[tuple[int, int], ...]], ...
+] = (
+    (0x7C000000, 0x14000000, "B/BL", ((0, 25),)),
+    (0xFF000010, 0x54000000, "B.cond", ((5, 23),)),
+    (0x7E000000, 0x34000000, "CBZ/CBNZ", (_A64_RT, (5, 23))),
+    (0x7E000000, 0x36000000, "TBZ/TBNZ", (_A64_RT, (5, 18), (19, 23))),
+    (0x1F000000, 0x10000000, "ADR/ADRP", (_A64_RT, (5, 23), (29, 30))),
+    (0x3B000000, 0x18000000, "LDR (literal)", (_A64_RT, (5, 23))),
+    (0x1F800000, 0x12800000, "MOVN/MOVZ/MOVK", (_A64_RT, (5, 20))),
+    (0x3B000000, 0x39000000, "LDR/STR (immediate)", (_A64_RT, _A64_RN, (10, 21))),
+    (0x3B200C00, 0x38000000, "LDUR/STUR", (_A64_RT, _A64_RN, (12, 20))),
+    (0x3B200C00, 0x38000400, "LDR/STR (post-index)", (_A64_RT, _A64_RN, (12, 20))),
+    (0x3B200C00, 0x38000C00, "LDR/STR (pre-index)", (_A64_RT, _A64_RN, (12, 20))),
+    (0x3B200C00, 0x38200800, "LDR/STR (register)", (_A64_RT, _A64_RN, _A64_RM)),
+    (0x3A000000, 0x28000000, "LDP/STP", (_A64_RT, _A64_RN, (10, 14), (15, 21))),
+    (0x1F000000, 0x11000000, "ADD/SUB (immediate)", (_A64_RT, _A64_RN, (10, 21))),
+    (0x1F800000, 0x12000000, "logical (immediate)", (_A64_RT, _A64_RN, (10, 22))),
+    (0x1F800000, 0x13000000, "bitfield", (_A64_RT, _A64_RN, (10, 21))),
+    (0x1F000000, 0x0A000000, "logical (register)", (_A64_RT, _A64_RN, (10, 15), _A64_RM)),
+    (0x1F000000, 0x0B000000, "ADD/SUB (register)", (_A64_RT, _A64_RN, (10, 15), _A64_RM)),
+    (0x1F000000, 0x1B000000, "MADD/MSUB", (_A64_RT, _A64_RN, (10, 14), _A64_RM)),
+    (0x1FE00000, 0x1A800000, "CSEL", (_A64_RT, _A64_RN, _A64_RM)),
+    (0xFE1FFC1F, 0xD61F0000, "BR/BLR/RET", (_A64_RN,)),
+)
+
+
+#: Fields holding a PC-relative address, per encoding class. IDA does not
+#: report ARM operand byte offsets, so the single-build policy wildcards these
+#: instructions whole; the cross-build merge narrows that to the address field
+#: and keeps the opcode (``? ? ? 34`` rather than ``? ? ? ?`` for a CBZ).
+_AARCH64_ADDRESS_FIELDS: dict[str, tuple[tuple[int, int], ...]] = {
+    "B/BL": ((0, 25),),
+    "B.cond": ((5, 23),),
+    "CBZ/CBNZ": ((5, 23),),
+    "TBZ/TBNZ": ((5, 18),),
+    "ADR/ADRP": ((5, 23), (29, 30)),
+    "LDR (literal)": ((5, 23),),
+}
+
+
+def _narrow_to_address_fields(
+    word: int, wildcards: typing.Sequence[bool]
+) -> list[bool]:
+    """Shrink a whole-instruction wildcard to the bytes of its address field.
+
+    Leaves ``wildcards`` unchanged for instructions without a PC-relative
+    address field, or when nothing is wildcarded.
+    """
+    encoding = _aarch64_encoding(word)
+    if encoding is None or not any(wildcards):
+        return list(wildcards)
+    fields = _AARCH64_ADDRESS_FIELDS.get(encoding[0])
+    if fields is None:
+        return list(wildcards)
+    masked = {
+        index for lo, hi in fields for index in range(lo // 8, hi // 8 + 1)
+    }
+    return [index in masked for index in range(len(wildcards))]
+
+
+def _aarch64_encoding(
+    word: int,
+) -> typing.Optional[tuple[str, tuple[tuple[int, int], ...]]]:
+    """Return (class name, fields) for an AArch64 word, or None if unknown."""
+    for mask, value, name, fields in _AARCH64_ENCODINGS:
+        if word & mask == value:
+            return name, fields
+    return None
+
+
+def _field_value(word: int, field: tuple[int, int]) -> int:
+    lo, hi = field
+    return (word >> lo) & ((1 << (hi - lo + 1)) - 1)
+
+
+def _aarch64_slot_verdict(
+    words: typing.Sequence[int],
+) -> tuple[CrossBuildVerdict, tuple[bool, bool, bool, bool]]:
+    """Merge one instruction slot across builds (first word is the reference).
+
+    Returns the verdict and which of the slot's 4 bytes are wildcards.
+    """
+    reference = words[0]
+    if all(word == reference for word in words):
+        return CrossBuildVerdict.EXACT, (False, False, False, False)
+    encoding = _aarch64_encoding(reference)
+    whole = (True, True, True, True)
+    if encoding is None:
+        return CrossBuildVerdict.CLASS, whole
+    name, fields = encoding
+    field_bits = 0
+    for lo, hi in fields:
+        field_bits |= ((1 << (hi - lo + 1)) - 1) << lo
+    opcode = reference & ~field_bits & 0xFFFFFFFF
+    for word in words[1:]:
+        other = _aarch64_encoding(word)
+        if other is None or other[0] != name or word & ~field_bits & 0xFFFFFFFF != opcode:
+            return CrossBuildVerdict.CLASS, whole
+    masked: set[int] = set()
+    for field in fields:
+        values = {_field_value(word, field) for word in words}
+        if len(values) > 1:
+            lo, hi = field
+            masked.update(range(lo // 8, hi // 8 + 1))
+    wildcards = tuple(index in masked for index in range(4))
+    return CrossBuildVerdict.FIELDS, typing.cast(
+        tuple[bool, bool, bool, bool], wildcards
+    )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CrossBuildSlot:
+    """One merged instruction slot."""
+
+    #: Byte offset of the slot from the function start.
+    offset: int
+    verdict: CrossBuildVerdict
+    #: Per-byte wildcard flags for the slot's 4 bytes.
+    wildcards: tuple[bool, bool, bool, bool]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CrossBuildMerge:
+    """The same function from several builds, merged slot by slot.
+
+    ``reference`` is the build open in IDA; ``others`` are the pasted builds.
+    Every build is cut to the shortest one, so each slot exists in all of them.
+    """
+
+    SLOT_SIZE: typing.ClassVar[int] = 4
+
+    reference: bytes
+    others: tuple[bytes, ...]
+    slots: tuple[CrossBuildSlot, ...]
+
+    @classmethod
+    def aarch64(
+        cls, reference: bytes, others: typing.Sequence[bytes]
+    ) -> "CrossBuildMerge":
+        """Merge AArch64 builds of one function, each starting at the function start."""
+        if not others:
+            raise ValueError("Need at least one other build to merge with.")
+        size = cls.SLOT_SIZE
+        slot_count = min(len(build) for build in (reference, *others)) // size
+        if slot_count == 0:
+            raise ValueError("Every build needs at least one whole instruction.")
+        builds = [reference, *others]
+        words = [
+            [
+                int.from_bytes(build[i * size : (i + 1) * size], "little")
+                for i in range(len(build) // size)
+            ]
+            for build in builds
+        ]
+        moved = cls._moved_slots(words[0], words[1:], slot_count)
+        slots = []
+        for index in range(slot_count):
+            if index in moved:
+                slots.append(
+                    CrossBuildSlot(
+                        index * size,
+                        CrossBuildVerdict.MOVED,
+                        (True, True, True, True),
+                    )
+                )
+                continue
+            verdict, wildcards = _aarch64_slot_verdict(
+                [build_words[index] for build_words in words]
+            )
+            slots.append(CrossBuildSlot(index * size, verdict, wildcards))
+        length = slot_count * size
+        return cls(
+            reference=bytes(reference[:length]),
+            others=tuple(bytes(build[:length]) for build in others),
+            slots=tuple(slots),
+        )
+
+    @staticmethod
+    def _moved_slots(
+        reference: list[int], others: list[list[int]], slot_count: int
+    ) -> set[int]:
+        """Slots holding an instruction the compiler rescheduled.
+
+        Diff each build against the reference on exact instruction words. An
+        identical run that the diff pairs up at a different slot was moved, so
+        both the slots it left and the slots it landed on are wildcarded.
+        """
+        moved: set[int] = set()
+        for other in others:
+            matcher = difflib.SequenceMatcher(a=reference, b=other, autojunk=False)
+            for a_start, b_start, run in matcher.get_matching_blocks():
+                if run and a_start != b_start:
+                    moved.update(range(a_start, a_start + run))
+                    moved.update(range(b_start, b_start + run))
+        return {index for index in moved if index < slot_count}
+
+    @property
+    def build_count(self) -> int:
+        """Number of builds merged, including the reference."""
+        return 1 + len(self.others)
+
+    def wildcard_mask(self) -> list[bool]:
+        """Per-byte wildcard flags over the merged length."""
+        return [flag for slot in self.slots for flag in slot.wildcards]
+
+    def verdict_counts(self) -> dict[CrossBuildVerdict, int]:
+        counts = {verdict: 0 for verdict in CrossBuildVerdict}
+        for slot in self.slots:
+            counts[slot.verdict] += 1
+        return counts
+
+    def signature(
+        self,
+        slot_count: typing.Optional[int] = None,
+        extra_wildcards: typing.Optional[typing.Sequence[bool]] = None,
+    ) -> Signature:
+        """The merged signature over the first ``slot_count`` slots.
+
+        ``extra_wildcards`` adds per-byte wildcards on top of the merge (for
+        example operands the single-build policy would wildcard anyway).
+        Trailing wildcards are trimmed.
+        """
+        mask = self.wildcard_mask()
+        if extra_wildcards is not None:
+            mask = [a or bool(b) for a, b in zip(mask, extra_wildcards)]
+        count = len(self.slots) if slot_count is None else slot_count
+        length = count * self.SLOT_SIZE
+        signature = Signature(
+            SignatureByte(value, wildcard)
+            for value, wildcard in zip(self.reference[:length], mask[:length])
+        )
+        signature.trim_signature()
+        return signature
+
+    @staticmethod
+    def matches_at(data: bytes, signature: Signature) -> list[int]:
+        """Every offset in ``data`` where ``signature`` matches."""
+        width = len(signature)
+        if width == 0:
+            return []
+        return [
+            start
+            for start in range(len(data) - width + 1)
+            if all(
+                byte.is_wildcard or data[start + i] == byte.value
+                for i, byte in enumerate(signature)
+            )
+        ]
+
+
+class CrossBuildText:
+    """Parse pasted builds: raw hex, or IDA listing lines with opcode bytes.
+
+    Builds are separated by a blank line or a line of ``---``/``===``. When the
+    listing carries addresses (``__text:0000000000D63130 83 14 00 34 ...``), a
+    blank line between contiguous addresses does not split the build, and a
+    jump in addresses starts a new one.
+    """
+
+    _HEX_PAIR: typing.ClassVar[re.Pattern[str]] = re.compile(r"^[0-9A-Fa-f]{2}$")
+    _HEX: typing.ClassVar[re.Pattern[str]] = re.compile(r"^(?:[0-9A-Fa-f]{2})+$")
+    _SEGMENT_ADDRESS: typing.ClassVar[re.Pattern[str]] = re.compile(
+        r"^[A-Za-z_.$@?][\w.$@?]*:([0-9A-Fa-f]+)$"
+    )
+    _SEPARATOR: typing.ClassVar[re.Pattern[str]] = re.compile(r"^(?:-{3,}|={3,})$")
+
+    @classmethod
+    def _line_bytes(cls, line: str) -> tuple[typing.Optional[int], bytes]:
+        """(address or None, the line's leading opcode bytes)."""
+        tokens = line.replace("|", " ").split()
+        if not tokens:
+            return None, b""
+        address = None
+        prefix = cls._SEGMENT_ADDRESS.match(tokens[0])
+        if prefix:
+            address = int(prefix.group(1), 16)
+            tokens = tokens[1:]
+        elif (
+            len(tokens) > 1
+            and len(tokens[0]) >= 8
+            and cls._HEX.match(tokens[0])
+            and cls._HEX_PAIR.match(tokens[1])
+        ):
+            # Bare address column: "0000000000D63130 83 14 00 34 ..."
+            address = int(tokens[0], 16)
+            tokens = tokens[1:]
+        if len(tokens) == 1 and cls._HEX.match(tokens[0]):
+            return address, bytes.fromhex(tokens[0])
+        out = bytearray()
+        for token in tokens:
+            if not cls._HEX_PAIR.match(token):
+                break
+            out.append(int(token, 16))
+        return address, bytes(out)
+
+    @classmethod
+    def parse(cls, text: str) -> list[bytes]:
+        builds: list[bytearray] = []
+        current: typing.Optional[bytearray] = None
+        pending_break = False
+        next_address: typing.Optional[int] = None
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line:
+                pending_break = True
+                continue
+            if cls._SEPARATOR.match(line):
+                current = None
+                next_address = None
+                pending_break = False
+                continue
+            address, data = cls._line_bytes(line)
+            if not data:
+                continue
+            contiguous = address is not None and address == next_address
+            jumped = (
+                address is not None
+                and next_address is not None
+                and address != next_address
+            )
+            if current is None or jumped or (pending_break and not contiguous):
+                current = bytearray()
+                builds.append(current)
+            current.extend(data)
+            pending_break = False
+            next_address = None if address is None else address + len(data)
+        return [bytes(build) for build in builds if build]
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CrossBuildSignature:
+    """Result of a cross-build signature run."""
+
+    signature: Signature
+    #: Where the signature starts: the function start in the open database.
+    address: Match
+    merge: CrossBuildMerge
+    #: Matches in the open database (search stops counting past 2).
+    match_count: int
+
+    @property
+    def unique(self) -> bool:
+        return self.match_count == 1
+
+    def report_lines(self, cfg: SigMakerConfig, name: str = "") -> list[str]:
+        """Human-readable summary for the Output window and the preview."""
+        merge = self.merge
+        counts = merge.verdict_counts()
+        covered = (len(self.signature) + merge.SLOT_SIZE - 1) // merge.SLOT_SIZE
+        shown = {
+            verdict: sum(
+                1 for slot in merge.slots[:covered] if slot.verdict is verdict
+            )
+            for verdict in CrossBuildVerdict
+        }
+        label = f"{self.address}{name}"
+        lines = [
+            f"Cross-build signature for {label} "
+            f"(this database + {len(merge.others)} pasted "
+            f"build{'s' if len(merge.others) != 1 else ''})",
+            f"  merged {len(merge.slots)} instructions: "
+            f"{counts[CrossBuildVerdict.EXACT]} identical, "
+            f"{counts[CrossBuildVerdict.FIELDS]} with changed fields, "
+            f"{counts[CrossBuildVerdict.MOVED]} moved, "
+            f"{counts[CrossBuildVerdict.CLASS]} different",
+            f"  signature covers {covered} instructions "
+            f"({len(self.signature)} bytes, "
+            f"{sum(1 for b in self.signature if not b.is_wildcard)} exact): "
+            f"{shown[CrossBuildVerdict.EXACT]} identical, "
+            f"{shown[CrossBuildVerdict.FIELDS]} with changed fields, "
+            f"{shown[CrossBuildVerdict.MOVED]} moved, "
+            f"{shown[CrossBuildVerdict.CLASS]} different",
+        ]
+        for index, build in enumerate(merge.others, start=1):
+            hits = CrossBuildMerge.matches_at(build, self.signature)
+            where = ", ".join(f"+{hit:#x}" for hit in hits) if hits else "miss"
+            lines.append(f"  pasted build {index}: matches at {where}")
+        if self.unique:
+            lines.append("  this database: unique (1 match)")
+        else:
+            lines.append(
+                "  this database: NOT unique "
+                f"({'2 or more' if self.match_count > 1 else self.match_count} matches)"
+            )
+        lines.append(
+            f"  {cfg.output_format.name}: {format(self.signature, cfg.output_format.value)}"
+        )
+        return lines
+
+
+class CrossBuildSignatureMaker:
+    """Build a cross-build signature for the function at ``ea`` (AArch64)."""
+
+    @staticmethod
+    def supported() -> bool:
+        return idaapi.ph_get_id() == idaapi.PLFM_ARM and bool(idaapi.inf_is_64bit())
+
+    def make(
+        self,
+        ea: int,
+        builds: typing.Sequence[bytes],
+        cfg: SigMakerConfig,
+    ) -> CrossBuildSignature:
+        if not self.supported():
+            raise Unexpected("Cross-build signatures support AArch64 databases only for now.")
+        pfn = idaapi.get_func(ea)
+        if pfn is None:
+            raise Unexpected("Place the cursor inside a function first.")
+        if not builds:
+            raise Unexpected("Paste at least one other build of this function.")
+        start = int(pfn.start_ea)
+        length = min(int(pfn.end_ea) - start, max(len(build) for build in builds))
+        reference = idaapi.get_bytes(start, length) or b""
+        try:
+            merge = CrossBuildMerge.aarch64(reference, builds)
+        except ValueError as exc:
+            raise Unexpected(str(exc)) from exc
+
+        extra = self._single_build_wildcards(pfn, merge, cfg)
+        scope = (
+            SignatureSearcher._scope_for_ea(start) if cfg.scope_to_segment else None
+        )
+        buf = _load_search_buffer(scope) if _Speedups.current().available else None
+        imagebase = SearchResults.current_imagebase(buf)
+
+        def count(slot_count: int) -> int:
+            signature = merge.signature(slot_count, extra)
+            if not any(not byte.is_wildcard for byte in signature):
+                return 2
+            matches = SignatureSearcher.find_all(
+                format(signature, SignatureType.IDA.value),
+                buf=buf,
+                skip_more_than_one=True,
+                scope=None if buf is not None else scope,
+                imagebase=imagebase,
+                raise_on_cancel=True,
+            )
+            return len(matches)
+
+        total = len(merge.slots)
+        best = total
+        best_count = count(total)
+        if best_count == 1:
+            low, high = 1, total
+            while low < high:
+                middle = (low + high) // 2
+                if count(middle) == 1:
+                    high = middle
+                else:
+                    low = middle + 1
+            best, best_count = low, 1
+        return CrossBuildSignature(
+            signature=merge.signature(best, extra),
+            address=Match(start),
+            merge=merge,
+            match_count=best_count,
+        )
+
+    @staticmethod
+    def _single_build_wildcards(
+        pfn, merge: CrossBuildMerge, cfg: SigMakerConfig
+    ) -> list[bool]:
+        """Wildcards the normal single-build rules add on the reference.
+
+        Address-bearing operands (calls, ADRP pages, far branches) can match by
+        chance across a few builds and still move in the next one, so the
+        single-build policy still applies. The exception is a direct branch
+        to a target inside this function that is identical in every build:
+        the builds are evidence that its displacement is stable.
+        """
+        start = int(pfn.start_ea)
+        mask = [False] * (len(merge.slots) * merge.SLOT_SIZE)
+        if not cfg.wildcard_operands:
+            return mask
+        processor = InstructionProcessor(OperandProcessor())
+        with _cfg_policy_scope(cfg):
+            for slot in merge.slots:
+                ea = start + slot.offset
+                insn = idaapi.insn_t()
+                if idaapi.decode_insn(insn, ea) != merge.SLOT_SIZE:
+                    continue
+                if slot.verdict is CrossBuildVerdict.EXACT and _is_local_branch(
+                    insn, start
+                ):
+                    continue
+                signature = Signature()
+                processor.append_instruction_to_sig(
+                    signature, ea, insn, True, cfg.wildcard_optimized
+                )
+                word = int.from_bytes(
+                    merge.reference[slot.offset : slot.offset + merge.SLOT_SIZE],
+                    "little",
+                )
+                narrowed = _narrow_to_address_fields(
+                    word,
+                    [byte.is_wildcard for byte in signature[: merge.SLOT_SIZE]],
+                )
+                mask[slot.offset : slot.offset + len(narrowed)] = narrowed
+        return mask
+
+
+def _is_local_branch(insn, function_start: int) -> bool:
+    """True for a direct, non-call branch whose target is in the same function."""
+    if idaapi.is_call_insn(insn):
+        return False
+    for operand in insn.ops:
+        if operand.type == idaapi.o_void:
+            break
+        if operand.type == idaapi.o_near:
+            target = idaapi.get_func(operand.addr)
+            return target is not None and int(target.start_ea) == function_start
+    return False
+
+
 class Profiler:
     """Central holder for the optional cProfile session behind the Start/Stop
     Profiling actions.
@@ -5503,6 +6051,7 @@ class SigMakerPlugin(idaapi.plugin_t):
     ACTION_STOP_PROFILING: str = "pysigmaker:stop_profiling"
     ACTION_PSEUDOCODE_SELECTION_SIG: str = "pysigmaker:pseudocode_selection_sig"
     ACTION_PSEUDOCODE_FUNCTION_SIG: str = "pysigmaker:pseudocode_function_sig"
+    ACTION_CROSS_BUILD_SIG: str = "pysigmaker:cross_build_sig"
 
     #: Settings from the last dialog run, reused by the right-click actions
     #: that skip the dialog. None until the dialog has been opened once.
@@ -5521,6 +6070,15 @@ class SigMakerPlugin(idaapi.plugin_t):
             _PopupHook(self.ACTION_SHOW_SIGMAKER, category="SigMaker"),
             _PopupHook(self.ACTION_START_PROFILING, category="SigMaker"),
             _PopupHook(self.ACTION_STOP_PROFILING, category="SigMaker"),
+            # Issue #100: only offered where it works (AArch64 for now).
+            _PopupHook(
+                self.ACTION_CROSS_BUILD_SIG,
+                predicate=lambda widget, popup, ctx: (
+                    _PopupHook.is_disassembly_widget(widget, popup, ctx)
+                    and CrossBuildSignatureMaker.supported()
+                ),
+                category="SigMaker",
+            ),
             # Pseudocode view: exactly one of the two attaches, decided by
             # whether the user has a selection, so the label always matches
             # what the action will do. Top level, not under "SigMaker/", to
@@ -5605,6 +6163,17 @@ class SigMakerPlugin(idaapi.plugin_t):
                 154,
             )
         )
+        idaapi.register_action(
+            idaapi.action_desc_t(
+                self.ACTION_CROSS_BUILD_SIG,
+                "Cross-build signature for function...",
+                _ActionHandler(self._action_cross_build_sig),
+                None,
+                "Merge this function with the same function pasted from other "
+                "builds into one signature that matches all of them.",
+                154,
+            )
+        )
 
     def _deregister_actions(self) -> None:
         idaapi.unregister_action(self.ACTION_SHOW_SIGMAKER)
@@ -5612,6 +6181,7 @@ class SigMakerPlugin(idaapi.plugin_t):
         idaapi.unregister_action(self.ACTION_STOP_PROFILING)
         idaapi.unregister_action(self.ACTION_PSEUDOCODE_SELECTION_SIG)
         idaapi.unregister_action(self.ACTION_PSEUDOCODE_FUNCTION_SIG)
+        idaapi.unregister_action(self.ACTION_CROSS_BUILD_SIG)
 
     def _action_start_profiling(self, ctx=None) -> None:
         start_profiling()
@@ -5808,6 +6378,51 @@ class SigMakerPlugin(idaapi.plugin_t):
         ea = idaapi.get_screen_ea() if view is None else view.entry_ea
         with self._action_scope():
             self._run_function_and_xref_sigs(ea, self._quick_config())
+
+    _CROSS_BUILD_PROMPT: typing.ClassVar[str] = (
+        "Paste the same function from your other builds, start of function first.\n"
+        "Raw hex or IDA listing lines with opcode bytes.\n"
+        "Separate builds with a blank line or a line of ---."
+    )
+
+    def _action_cross_build_sig(self, ctx=None) -> None:
+        """Right-click: merge this function with pasted copies from other
+        builds into one signature (issue #100)."""
+        ea = idaapi.get_screen_ea()
+        with self._action_scope():
+            pfn = idaapi.get_func(ea)
+            if pfn is None:
+                idaapi.msg("Place cursor inside a function first.\n")
+                return
+            text = idaapi.ask_text(0, "", self._CROSS_BUILD_PROMPT)
+            if not text:
+                idaapi.msg("No builds pasted.\n")
+                return
+            builds = CrossBuildText.parse(text)
+            if not builds:
+                idaapi.msg("Found no opcode bytes in the pasted text.\n")
+                return
+            config = self._quick_config()
+            with ProgressDialog(
+                "Cross-build signature\n\n"
+                "Merging the builds and checking uniqueness.\n\n"
+                "Press Cancel to stop"
+            ):
+                result = CrossBuildSignatureMaker().make(
+                    int(pfn.start_ea), builds, config
+                )
+            lines = result.report_lines(
+                config, _func_name_suffix(int(pfn.start_ea))
+            )
+            for line in lines:
+                idaapi.msg(f"{line}\n")
+            question = "\n".join(lines[1:-1]) + "\n\nCopy the signature to the clipboard?"
+            # ask_yn takes a printf-style format string.
+            question = question.replace("%", "%%")
+            if idaapi.ask_yn(idaapi.ASKBTN_YES, f"HIDECANCEL\n{question}") == idaapi.ASKBTN_YES:
+                fmted = format(result.signature, config.output_format.value)
+                if Clipboard.set_text(fmted):
+                    idaapi.msg("Copied the cross-build signature to the clipboard.\n")
 
     @staticmethod
     def _report_uniqueness(

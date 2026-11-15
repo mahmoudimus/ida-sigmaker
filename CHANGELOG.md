@@ -4,6 +4,10 @@ All notable user-visible changes to this plugin are documented here. The format 
 
 ## [Unreleased]
 
+### Added
+
+- **Cross-build signatures (AArch64).** Right-click in the disassembly, SigMaker > *Cross-build signature for function...*, and paste the same function from your other builds (raw hex or IDA listing lines with opcode bytes). SigMaker lines the builds up instruction by instruction: bytes identical everywhere stay exact, fields that changed (offsets, registers, immediates) are wildcarded field by field, and instructions the compiler moved are wildcarded whole. It then grows the signature until it is unique in the open database and shows whether it matches every pasted build before copying it. Scripts can use `CrossBuildSignatureMaker().make(ea, builds, cfg)` with `CrossBuildText.parse(text)`. Nothing changes unless you use the new action. (#100)
+
 ## [1.16.0] - 2026-11-06
 
 ### Added

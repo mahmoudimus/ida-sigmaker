@@ -1106,6 +1106,127 @@ class TestAArch64StructOffsetFixture(OperandFixtureIntegrationTest):
         )
 
 
+class TestCrossBuildFixture(OpenedFixtureIntegrationTest):
+    """Issue #100: cross-build signature for the issue #97 function."""
+
+    _fixture_parts = ("arm", "aarch64", "aarch64_cross_build.o")
+    # Two older builds of the function, pasted the way IDA lists them.
+    _PASTED = """\
+83 14 00 34                     CBZ             W3, locret_CF1AE0
+FD 7B B6 A9                     STP             X29, X30, [SP,#var_A0]!
+FD 03 00 91                     MOV             X29, SP
+F7 63 03 A9                     STP             X23, X24, [SP,#0xA0+var_70]
+F7 03 03 2A                     MOV             W23, W3
+03 60 8A D2                     MOV             X3, #0x5300
+18 00 03 8B                     ADD             X24, X0, X3
+F3 53 01 A9                     STP             X19, X20, [SP,#0xA0+var_90]
+F4 03 01 2A                     MOV             W20, W1
+F5 5B 02 A9                     STP             X21, X22, [SP,#0xA0+var_80]
+F6 03 00 AA                     MOV             X22, X0
+F9 6B 04 A9                     STP             X25, X26, [SP,#0xA0+var_60]
+F9 03 02 AA                     MOV             X25, X2
+13 1B 40 B9                     LDR             W19, [X24,#0x18]
+7F 06 00 31                     CMN             W19, #1
+E0 01 00 54                     B.EQ            loc_CF18C8
+03 98 69 F9                     LDR             X3, [X0,#0x5330]
+04 00 00 14                     B               loc_CF18A4
+
+43 14 00 34                     CBZ             W3, locret_D624E8
+FD 7B B6 A9                     STP             X29, X30, [SP,#var_A0]!
+FD 03 00 91                     MOV             X29, SP
+F7 63 03 A9                     STP             X23, X24, [SP,#0xA0+var_70]
+F7 03 03 2A                     MOV             W23, W3
+F9 6B 04 A9                     STP             X25, X26, [SP,#0xA0+var_60]
+F9 03 02 AA                     MOV             X25, X2
+02 7A 8A D2                     MOV             X2, #0x53D0
+18 00 02 8B                     ADD             X24, X0, X2
+F3 53 01 A9                     STP             X19, X20, [SP,#0xA0+var_90]
+F4 03 01 2A                     MOV             W20, W1
+F5 5B 02 A9                     STP             X21, X22, [SP,#0xA0+var_80]
+F6 03 00 AA                     MOV             X22, X0
+13 1B 40 B9                     LDR             W19, [X24,#0x18]
+7F 06 00 31                     CMN             W19, #1
+E0 01 00 54                     B.EQ            loc_D622D0
+03 00 6A F9                     LDR             X3, [X0,#0x5400]
+04 00 00 14                     B               loc_D622AC
+"""
+    _HAND_SIG = (
+        "? ? ? 34 FD 7B B6 A9 FD 03 00 91 F7 63 03 A9 F7 03 03 2A "
+        + " ".join(["?"] * 32)
+        + " 13 ? ? B9 7F 06 00 31 E0 01 00 54 ? ? ? F9 04 00 00 14"
+    )
+
+    def _cfg(self):
+        return sigmaker.SigMakerConfig.quick_defaults()
+
+    def _target(self):
+        ea = idc.get_name_ea_simple("sigmaker_cross_build_target")
+        self.assertNotEqual(ea, idaapi.BADADDR)
+        return ea
+
+    def _builds(self):
+        builds = sigmaker.CrossBuildText.parse(self._PASTED)
+        self.assertEqual([len(b) for b in builds], [72, 72])
+        return builds
+
+    def test_database_is_aarch64(self):
+        self.assertTrue(sigmaker.CrossBuildSignatureMaker.supported())
+
+    def test_function_holds_its_branch_targets(self):
+        pfn = idaapi.get_func(self._target())
+        self.assertEqual(pfn.end_ea - pfn.start_ea, 0x294)
+
+    def test_full_merge_reproduces_the_hand_built_signature(self):
+        # The default single-build rules wildcard branches whole; the merge
+        # keeps the two in-function branches that are identical in every
+        # build exact and narrows the changed CBZ to its displacement.
+        pfn = idaapi.get_func(self._target())
+        start = pfn.start_ea
+        merge = sigmaker.CrossBuildMerge.aarch64(
+            idaapi.get_bytes(start, 72), self._builds()
+        )
+        extra = sigmaker.CrossBuildSignatureMaker._single_build_wildcards(
+            pfn, merge, self._cfg()
+        )
+        self.assertEqual(f"{merge.signature(None, extra):ida}", self._HAND_SIG)
+        self.assertEqual(
+            [str(m) for m in sigmaker.SignatureSearcher.find_all(self._HAND_SIG)],
+            [hex(start)],
+        )
+
+    def test_grows_past_the_decoy_to_a_unique_signature(self):
+        start = self._target()
+        result = sigmaker.CrossBuildSignatureMaker().make(
+            start + 0x10, self._builds(), self._cfg()
+        )
+        self.assertTrue(result.unique)
+        self.assertEqual(int(result.address), start)
+        # The first 5 instructions also start the decoy, and the moved run
+        # after them is all wildcards, so the signature has to reach the
+        # LDR W19 slot: 14 instructions, 56 bytes.
+        self.assertEqual(
+            f"{result.signature:ida}", " ".join(self._HAND_SIG.split()[:56])
+        )
+        self.assertEqual(
+            [str(m) for m in sigmaker.SignatureSearcher.find_all(
+                f"{result.signature:ida}"
+            )],
+            [hex(start)],
+        )
+        lines = result.report_lines(self._cfg())
+        self.assertIn("pasted build 1: matches at +0x0", lines[3])
+        self.assertIn("pasted build 2: matches at +0x0", lines[4])
+        self.assertEqual(lines[5], "  this database: unique (1 match)")
+
+    def test_decoy_alone_is_not_unique_on_the_shared_prefix(self):
+        prefix = " ".join(self._HAND_SIG.split()[:20])
+        decoy = idc.get_name_ea_simple("sigmaker_cross_build_decoy")
+        self.assertEqual(
+            sorted(int(m) for m in sigmaker.SignatureSearcher.find_all(prefix)),
+            sorted([self._target(), decoy]),
+        )
+
+
 class TestMipsHi16Lo16Fixture(OperandFixtureIntegrationTest):
     """Exercise MIPS relocation operand metadata with a controlled ELF object."""
 
